@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tomllib
 
 from ucode.agents import codex
 
@@ -21,18 +22,19 @@ class TestCodexSpec:
 
 
 class TestRenderOverlay:
-    def test_creates_ucode_profile_without_setting_global_default(self):
+    def test_sets_provider_without_legacy_profile(self):
         overlay = codex.render_overlay(WS)
         assert "profile" not in overlay
-        assert "ucode" in overlay["profiles"]
+        assert "profiles" not in overlay
+        assert overlay["model_provider"] == "ucode-databricks"
 
     def test_sets_model_provider(self):
         overlay = codex.render_overlay(WS)
-        assert overlay["profiles"]["ucode"]["model_provider"] == "ucode-databricks"
+        assert overlay["model_provider"] == "ucode-databricks"
 
     def test_sets_model_when_provided(self):
         overlay = codex.render_overlay(WS, "databricks-gpt-5")
-        assert overlay["profiles"]["ucode"]["model"] == "databricks-gpt-5"
+        assert overlay["model"] == "databricks-gpt-5"
 
     def test_provider_base_url(self):
         overlay = codex.render_overlay(WS)
@@ -73,6 +75,10 @@ class TestRenderOverlayUserAgent:
         # Revert must clean up the new key.
         assert ["model_providers", "ucode-databricks", "http_headers"] in codex.MANAGED_KEYS
 
+    def test_managed_keys_include_top_level_model_selection(self):
+        assert ["model"] in codex.MANAGED_KEYS
+        assert ["model_provider"] in codex.MANAGED_KEYS
+
 
 class TestCodexDefaultModel:
     def test_returns_first_codex_model(self):
@@ -91,9 +97,9 @@ class TestCodexValidateCmd:
         cmd = codex.validate_cmd("codex")
         assert "exec" in cmd
 
-    def test_uses_ucode_profile(self):
+    def test_does_not_use_legacy_profile_flag(self):
         cmd = codex.validate_cmd("codex")
-        assert cmd[:3] == ["codex", "--profile", "ucode"]
+        assert "--profile" not in cmd
 
     def test_has_prompt(self):
         cmd = codex.validate_cmd("codex")
@@ -107,7 +113,7 @@ class TestCodexValidateCmd:
 
 
 class TestCodexLaunch:
-    def test_sets_oauth_token_and_ucode_profile_before_exec(self, monkeypatch):
+    def test_sets_oauth_token_before_exec(self, monkeypatch):
         exec_calls: list[tuple[str, list[str]]] = []
 
         def fake_execvp(binary: str, args: list[str]) -> None:
@@ -126,4 +132,38 @@ class TestCodexLaunch:
             assert str(exc) == "stop"
 
         assert os.environ["OAUTH_TOKEN"] == "fresh-token"
-        assert exec_calls == [("codex", ["codex", "--profile", "ucode", "--search"])]
+        assert exec_calls == [("codex", ["codex", "--search"])]
+
+
+class TestCodexWriteToolConfig:
+    def test_removes_legacy_ucode_profile(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "config.toml"
+        backup_path = tmp_path / "backup.toml"
+        config_path.write_text(
+            """
+[profiles.ucode]
+model = "old-model"
+model_provider = "ucode-databricks"
+
+[profiles.personal]
+model = "o3"
+
+[model_providers.ucode-databricks]
+name = "old"
+base_url = "https://old.example.com"
+wire_api = "responses"
+""".strip()
+        )
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", backup_path)
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+
+        codex.write_tool_config(
+            {"workspace": WS, "codex_models": ["databricks-gpt-5"]},
+        )
+
+        written = tomllib.loads(config_path.read_text())
+        assert "ucode" not in written["profiles"]
+        assert written["profiles"]["personal"]["model"] == "o3"
+        assert written["model"] == "databricks-gpt-5"
+        assert written["model_provider"] == "ucode-databricks"

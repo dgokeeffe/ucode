@@ -276,9 +276,11 @@ def run(
     )
 
 
-def build_databricks_cli_env(workspace: str) -> dict[str, str]:
+def build_databricks_cli_env(workspace: str, profile: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env["DATABRICKS_HOST"] = workspace
+    if profile is None:
+        env.pop("DATABRICKS_CONFIG_PROFILE", None)
     return env
 
 
@@ -379,7 +381,7 @@ def has_valid_databricks_auth(workspace: str, profile: str | None = None) -> boo
         return True
     _log_auth_diagnostics()
     try:
-        env = build_databricks_cli_env(workspace)
+        env = build_databricks_cli_env(workspace, profile)
         result = run(
             [
                 "databricks",
@@ -486,7 +488,7 @@ def run_databricks_login(workspace: str, profile: str | None = None) -> None:
             workspace,
             *_profile_args(profile_name),
         ]
-        run(cmd, env=build_databricks_cli_env(workspace), timeout=300)
+        run(cmd, env=build_databricks_cli_env(workspace, profile_name), timeout=300)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError("`databricks auth login` failed.") from exc
     except subprocess.TimeoutExpired as exc:
@@ -522,7 +524,7 @@ def get_databricks_token(
         return bearer
 
     _log_auth_diagnostics()
-    env = build_databricks_cli_env(workspace)
+    env = build_databricks_cli_env(workspace, profile)
     cmd = [
         "databricks",
         "auth",

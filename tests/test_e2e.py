@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -55,6 +56,18 @@ def _run_agent(
         env=env,
         stdin=subprocess.DEVNULL,
     )
+
+
+def _codex_home_for_e2e(tmp_path: Path) -> Path:
+    """Return an isolated Codex home outside pytest's temporary directory.
+
+    Newer Codex releases refuse to create helper binaries when
+    ``CODEX_HOME`` is under ``/tmp``. Keep the e2e config isolated from
+    the user's real ``~/.codex`` while avoiding Codex's temp-home guard.
+    """
+    codex_home = Path.home() / ".cache" / "ucode-e2e" / tmp_path.name / "codex_home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    return codex_home
 
 
 # ---------------------------------------------------------------------------
@@ -340,37 +353,40 @@ class TestCodexLaunch:
         models = self._codex_models(e2e_state)
 
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        config_dir = tmp_path / "codex_home" / ".codex"
-        config_dir.mkdir(parents=True)
+        codex_home = _codex_home_for_e2e(tmp_path)
+        config_dir = codex_home
         config_path = config_dir / "config.toml"
         backup_path = tmp_path / "codex-config.backup.toml"
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
         monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", backup_path)
 
-        failures = []
-        timeout_seconds = int(os.environ.get("UCODE_E2E_AGENT_TIMEOUT", "60"))
-        for model in models:
-            state = {**e2e_state, "workspace": e2e_workspace}
-            with pytest.MonkeyPatch().context() as mp:
-                mp.setattr("ucode.state.save_state", lambda s: None)
-                codex.write_tool_config(state, model)
+        try:
+            failures = []
+            timeout_seconds = int(os.environ.get("UCODE_E2E_AGENT_TIMEOUT", "60"))
+            for model in models:
+                state = {**e2e_state, "workspace": e2e_workspace}
+                with pytest.MonkeyPatch().context() as mp:
+                    mp.setattr("ucode.state.save_state", lambda s: None)
+                    codex.write_tool_config(state, model)
 
-            cmd = codex.validate_cmd("codex")
-            try:
-                result = _run_agent(
-                    cmd,
-                    env={**os.environ, "CODEX_HOME": str(config_dir)},
-                    timeout=timeout_seconds,
-                )
-            except subprocess.TimeoutExpired:
-                failures.append(f"model={model} timed out after {timeout_seconds}s")
-                continue
+                cmd = codex.validate_cmd("codex")
+                try:
+                    result = _run_agent(
+                        cmd,
+                        env={**os.environ, "CODEX_HOME": str(config_dir)},
+                        timeout=timeout_seconds,
+                    )
+                except subprocess.TimeoutExpired:
+                    failures.append(f"model={model} timed out after {timeout_seconds}s")
+                    continue
 
-            if result.returncode != 0 or not (result.stdout or result.stderr).strip():
-                failures.append(
-                    f"model={model} rc={result.returncode} "
-                    f"stdout={result.stdout[:200]!r} stderr={result.stderr[:200]!r}"
-                )
+                if result.returncode != 0 or not (result.stdout or result.stderr).strip():
+                    failures.append(
+                        f"model={model} rc={result.returncode} "
+                        f"stdout={result.stdout[:200]!r} stderr={result.stderr[:200]!r}"
+                    )
+        finally:
+            shutil.rmtree(codex_home, ignore_errors=True)
 
         assert not failures, "Codex launch failures:\n" + "\n".join(failures)
 
