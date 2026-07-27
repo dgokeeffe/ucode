@@ -918,8 +918,8 @@ class TestPiLaunch:
             pytest.skip("No Pi-compatible models available on this workspace")
 
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        # Point Pi's runtime config and ucode's writers at the same isolated
-        # directory so models/settings never touch the developer's real config.
+        # Point PI_CODING_AGENT_DIR and ucode's config writer at the same
+        # isolated directory without changing the process HOME.
         pi_home = tmp_path / "pi-home"
         pi_dir = pi_home / ".pi" / "agent"
         config_path = pi_dir / "models.json"
