@@ -337,13 +337,17 @@ class TestDownloadSkills:
         assert (tmp_path / ".claude/skills/good/SKILL.md").read_bytes() == b"ok"
         assert not (tmp_path / ".claude/skills/bad").exists()
 
-    def test_prints_downloaded_count_summary(self, tmp_path, monkeypatch, capsys):
+    def test_prints_downloaded_count_and_roots_summary(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["a", "b", "c"], None))
         monkeypatch.setattr(sd, "fetch_skill_bundle", lambda *a, **k: ({"SKILL.md": b"x"}, None))
 
         sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
 
-        assert "Downloaded 3/3 skill(s) from `main.default`" in capsys.readouterr().out
+        # Rich wraps long paths across lines; strip all whitespace from both sides to compare.
+        roots = sd.skill_dir_roots(str(tmp_path))
+        expected = f"Downloaded 3/3 skill(s) from `main.default` in {roots[0]} and {roots[1]}."
+        printed = "".join(capsys.readouterr().out.split())
+        assert "".join(expected.split()) in printed
 
     def test_summary_counts_only_written_skills(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["good", "bad"], None))
@@ -357,7 +361,61 @@ class TestDownloadSkills:
 
         sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
 
-        assert "Downloaded 1/2 skill(s) from `main.default`" in capsys.readouterr().out
+        assert "Downloaded 1/2 skill(s) from `main.default` in" in capsys.readouterr().out
+
+    def test_skill_filter_downloads_only_matching_leaves(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            sd, "list_schema_skills", lambda *a, **k: (["pii-handling", "triage"], None)
+        )
+        monkeypatch.setattr(sd, "fetch_skill_bundle", lambda *a, **k: ({"SKILL.md": b"x"}, None))
+
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path), {"triage"})
+
+        assert (tmp_path / ".claude/skills/triage/SKILL.md").read_bytes() == b"x"
+        assert not (tmp_path / ".claude/skills/pii-handling").exists()
+
+    def test_skill_filter_warns_on_unknown_and_downloads_rest(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["triage"], None))
+        monkeypatch.setattr(sd, "fetch_skill_bundle", lambda *a, **k: ({"SKILL.md": b"x"}, None))
+
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path), {"triage", "ghost"})
+
+        out = capsys.readouterr().out
+        assert "Skipping requested skill(s) not found in `main.default`: ghost" in out
+        assert (tmp_path / ".claude/skills/triage/SKILL.md").read_bytes() == b"x"
+
+    def test_empty_skill_filter_downloads_nothing(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["triage"], None))
+        called = []
+        monkeypatch.setattr(
+            sd, "fetch_skill_bundle", lambda *a, **k: called.append(1) or ({"SKILL.md": b"x"}, None)
+        )
+
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path), set())
+
+        assert called == []
+        assert not (tmp_path / ".claude/skills/triage").exists()
+        # The schema has skills; the filter selected none — distinct from the
+        # empty-schema note.
+        out = capsys.readouterr().out
+        assert "No requested skills to download from `main.default`." in out
+        assert "No skills found" not in out
+
+    def test_empty_schema_reports_no_skills_found(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: ([], None))
+
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path), None)
+
+        assert "No skills found in `main.default`." in capsys.readouterr().out
+
+    def test_none_skill_filter_downloads_everything(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["a", "b"], None))
+        monkeypatch.setattr(sd, "fetch_skill_bundle", lambda *a, **k: ({"SKILL.md": b"x"}, None))
+
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path), None)
+
+        assert (tmp_path / ".claude/skills/a/SKILL.md").exists()
+        assert (tmp_path / ".claude/skills/b/SKILL.md").exists()
 
 
 class TestConfigureSkillsDownloadCommand:
@@ -371,12 +429,14 @@ class TestConfigureSkillsDownloadCommand:
         monkeypatch.setattr(
             sd,
             "download_skills",
-            lambda ws, tok, locations, path: calls.update(download=(ws, tok, locations, path)),
+            lambda ws, tok, locations, path, skills=None: calls.update(
+                download=(ws, tok, locations, path, skills)
+            ),
         )
         monkeypatch.setattr(
             sd,
             "register_schemaless_skills_connection",
-            lambda state, ws, clients: calls.update(register=(ws, clients)),
+            lambda state, ws, profile, clients: calls.update(register=(ws, profile, clients)),
         )
         return calls
 
@@ -385,12 +445,21 @@ class TestConfigureSkillsDownloadCommand:
 
         assert sd.configure_skills_download_command(["a.b"], path="/tmp/skills") == 0
 
-        assert calls["download"] == (WS, "token", ["a.b"], "/tmp/skills")
-        assert calls["register"] == (WS, ["claude"])
+        assert calls["download"] == (WS, "token", ["a.b"], "/tmp/skills", None)
+        assert calls["register"] == (WS, "profile", ["claude"])
 
     def test_none_path_threads_through(self, monkeypatch):
         calls = self._stub(monkeypatch)
 
         assert sd.configure_skills_download_command(["a.b"], path=None) == 0
 
-        assert calls["download"] == (WS, "token", ["a.b"], None)
+        assert calls["download"] == (WS, "token", ["a.b"], None, None)
+        assert calls["register"] == (WS, "profile", ["claude"])
+
+    def test_skills_filter_threads_through(self, monkeypatch):
+        calls = self._stub(monkeypatch)
+
+        assert sd.configure_skills_download_command(["a.b"], path=None, skills={"triage"}) == 0
+
+        assert calls["download"] == (WS, "token", ["a.b"], None, {"triage"})
+        assert calls["register"] == (WS, "profile", ["claude"])

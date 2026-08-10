@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import io
 from datetime import timedelta
+from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
+from rich.console import Console
 
 from ucode.ui import (
     format_duration,
+    format_meter,
     format_token_count,
+    format_usd,
     normalize_workspace_url,
+    prompt_for_percentage,
+    prompt_for_text,
     prompt_for_workspace,
     prompt_yes_no_default,
     render_box_table,
@@ -48,6 +55,73 @@ class TestPromptYesNoDefault:
     def test_explicit_yes_overrides_default_false(self, monkeypatch):
         self._answer(monkeypatch, "yes")
         assert prompt_yes_no_default("go?", default=False) is True
+
+
+def _visible(markup: str) -> str:
+    """What the user actually sees, with Rich markup resolved.
+
+    Asserting on the raw markup string is what let a swallowed default ship: `[tiered]` is present
+    in the markup and absent from the output, because Rich reads it as a style tag.
+    """
+    console = Console(file=io.StringIO(), force_terminal=False, width=200)
+    console.print(markup)
+    return console.file.getvalue().rstrip()
+
+
+class TestDefaultsAreLabelledAsAcceptable:
+    """A shown default must say that enter takes it, or it reads as a format example."""
+
+    def test_text_default_says_enter_accepts_it(self):
+        with patch("ucode.ui.console.input", return_value="") as inp:
+            assert prompt_for_text("Policy name", default="tiered") == "tiered"
+        rendered = _visible(inp.call_args[0][0])
+        assert "[tiered]" in rendered
+        assert "enter to accept" in rendered
+
+    def test_a_word_like_default_is_not_eaten_as_markup(self):
+        # Rich treats `[coding-agents-tiered-routing]` as a style tag and renders nothing for it, so
+        # the real wizard default vanished from the prompt while `[80]` survived.
+        with patch("ucode.ui.console.input", return_value="") as inp:
+            prompt_for_text("Policy name", default="coding-agents-tiered-routing")
+        assert "[coding-agents-tiered-routing]" in _visible(inp.call_args[0][0])
+
+    def test_a_dotted_default_is_not_eaten_as_markup(self):
+        with patch("ucode.ui.console.input", return_value="") as inp:
+            prompt_for_text("Skills location", default="main.default")
+        assert "[main.default]" in _visible(inp.call_args[0][0])
+
+    def test_percentage_default_says_enter_accepts_it(self):
+        with patch("ucode.ui.console.input", return_value="") as inp:
+            assert prompt_for_percentage("at what percent?", default=0.8) == 0.8
+        rendered = _visible(inp.call_args[0][0])
+        # Prompted in percent even though the API takes a fraction.
+        assert "[80]" in rendered
+        assert "enter to accept" in rendered
+
+    def test_no_default_shows_no_hint(self):
+        with patch("ucode.ui.console.input", return_value="typed") as inp:
+            assert prompt_for_text("Model") == "typed"
+        assert "enter to accept" not in _visible(inp.call_args[0][0])
+
+    def test_typing_still_overrides_the_default(self):
+        with patch("ucode.ui.console.input", return_value="mine"):
+            assert prompt_for_text("Policy name", default="tiered") == "mine"
+
+
+class TestClosedStdinAborts:
+    """Ctrl-D must reach the CLI as an abort, not as a traceback."""
+
+    def test_percentage_without_a_default_raises_keyboard_interrupt(self):
+        # `ucode setup`'s tier prompt passes no default. EOFError has no handler above this call —
+        # the setup command catches only RuntimeError and KeyboardInterrupt — so a bare EOFError
+        # reached the admin as a raw traceback.
+        with patch("ucode.ui.console.input", side_effect=EOFError):
+            with pytest.raises(KeyboardInterrupt):
+                prompt_for_percentage("Tier 1: activates at what percent of budget?")
+
+    def test_percentage_with_a_default_still_takes_it(self):
+        with patch("ucode.ui.console.input", side_effect=EOFError):
+            assert prompt_for_percentage("at what percent?", default=0.8) == 0.8
 
 
 class TestNormalizeWorkspaceUrl:
@@ -225,3 +299,42 @@ class TestPromptForWorkspace:
             url, profile = prompt_for_workspace("desc", profiles=None)
         assert url == "https://example.databricks.com"
         assert profile is None
+
+
+class TestFormatUsd:
+    def test_rounds_to_cents(self):
+        assert format_usd(Decimal("12.345")) == "$12.35"
+        assert format_usd(Decimal("12.344")) == "$12.34"
+
+    def test_pads_to_two_decimals(self):
+        assert format_usd(Decimal("5")) == "$5.00"
+
+    def test_thousands_separator(self):
+        assert format_usd(Decimal("1234567.5")) == "$1,234,567.50"
+
+    def test_zero(self):
+        assert format_usd(Decimal("0")) == "$0.00"
+
+
+class TestFormatMeter:
+    def test_empty(self):
+        assert format_meter(0.0, width=10) == "[" + "\u2591" * 10 + "]"
+
+    def test_full(self):
+        assert format_meter(1.0, width=10) == "[" + "\u2588" * 10 + "]"
+
+    def test_half(self):
+        assert format_meter(0.5, width=10) == "[" + "\u2588" * 5 + "\u2591" * 5 + "]"
+
+    def test_tiny_nonzero_fills_one_cell(self):
+        assert format_meter(0.001, width=10) == "[\u2588" + "\u2591" * 9 + "]"
+
+    def test_clamps_above_one(self):
+        assert format_meter(2.5, width=10) == "[" + "\u2588" * 10 + "]"
+
+    def test_clamps_below_zero(self):
+        assert format_meter(-1.0, width=10) == "[" + "\u2591" * 10 + "]"
+
+    def test_width_is_constant(self):
+        for fraction in (0.0, 0.13, 0.5, 0.99, 1.0):
+            assert len(format_meter(fraction)) == 32

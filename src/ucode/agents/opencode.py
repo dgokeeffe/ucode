@@ -31,7 +31,6 @@ OPENCODE_XDG_CONFIG_HOME = APP_DIR / "opencode-xdg"
 OPENCODE_CONFIG_DIR = OPENCODE_XDG_CONFIG_HOME / "opencode"
 OPENCODE_CONFIG_PATH = OPENCODE_CONFIG_DIR / "opencode.json"
 OPENCODE_BACKUP_PATH = APP_DIR / "opencode-config.backup.json"
-OPENCODE_MCP_AUTH_HEADER_VALUE = "Bearer {env:OAUTH_TOKEN}"
 
 SPEC: ToolSpec = {
     "binary": "opencode",
@@ -233,25 +232,25 @@ def write_tool_config(
     return state, token
 
 
-def build_mcp_server_entry(url: str) -> dict:
+def build_mcp_server_entry(argv: list[str]) -> dict:
+    # A `local` MCP server runs a command over stdio; `command` is the full
+    # argv. ucode registers the `ucode mcp-proxy ...` bridge here so OpenCode
+    # never speaks HTTP+bearer directly — the proxy mints fresh tokens itself.
     return {
-        "type": "remote",
-        "url": url,
+        "type": "local",
+        "command": list(argv),
         "enabled": True,
-        "headers": {
-            "Authorization": OPENCODE_MCP_AUTH_HEADER_VALUE,
-        },
     }
 
 
-def write_mcp_server_config(name: str, url: str) -> bool:
+def write_mcp_server_config(name: str, argv: list[str]) -> bool:
     backup_existing_file(OPENCODE_CONFIG_PATH, OPENCODE_BACKUP_PATH)
     existing = read_json_safe(OPENCODE_CONFIG_PATH)
     mcp_servers = existing.get("mcp")
     if not isinstance(mcp_servers, dict):
         mcp_servers = {}
     removed = name in mcp_servers
-    mcp_servers[name] = build_mcp_server_entry(url)
+    mcp_servers[name] = build_mcp_server_entry(argv)
     existing["mcp"] = mcp_servers
     write_json_file(OPENCODE_CONFIG_PATH, existing)
     return removed
@@ -269,6 +268,8 @@ def remove_mcp_server_config(name: str) -> bool:
 
 
 def default_model(state: dict) -> str | None:
+    if isinstance(state.get("opencode_default_model"), str):
+        return state.get("opencode_default_model")
     opencode_models = state.get("opencode_models") or {}
     anthropic = opencode_models.get("anthropic") or []
     if anthropic:
