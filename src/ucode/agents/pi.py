@@ -373,21 +373,28 @@ def _write_tool_config_unlocked(
             providers.pop(stale, None)
     merged = deep_merge_dict(existing, overlay)
     write_json_file(PI_CONFIG_PATH, merged)
-    _write_settings(overlay["model"])
+    _write_settings(overlay["model"], clear_unresolved=managed_families is not None)
     state = mark_tool_managed(state, "pi", managed_keys)
     save_state(state)
     return state, token
 
 
-def _write_settings(model_selector: str) -> None:
+def _write_settings(model_selector: str, *, clear_unresolved: bool = False) -> None:
     # Pin defaultProvider/defaultModel in settings.json so Pi doesn't fall
     # through to an env-key-backed provider (e.g. HF_TOKEN exposing
     # huggingface) in `findInitialModel` when no --model is passed.
     provider, _, model_id = model_selector.partition("/")
-    if not model_id:
+    if not model_id and not clear_unresolved:
         return
     backup_existing_file(PI_SETTINGS_PATH, PI_SETTINGS_BACKUP_PATH)
     existing = read_json_safe(PI_SETTINGS_PATH)
+    if not model_id:
+        # A non-empty managed allowlist with no servable model must not retain a
+        # stale default that bypasses the current administrator policy.
+        existing.pop("defaultProvider", None)
+        existing.pop("defaultModel", None)
+        write_json_file(PI_SETTINGS_PATH, existing)
+        return
     merged = deep_merge_dict(existing, {"defaultProvider": provider, "defaultModel": model_id})
     write_json_file(PI_SETTINGS_PATH, merged)
 
@@ -494,7 +501,9 @@ def _start_oss_proxy(
     base URL, so a stale loopback port from an old config can never become the
     next proxy's upstream.
     """
-    if not (state.get("oss_models") or []):
+    managed_families = _managed_model_families(state)
+    oss_models = state.get("oss_models") or [] if managed_families is None else managed_families[3]
+    if not oss_models:
         return None
     direct_oss_url = build_pi_base_urls(state["workspace"])["oss"]
     origin = direct_oss_url.split("/ai-gateway/", 1)[0]
