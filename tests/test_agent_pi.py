@@ -651,6 +651,30 @@ class TestWriteToolConfig:
         assert settings["defaultProvider"] == "databricks-claude"
         assert settings["defaultModel"] == "claude-sonnet"
 
+    def test_unservable_managed_allowlist_clears_stale_default(self, tmp_path, monkeypatch):
+        pi_mod, _, settings_file, _ = self._setup(tmp_path, monkeypatch)
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "defaultProvider": "databricks-claude",
+                    "defaultModel": "stale-unlisted-model",
+                    "theme": "Default Dark",
+                }
+            )
+        )
+
+        with patch("ucode.agents.pi.save_state"):
+            pi_mod.write_tool_config(
+                self._state(pi_models=["system.ai.unsupported-model"]),
+                "system.ai.unsupported-model",
+                token="tok",
+            )
+
+        settings = json.loads(settings_file.read_text())
+        assert "defaultProvider" not in settings
+        assert "defaultModel" not in settings
+        assert settings["theme"] == "Default Dark"
+
     def test_pre_existing_settings_are_backed_up_before_first_write(self, tmp_path, monkeypatch):
         pi_mod, _, settings_file, settings_backup_file = self._setup(tmp_path, monkeypatch)
 
@@ -761,6 +785,23 @@ class TestMlflowProxyLifecycle:
         with patch.object(pi._mlflow_proxy, "start") as start:
             assert pi._start_oss_proxy(state) is None
         start.assert_not_called()
+
+    def test_managed_oss_allowlist_starts_proxy_without_discovery_state(self):
+        server = MagicMock()
+        state = {
+            "workspace": WS,
+            "pi_models": ["system.ai.kimi-k2-7-code"],
+            "base_urls": {"pi": _base_urls()},
+        }
+        with patch.object(
+            pi._mlflow_proxy,
+            "start",
+            return_value=(server, "http://127.0.0.1:60000"),
+        ) as start:
+            running = pi._start_oss_proxy(state)
+        assert running is not None
+        start.assert_called_once_with(WS)
+        assert state["base_urls"]["pi"]["oss"] == ("http://127.0.0.1:60000/ai-gateway/mlflow/v1")
 
     def test_stale_loopback_url_is_replaced_and_real_workspace_is_upstream(self):
         server = MagicMock()

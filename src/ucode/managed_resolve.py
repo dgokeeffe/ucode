@@ -93,8 +93,8 @@ def managed_unservable_models(managed: dict, tool: str) -> list[str]:
 
     Only non-empty when *every* named model is unservable, which is when the translation yields
     nothing and the developer's own models stand — so the caller can say why the admin's list had no
-    effect. opencode has no OpenAI provider and pi has no OSS provider, so each can be handed a
-    valid model FQN it cannot route.
+    effect. OpenCode has no OpenAI provider; Pi supports Claude, GPT, Gemini, and validated OSS
+    families.
     """
     if tool not in ("opencode", "pi"):
         return []
@@ -107,7 +107,7 @@ def managed_unservable_models(managed: dict, tool: str) -> list[str]:
         else [
             m
             for m in models
-            if classify_model_family(m) in (*ANTHROPIC_FAMILIES, "codex", "gemini")
+            if classify_model_family(m) in (*ANTHROPIC_FAMILIES, "codex", "gemini", "oss")
         ]
     )
     return [] if servable else models
