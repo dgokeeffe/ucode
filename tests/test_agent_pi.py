@@ -618,6 +618,23 @@ class TestWriteToolConfig:
         assert entry["contextWindow"] == 256_000
         assert entry["maxTokens"] == 65_536
 
+    def test_managed_oss_allowlist_excludes_unlisted_discovered_models(self, tmp_path, monkeypatch):
+        pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
+        state = self._state(
+            pi_models=["system.ai.deepseek-v4-pro"],
+            claude_models={"sonnet": "unlisted-claude"},
+            oss_models=["system.ai.deepseek-v4-pro", "system.ai.glm-5-2"],
+        )
+
+        with patch("ucode.agents.pi.save_state"):
+            pi_mod.write_tool_config(state, "system.ai.deepseek-v4-pro", token="tok")
+
+        providers = json.loads(config_file.read_text())["providers"]
+        assert set(providers) == {"databricks-mlflow"}
+        assert [model["id"] for model in providers["databricks-mlflow"]["models"]] == [
+            "system.ai.deepseek-v4-pro"
+        ]
+
     def test_settings_pins_default_provider_and_model(self, tmp_path, monkeypatch):
         # Without this, Pi's `findInitialModel` can fall through to a built-in
         # provider when an unrelated env var (e.g. HF_TOKEN) makes one look
@@ -697,27 +714,45 @@ class TestManagedModels:
                 "system.ai.claude-opus-4-8",
                 "system.ai.gpt-5",
                 "system.ai.gemini-3-flash",
+                "system.ai.deepseek-v4-pro",
             ]
         }
         assert pi._managed_model_families(state) == (
             {"opus": "system.ai.claude-opus-4-8"},
             ["system.ai.gpt-5"],
             ["system.ai.gemini-3-flash"],
+            ["system.ai.deepseek-v4-pro"],
         )
 
     def test_no_split_without_managed_models(self):
         assert pi._managed_model_families({"claude_models": {"opus": "x"}}) is None
 
-    def test_none_when_no_managed_model_is_servable(self):
-        # Pi has no OSS provider, so an oss-only list yields no families. Returning an all-empty
-        # tuple would be truthy and suppress the fallback, writing a config with zero providers.
-        assert pi._managed_model_families({"pi_models": ["system.ai.kimi-k2-7-code"]}) is None
+    def test_oss_only_allowlist_does_not_fall_back_to_discovery(self):
+        assert pi._managed_model_families({"pi_models": ["system.ai.kimi-k2-7-code"]}) == (
+            {},
+            [],
+            [],
+            ["system.ai.kimi-k2-7-code"],
+        )
+
+    def test_unsupported_nonempty_allowlist_stays_empty(self):
+        assert pi._managed_model_families({"pi_models": ["system.ai.unsupported-model"]}) == (
+            {},
+            [],
+            [],
+            [],
+        )
 
     def test_partially_servable_list_still_splits(self):
         families = pi._managed_model_families(
             {"pi_models": ["system.ai.kimi-k2-7-code", "system.ai.claude-opus-4-8"]}
         )
-        assert families == ({"opus": "system.ai.claude-opus-4-8"}, [], [])
+        assert families == (
+            {"opus": "system.ai.claude-opus-4-8"},
+            [],
+            [],
+            ["system.ai.kimi-k2-7-code"],
+        )
 
 
 class TestMlflowProxyLifecycle:

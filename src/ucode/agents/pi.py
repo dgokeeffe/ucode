@@ -349,11 +349,13 @@ def _write_tool_config_unlocked(
         )
     pi_base_urls = state.get("base_urls", {}).get("pi") or build_pi_base_urls(state["workspace"])
     managed_families = _managed_model_families(state)
-    claude_models, codex_models, gemini_models = managed_families or (
-        state.get("claude_models") or {},
-        state.get("codex_models") or [],
-        state.get("gemini_models") or [],
-    )
+    if managed_families is None:
+        claude_models = state.get("claude_models") or {}
+        codex_models = state.get("codex_models") or []
+        gemini_models = state.get("gemini_models") or []
+        oss_models = state.get("oss_models") or []
+    else:
+        claude_models, codex_models, gemini_models, oss_models = managed_families
     overlay, managed_keys = render_overlay(
         model,
         token,
@@ -361,7 +363,7 @@ def _write_tool_config_unlocked(
         claude_models,
         codex_models,
         gemini_models,
-        state.get("oss_models") or [],
+        oss_models,
         state.get("oss_model_specs") or [],
     )
     existing = read_json_safe(PI_CONFIG_PATH)
@@ -390,12 +392,15 @@ def _write_settings(model_selector: str) -> None:
     write_json_file(PI_SETTINGS_PATH, merged)
 
 
-def _managed_model_families(state: dict) -> tuple[dict[str, str], list[str], list[str]] | None:
-    """Split a managed config's ``pi_models`` into the per-family inputs Pi's providers need.
+def _managed_model_families(
+    state: dict,
+) -> tuple[dict[str, str], list[str], list[str], list[str]] | None:
+    """Split a managed config's ``pi_models`` into Pi provider inputs.
 
-    Pi builds one provider block per family, so a flat list has to be classified back out. Returns
-    None when the managed models yield no family Pi can serve, leaving the workspace-wide discovery
-    lists in play rather than writing a config with no usable provider.
+    ``None`` means there is no managed allowlist and workspace discovery may be
+    used. A present non-empty allowlist always returns four collections—even if
+    every entry is malformed or unsupported—so unlisted discovered models can
+    never leak back into managed Pi configuration.
     """
     managed = state.get("pi_models")
     if not isinstance(managed, list) or not managed:
@@ -403,6 +408,7 @@ def _managed_model_families(state: dict) -> tuple[dict[str, str], list[str], lis
     claude: dict[str, str] = {}
     codex: list[str] = []
     gemini: list[str] = []
+    oss: list[str] = []
     for model in managed:
         if not isinstance(model, str) or not model.strip():
             continue
@@ -413,9 +419,9 @@ def _managed_model_families(state: dict) -> tuple[dict[str, str], list[str], lis
             codex.append(model)
         elif family == "gemini":
             gemini.append(model)
-    if not (claude or codex or gemini):
-        return None
-    return claude, codex, gemini
+        elif family == "oss":
+            oss.append(model)
+    return claude, codex, gemini, oss
 
 
 def default_model(state: dict) -> str | None:
