@@ -186,7 +186,7 @@ def _pi_oss_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
     A valid discovered boolean overrides static reasoning. Any discovered spec
     receives a complete conservative limit pair, so missing capability fields
     cannot leave a validated model effectively uncapped. Missing specs retain
-    the existing static GLM/Kimi behavior, while unknown models remain bare.
+    the existing static GLM/Kimi/DeepSeek behavior, while unknown models remain bare.
     """
     entry: dict = {"id": model_id}
     static_limits = model_token_limits(model_id)

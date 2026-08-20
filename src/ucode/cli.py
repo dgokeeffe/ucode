@@ -616,8 +616,8 @@ def configure_shared_state(
                     # Keep IDs and specs aligned. Broad OSS families are admitted
                     # only by live capability validation; if that refresh fails,
                     # offering the stale IDs without safe metadata would regress
-                    # them to uncapped client defaults. Static GLM/Kimi fallback
-                    # specs are still returned by discover_oss_model_specs.
+                    # them to uncapped client defaults. Static GLM/Kimi/DeepSeek
+                    # fallback specs are still returned by discover_oss_model_specs.
                     oss_models = [spec["id"] for spec in oss_specs]
                     if not oss_specs and specs_reason:
                         oss_reason = specs_reason

@@ -1555,7 +1555,7 @@ def _canonical_oss_model_id(model_id: str) -> str:
 
 
 def _static_oss_spec(model_id: str) -> dict | None:
-    """Capability fallback for the statically validated GLM/Kimi families."""
+    """Capability fallback for statically validated GLM/Kimi/DeepSeek families."""
     if not _is_oss_chat_model(model_id.lower()):
         return None
     limits = model_token_limits(model_id) or {}
@@ -1635,7 +1635,7 @@ def _oss_specs_from_foundation_models(payload: object) -> list[dict]:
         static_fallback = _static_oss_spec(name)
         if static_fallback is not None:
             # Missing/partial metadata must not regress the statically verified
-            # GLM/Kimi capabilities already used by existing installations.
+            # GLM/Kimi/DeepSeek capabilities used by existing installations.
             reasoning = reasoning or static_fallback["reasoning"]
             context_window = context_window or static_fallback["context_window"]
             max_tokens = max_tokens or static_fallback["max_tokens"]
@@ -1664,8 +1664,8 @@ def discover_oss_model_specs(
 
     With ``model_ids`` (the UC-first path), endpoint capabilities are projected
     back onto those exact ids using their normalized model name. Statically
-    validated GLM/Kimi ids remain available when capability discovery fails or
-    omits them. Without ``model_ids`` (the serving-endpoint fallback), only
+    validated GLM/Kimi/DeepSeek ids remain available when capability discovery
+    fails or omits them. Without ``model_ids`` (the serving-endpoint fallback), only
     models validated by the live API metadata are returned.
     """
     hostname = workspace_hostname(workspace)
@@ -2119,7 +2119,7 @@ def discover_model_services(
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
 
     # Project the live endpoint capability listing onto the UC ids. This
-    # broadens discovery beyond the static GLM/Kimi fallback only when the
+    # broadens discovery beyond the static GLM/Kimi/DeepSeek fallback only when the
     # corresponding endpoint is validated as MLflow chat-completions-only.
     oss_specs, _ = discover_oss_model_specs(workspace, token, ids)
     oss_models = [spec["id"] for spec in oss_specs]

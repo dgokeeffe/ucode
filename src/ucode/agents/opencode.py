@@ -126,7 +126,7 @@ def _oss_model_overlay(
 
     OpenCode requires context and output limits together. Every discovered spec
     therefore receives a complete conservative pair. Missing specs retain
-    static GLM/Kimi metadata, and unknown no-spec models remain uncapped.
+    static GLM/Kimi/DeepSeek metadata, and unknown no-spec models remain uncapped.
     """
     overlay: dict = {"headers": ua_header}
     static_limits = model_token_limits(model)

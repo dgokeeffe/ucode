@@ -226,6 +226,12 @@ class TestModelTokenLimits:
             "output": 65_536,
         }
 
+    def test_deepseek_uses_conservative_fallback(self):
+        assert db_mod.model_token_limits("system.ai.deepseek-v4-pro") == {
+            "context": 128_000,
+            "output": 8_192,
+        }
+
     def test_unvalidated_families_return_none(self):
         for model_id in (
             "system.ai.inkling",
@@ -233,7 +239,6 @@ class TestModelTokenLimits:
             "system.ai.llama-4-maverick",
             "system.ai.qwen35-122b-a10b",
             "system.ai.gemma-3-12b",
-            "system.ai.deepseek-v3",
         ):
             assert db_mod.model_token_limits(model_id) is None
 
@@ -478,8 +483,8 @@ class TestDiscoverModelServices:
         assert reason == "HTTP 500 Server Error"
 
     def test_no_matching_families_reports_sample(self, monkeypatch):
-        # deepseek is outside every claude/gpt/gemini/oss family bucket.
-        payload = {"model_services": [_model_service("system.ai.deepseek-v3")]}
+        # Llama is outside every claude/gpt/gemini/oss family bucket.
+        payload = {"model_services": [_model_service("system.ai.llama-4-maverick")]}
         monkeypatch.setattr(
             db_mod, "_http_get_json", lambda url, token, timeout=10: (payload, None)
         )
@@ -487,7 +492,7 @@ class TestDiscoverModelServices:
         claude, codex, gemini, oss, reason = db_mod.discover_model_services(WS, "token")
 
         assert (claude, codex, gemini, oss) == ({}, [], [], [])
-        assert reason is not None and "deepseek-v3" in reason
+        assert reason is not None and "llama-4-maverick" in reason
 
     def test_ignores_non_system_ai_schemas(self, monkeypatch):
         # The metastore listing returns services from every schema; only
