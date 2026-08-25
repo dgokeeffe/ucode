@@ -7,7 +7,7 @@ handoff_security:
 verification_identity:
   repository: "/Users/david.okeeffe/Repos/ucode"
   base_revision: "95d235682549e880def6e69b4c923edfa30964a3"
-  head_revision: "c45740b53925fb2644bdb671ac39283722d810e9"
+  head_revision: "5041762cd923955cd43d042cc92999f831e48273"
   dirty_state_digest: "7cda9bc7f375698292a57edab36c6e2e8cbaf64607791f540862aef11fa0a3f0"
 repository_policy:
   source: "AGENTS.md and project instructions"
@@ -48,10 +48,10 @@ deterministic_plan:
 command_results:
   - command: "uv run --frozen pytest -q tests/test_agent_pi.py tests/test_databricks.py tests/test_cli.py"
     exit_status: 0
-    result: "611 passed in 33.00s"
+    result: "620 passed in 32.81s"
   - command: "uv run --frozen pytest -q -k 'not TestStateFileIsNotRewritten and not test_user_agent_arrives_at_gateway'"
     exit_status: 0
-    result: "2093 passed, 37 skipped, 13 deselected in 76.51s"
+    result: "2102 passed, 37 skipped, 13 deselected in 77.93s"
   - command: "uv run --frozen pytest -q"
     exit_status: "unavailable"
     result: "attempt returned no result after hanging in the known real-state TestStateFileIsNotRewritten path"
@@ -68,11 +68,11 @@ reviewer_reports:
   - role: "requirements-reviewer"
     result: "initial blockers fixed; Fable concern conflicts with explicit opt-in non-goal"
   - role: "edge-case-reviewer"
-    result: "initial same-family, no-Opus, fallback, and partial-inventory findings fixed; Fable remains intentionally opt-in"
+    result: "same-family, no-Opus, fallback, malformed-pagination, and stale-cache findings fixed; complete UC authority and Fable opt-in remain deliberate"
   - role: "routine security triage"
-    result: "no evidenced credential or unsafe-write blocker"
+    result: "no evidenced credential or unsafe-write blocker; apiKey file permissions are pre-existing residual"
   - role: "regression-reviewer"
-    result: "initial legacy fallback blocker fixed; no remaining blocker in re-review"
+    result: "Claude/Pi partial fallback blockers fixed; non-Claude partial inventories and complete UC authority recorded as scoped residuals"
 finding_reproductions:
   - finding: "managed same-family Claude entries were dropped"
     disposition: "fixed with managed supplemental Claude ids and focused regression test"
@@ -81,7 +81,7 @@ finding_reproductions:
   - finding: "legacy fallback was skipped for empty/non-Claude/partial UC inventory"
     disposition: "fixed by unbucketed union fallback and incomplete-walk handling, with focused tests"
 fixes_and_re_review:
-  - "re-ran 611 focused tests, Ruff, format, diff, and ancestry checks after the final commit"
+  - "re-ran 620 focused tests, 2102 bounded-suite tests, Ruff, format, diff, and ancestry checks after the final implementation commit"
 adjudication:
   decision: "READY_FOR_HUMAN_REVIEW"
   rationale: "Requested local integration and Pi Opus 5 exposure are implemented and deterministically validated; full-suite baseline hangs and live e2e remain unavailable."
@@ -90,12 +90,14 @@ unavailable_checks:
   - "live Databricks e2e because UCODE_TEST_WORKSPACE is unset"
 residual_risks:
   - "No live workspace request verified Opus 5 through the current gateway"
+  - "Complete, successful UC listings remain authoritative rather than being unioned with legacy endpoint listings"
+  - "Partial non-Claude UC family inventories retain the existing UC-first behavior; the hardening is scoped to Claude/Pi availability"
   - "uv.lock and .pi-subagents/ remain pre-existing uncommitted worktree changes"
 human_approvals: []
 pr_release_gate:
   pr: "not-applicable; no PR workflow action authorized"
   state: "not-applicable"
-  reviewed_revision: "c45740b53925fb2644bdb671ac39283722d810e9"
+  reviewed_revision: "8f621bcf67e7d847f4ee9e5023288e7b3a492571"
   required_checks_source: "local no-PR branch review"
   required_checks: []
   post_approval_diff: "none"
@@ -104,11 +106,11 @@ lifecycle_history:
   - state: "main-synced"
     actor: "ucode development session"
     timestamp: "2026-08-25"
-    identity: "c45740b53925fb2644bdb671ac39283722d810e9"
+    identity: "8f621bcf67e7d847f4ee9e5023288e7b3a492571"
   - state: "ready-for-human-review"
     actor: "ucode development session"
     timestamp: "2026-08-25"
-    identity: "c45740b53925fb2644bdb671ac39283722d810e9"
+    identity: "8f621bcf67e7d847f4ee9e5023288e7b3a492571"
 final_decision:
   state: "READY_FOR_HUMAN_REVIEW"
   owner: "repository maintainer"

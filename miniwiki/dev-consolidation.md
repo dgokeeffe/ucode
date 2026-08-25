@@ -83,7 +83,7 @@ The stash includes the old untracked diagnostic files, local `tests/test_e2e.py`
 
 ## 2026-08-25 main sync and Pi Claude inventory
 
-`origin/main` was at `95d2356` and was merged into `dev` as `cbde22e`. The ancestry check passed, and `dev` is now 15 commits ahead of `origin/main` with no commits behind it. Main's Claude native discovery, status/managed-config presentation, MCP agent targeting, Claude relay buffering fix, and reproduction harness were retained alongside the consolidated agent work.
+`origin/main` was at `95d2356` and was merged into `dev` as `cbde22e`. The ancestry check passed, and `dev` is now 19 commits ahead of `origin/main` with no commits behind it. Main's Claude native discovery, status/managed-config presentation, MCP agent targeting, Claude relay buffering fix, and reproduction harness were retained alongside the consolidated agent work.
 
 Pi now performs a Pi-only supplemental Claude inventory lookup when writing an unmanaged config. It unions all Claude ids from the cached UC model-services walk with the legacy Anthropic gateway listing when UC is empty, non-Claude-only, or partial. The shared `claude_models` map remains pinned to Opus 4.8 for smart-routing compatibility and therefore remains Pi's default; Opus 5 is registered in Pi's Claude provider and can be selected explicitly. Managed `pi_models` remains authoritative and preserves multiple versions in one Claude family. Fable's existing opt-in behavior is unchanged. UC pagination now rejects malformed tokens, avoids caching incomplete walks, and supplements a partial Claude family map before it reaches the CLI.
 
