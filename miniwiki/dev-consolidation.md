@@ -85,12 +85,12 @@ The stash includes the old untracked diagnostic files, local `tests/test_e2e.py`
 
 `origin/main` was at `95d2356` and was merged into `dev` as `cbde22e`. The ancestry check passed, and `dev` is now 15 commits ahead of `origin/main` with no commits behind it. Main's Claude native discovery, status/managed-config presentation, MCP agent targeting, Claude relay buffering fix, and reproduction harness were retained alongside the consolidated agent work.
 
-Pi now performs a Pi-only supplemental Claude inventory lookup when writing an unmanaged config. It unions all Claude ids from the cached UC model-services walk with the legacy Anthropic gateway listing when UC is empty, non-Claude-only, or partial. The shared `claude_models` map remains pinned to Opus 4.8 for smart-routing compatibility and therefore remains Pi's default; Opus 5 is registered in Pi's Claude provider and can be selected explicitly. Managed `pi_models` remains authoritative and preserves multiple versions in one Claude family. Fable's existing opt-in behavior is unchanged.
+Pi now performs a Pi-only supplemental Claude inventory lookup when writing an unmanaged config. It unions all Claude ids from the cached UC model-services walk with the legacy Anthropic gateway listing when UC is empty, non-Claude-only, or partial. The shared `claude_models` map remains pinned to Opus 4.8 for smart-routing compatibility and therefore remains Pi's default; Opus 5 is registered in Pi's Claude provider and can be selected explicitly. Managed `pi_models` remains authoritative and preserves multiple versions in one Claude family. Fable's existing opt-in behavior is unchanged. UC pagination now rejects malformed tokens, avoids caching incomplete walks, and supplements a partial Claude family map before it reaches the CLI.
 
 Verification for this revision (auditable record: `verification/dev-opus5-c45740b.yaml`):
 
-- `uv run --frozen pytest -q tests/test_agent_pi.py tests/test_databricks.py tests/test_cli.py`: **611 passed**.
-- `uv run --frozen pytest -q -k 'not TestStateFileIsNotRewritten and not test_user_agent_arrives_at_gateway'`: **2093 passed, 37 skipped, 13 deselected in 76.51s**.
+- `uv run --frozen pytest -q tests/test_agent_pi.py tests/test_databricks.py tests/test_cli.py`: **620 passed**.
+- `uv run --frozen pytest -q -k 'not TestStateFileIsNotRewritten and not test_user_agent_arrives_at_gateway'`: **2102 passed, 37 skipped, 13 deselected in 77.93s**.
 - `uv run --frozen pytest -q` was attempted but returned no result after hanging in the known real-state `TestStateFileIsNotRewritten` path; the bounded suite above completed.
 - `uv run --frozen ruff check src tests`: passed.
 - `uv run --frozen ruff format --check src/ tests/`: **81 files already formatted**.

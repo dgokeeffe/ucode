@@ -634,6 +634,17 @@ class TestWriteToolConfig:
         assert written["model"] == "databricks-claude/claude-sonnet"
         assert written["providers"]["databricks-claude"]["apiKey"] == "tok"
 
+    def test_cached_pi_inventory_always_keeps_shared_default(self):
+        state = {
+            "workspace": WS,
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+            "pi_claude_models": ["system.ai.claude-opus-5"],
+        }
+
+        models = pi._discover_pi_claude_models(state, "tok", state["claude_models"])
+
+        assert models == ["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"]
+
     def test_config_discovers_supplemental_claude_versions_for_pi(self, tmp_path, monkeypatch):
         pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
         state = self._state(
