@@ -81,7 +81,27 @@ The pre-sync branch tip and complete dirty worktree were preserved before integr
 
 The stash includes the old untracked diagnostic files, local `tests/test_e2e.py` edit, unrelated `uv.lock` rewrite, and prior orchestration artifacts. Nothing from it was discarded. Rollback is to repoint `dev` to the backup branch; individual files can be recovered from the protected stash ref.
 
+## 2026-08-25 main sync and Pi Claude inventory
+
+`origin/main` was at `95d2356` and was merged into `dev` as `cbde22e`. The ancestry check passed, and `dev` is now 15 commits ahead of `origin/main` with no commits behind it. Main's Claude native discovery, status/managed-config presentation, MCP agent targeting, Claude relay buffering fix, and reproduction harness were retained alongside the consolidated agent work.
+
+Pi now performs a Pi-only supplemental Claude inventory lookup when writing an unmanaged config. It unions all Claude ids from the cached UC model-services walk with the legacy Anthropic gateway listing when UC is empty, non-Claude-only, or partial. The shared `claude_models` map remains pinned to Opus 4.8 for smart-routing compatibility and therefore remains Pi's default; Opus 5 is registered in Pi's Claude provider and can be selected explicitly. Managed `pi_models` remains authoritative and preserves multiple versions in one Claude family. Fable's existing opt-in behavior is unchanged.
+
+Verification for this revision:
+
+- `uv run --frozen pytest -q tests/test_agent_pi.py tests/test_databricks.py tests/test_cli.py`: **611 passed**.
+- `uv run --frozen pytest -q -k 'not TestStateFileIsNotRewritten and not test_user_agent_arrives_at_gateway'`: **2093 passed, 37 skipped, 13 deselected in 76.51s**.
+- `uv run --frozen pytest -q` was attempted but returned no result after hanging in the known real-state `TestStateFileIsNotRewritten` path; the bounded suite above completed.
+- `uv run --frozen ruff check src tests`: passed.
+- `uv run --frozen ruff format --check src/ tests/`: **81 files already formatted**.
+- `git diff --check`: passed; `git merge-base --is-ancestor origin/main HEAD`: passed.
+- No live Databricks e2e was run because `UCODE_TEST_WORKSPACE` was not set.
+
+Independent review found and the parent reproduced/fixed: (1) same-family managed Claude ids being dropped, (2) no supplemental discovery for non-Opus Claude-only states, and (3) legacy gateway fallback being skipped for non-Claude or partial UC inventories. Reviewers also raised Fable inclusion, but that conflicts with the pre-existing explicit Fable opt-in invariant and was intentionally not changed.
+
 ## Residuals and next action
 
+- The full suite's unchanged real-state tests remain unavailable because they hang; the completed bounded suite excludes that class and the known Claude user-agent test.
 - No live Databricks e2e was run in this integration session because `UCODE_TEST_WORKSPACE` was not set.
+- `uv.lock` and `.pi-subagents/` remain pre-existing local worktree changes and were not included in the implementation commit.
 - The local `dev` branch is not pushed by this work. Pushing or opening/updating a PR remains an explicit human action.

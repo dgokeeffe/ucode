@@ -60,6 +60,7 @@ from ucode.databricks import (
     build_pi_base_urls,
     classify_model_family,
     claude_model_capabilities,
+    discover_claude_models_unbucketed,
     get_databricks_token,
     gpt_model_token_limits,
     model_is_reasoning,
@@ -110,12 +111,15 @@ def _resolve_model_selector(
     codex_models: list[str],
     gemini_models: list[str],
     oss_models: list[str],
+    claude_model_ids: list[str] | None = None,
 ) -> str:
     """Return a Pi model selector in `<provider>/<model>` form when possible."""
     for name in PROVIDER_NAMES:
         if model.startswith(f"{name}/"):
             return model
-    if model in claude_models.values():
+    all_claude_models = set(claude_models.values())
+    all_claude_models.update(claude_model_ids or [])
+    if model in all_claude_models:
         return f"databricks-claude/{model}"
     if model in codex_models:
         return f"databricks-openai/{model}"
@@ -142,6 +146,12 @@ def _pi_claude_model_entry(model_id: str) -> dict:
     }
     if capabilities.force_adaptive_thinking:
         entry["compat"] = {"forceAdaptiveThinking": True}
+        # Pi hides its extended levels unless custom models declare them. All
+        # adaptive Claude models support `max`; native `xhigh` is limited to
+        # Opus 4.7/4.8, Sonnet 5, and Fable 5.
+        entry["thinkingLevelMap"] = {"max": "max"}
+        if capabilities.supports_xhigh_thinking:
+            entry["thinkingLevelMap"]["xhigh"] = "xhigh"
     return entry
 
 
@@ -251,6 +261,7 @@ def render_overlay(
     gemini_models: list[str],
     oss_models: list[str],
     oss_specs: list[dict] | None = None,
+    claude_model_ids: list[str] | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Pi's private agent config."""
     providers: dict = {}
@@ -259,7 +270,7 @@ def render_overlay(
     # `/` and a space so it can never collide — safe to pass as a literal.
     ua_headers = {"User-Agent": f"ucode/{ucode_version()} pi/{agent_version('pi')}"}
 
-    claude_ids = sorted(set(claude_models.values()))
+    claude_ids = sorted(set(claude_models.values()) | set(claude_model_ids or []))
     if claude_ids:
         providers["databricks-claude"] = {
             "baseUrl": pi_base_urls["claude"],
@@ -316,7 +327,12 @@ def render_overlay(
         keys.append(["providers", "databricks-mlflow"])
     overlay: dict = {
         "model": _resolve_model_selector(
-            model, claude_models, codex_models, gemini_models, oss_models
+            model,
+            claude_models,
+            codex_models,
+            gemini_models,
+            oss_models,
+            claude_model_ids,
         ),
     }
     if providers:
@@ -349,13 +365,20 @@ def _write_tool_config_unlocked(
         )
     pi_base_urls = state.get("base_urls", {}).get("pi") or build_pi_base_urls(state["workspace"])
     managed_families = _managed_model_families(state)
+    claude_model_ids: list[str] | None = None
     if managed_families is None:
         claude_models = state.get("claude_models") or {}
         codex_models = state.get("codex_models") or []
         gemini_models = state.get("gemini_models") or []
         oss_models = state.get("oss_models") or []
+        # The shared map keeps one model per family; Pi supplements it with
+        # the full inventory for every family that discovery enabled.
+        claude_model_ids = (
+            _discover_pi_claude_models(state, token, claude_models) if claude_models else None
+        )
     else:
         claude_models, codex_models, gemini_models, oss_models = managed_families
+        claude_model_ids = _managed_pi_claude_models(state)
     overlay, managed_keys = render_overlay(
         model,
         token,
@@ -365,6 +388,7 @@ def _write_tool_config_unlocked(
         gemini_models,
         oss_models,
         state.get("oss_model_specs") or [],
+        claude_model_ids,
     )
     existing = read_json_safe(PI_CONFIG_PATH)
     providers = existing.get("providers")
@@ -377,6 +401,47 @@ def _write_tool_config_unlocked(
     state = mark_tool_managed(state, "pi", managed_keys)
     save_state(state)
     return state, token
+
+
+def _managed_pi_claude_models(state: dict) -> list[str]:
+    """Return every Claude id explicitly allowed by a managed Pi config."""
+    managed = state.get("pi_models")
+    if not isinstance(managed, list):
+        return []
+    return [
+        model
+        for model in managed
+        if isinstance(model, str) and classify_model_family(model) in ANTHROPIC_FAMILIES
+    ]
+
+
+def _discover_pi_claude_models(state: dict, token: str, claude_models: dict[str, str]) -> list[str]:
+    """Return all Claude ids Pi may offer without changing shared routing state.
+
+    Shared discovery intentionally keeps one model per Claude family and pins
+    Opus to 4.8 while the smart router requires that arm. Pi is a model picker,
+    so it can safely expose newer versions as long as its default remains the
+    shared pinned id.
+    Cache the supplemental inventory in state after the first Pi config write;
+    a failed supplemental request degrades to the shared family picks.
+    """
+    allowed_families = set(claude_models)
+    cached = state.get("pi_claude_models")
+    if isinstance(cached, list):
+        return [
+            model
+            for model in cached
+            if isinstance(model, str) and classify_model_family(model) in allowed_families
+        ]
+
+    try:
+        discovered, _ = discover_claude_models_unbucketed(state["workspace"], token)
+    except (RuntimeError, OSError):
+        discovered = []
+    if discovered:
+        state["pi_claude_models"] = discovered
+        return [model for model in discovered if classify_model_family(model) in allowed_families]
+    return list(claude_models.values())
 
 
 def _write_settings(model_selector: str, *, clear_unresolved: bool = False) -> None:

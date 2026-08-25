@@ -341,11 +341,33 @@ class TestClaudeModelCapabilities:
         assert capabilities.output == output
         assert capabilities.supports_1m is supports_1m
         assert capabilities.force_adaptive_thinking is adaptive
+        expected_xhigh = model_id in {
+            "claude-sonnet-5",
+            "system.ai.claude-fable-5",
+        }
+        assert capabilities.supports_xhigh_thinking is expected_xhigh
         assert db_mod.claude_model_supports_1m(model_id) is supports_1m
         assert db_mod.claude_model_token_limits(model_id) == {
             "context": context,
             "output": output,
         }
+
+    @pytest.mark.parametrize(
+        ("model_id", "expected"),
+        [
+            ("claude-opus-4-6", False),
+            ("claude-opus-4-7", True),
+            ("system.ai.claude-opus-4-8", True),
+            ("system.ai.claude-opus-5", False),
+            ("claude-sonnet-4-6", False),
+            ("claude-sonnet-5", True),
+            ("claude-sonnet-6", False),
+            ("claude-fable-5", True),
+            ("claude-fable-6", False),
+        ],
+    )
+    def test_xhigh_thinking_is_explicitly_allowlisted(self, model_id, expected):
+        assert db_mod.claude_model_capabilities(model_id).supports_xhigh_thinking is expected
 
 
 class TestModelIsReasoning:
@@ -2830,6 +2852,45 @@ class TestModelServicesCache:
         # for smart-routing compatibility by _prefer_opus_4_8), and the full list.
         assert claude["opus"] == "system.ai.claude-opus-4-8"
         assert unbucketed == ["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"]
+
+    def test_unbucketed_falls_back_to_legacy_gateway_inventory(self, monkeypatch):
+        monkeypatch.setattr(db_mod, "list_model_services", lambda w, t: ([], "UC unavailable"))
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=10: (
+                {
+                    "data": [
+                        {"id": "databricks-claude-opus-4-8"},
+                        {"id": "databricks-claude-opus-5"},
+                        {"id": "databricks-claude-opus-5-anthropic"},
+                    ]
+                },
+                None,
+            ),
+        )
+
+        models, reason = db_mod.discover_claude_models_unbucketed(WS, "tok")
+
+        assert reason is None
+        assert models == ["databricks-claude-opus-4-8", "databricks-claude-opus-5"]
+
+    def test_unbucketed_unions_legacy_inventory_after_partial_uc_walk(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "list_model_services",
+            lambda w, t: (["system.ai.claude-opus-4-8"], "UC page failed"),
+        )
+        monkeypatch.setattr(
+            db_mod,
+            "_discover_claude_gateway_ids",
+            lambda w, t: (["databricks-claude-opus-5"], None),
+        )
+
+        models, reason = db_mod.discover_claude_models_unbucketed(WS, "tok")
+
+        assert reason is None
+        assert models == ["databricks-claude-opus-5", "system.ai.claude-opus-4-8"]
 
     def test_use_cache_false_forces_a_fresh_walk(self, monkeypatch):
         calls: dict = {}

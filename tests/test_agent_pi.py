@@ -157,13 +157,31 @@ class TestRenderOverlayProviders:
         assert opus["reasoning"] is True
         assert opus["input"] == ["text", "image"]
         assert opus["compat"] == {"forceAdaptiveThinking": True}
+        assert opus["thinkingLevelMap"] == {"max": "max", "xhigh": "xhigh"}
         assert entries["system.ai.claude-sonnet-4-5"]["contextWindow"] == 1_000_000
         assert entries["system.ai.claude-sonnet-4-5"]["maxTokens"] == 64_000
+        assert "thinkingLevelMap" not in entries["system.ai.claude-sonnet-4-5"]
         assert entries["databricks-claude-haiku-4-5"]["contextWindow"] == 200_000
         fable = entries["system.ai.claude-fable-5"]
         assert fable["contextWindow"] == 1_000_000
         assert fable["maxTokens"] == 128_000
         assert fable["compat"] == {"forceAdaptiveThinking": True}
+        assert fable["thinkingLevelMap"] == {"max": "max", "xhigh": "xhigh"}
+
+    def test_claude_extended_levels_follow_model_capabilities(self):
+        overlay, _ = _overlay(
+            "claude-sonnet-5",
+            claude_models={
+                "opus": "system.ai.claude-opus-4-6",
+                "sonnet": "system.ai.claude-sonnet-5",
+            },
+        )
+        entries = {m["id"]: m for m in overlay["providers"]["databricks-claude"]["models"]}
+        assert entries["system.ai.claude-opus-4-6"]["thinkingLevelMap"] == {"max": "max"}
+        assert entries["system.ai.claude-sonnet-5"]["thinkingLevelMap"] == {
+            "max": "max",
+            "xhigh": "xhigh",
+        }
 
     def test_gemini_provider_uses_google_generative_ai(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
@@ -357,6 +375,27 @@ class TestRenderOverlayAuthAndModels:
         overlay, _ = _overlay("claude-sonnet", claude_models=claude_models)
         ids = {m["id"] for m in overlay["providers"]["databricks-claude"]["models"]}
         assert ids == {"claude-opus", "claude-sonnet"}
+
+    def test_pi_can_list_supplemental_claude_versions(self):
+        # Shared discovery pins the opus family to 4.8 for smart routing. Pi's
+        # model picker still needs to expose newer versions such as Opus 5.
+        overlay, _ = pi.render_overlay(
+            "system.ai.claude-opus-5",
+            "tok",
+            _base_urls(),
+            {"opus": "system.ai.claude-opus-4-8"},
+            [],
+            [],
+            [],
+            [],
+            ["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"],
+        )
+        provider = overlay["providers"]["databricks-claude"]
+        assert {model["id"] for model in provider["models"]} == {
+            "system.ai.claude-opus-4-8",
+            "system.ai.claude-opus-5",
+        }
+        assert overlay["model"] == "databricks-claude/system.ai.claude-opus-5"
 
     def test_openai_models_listed(self):
         overlay, _ = _overlay("gpt-5", codex_models=["gpt-5", "gpt-5-mini"])
@@ -595,6 +634,71 @@ class TestWriteToolConfig:
         assert written["model"] == "databricks-claude/claude-sonnet"
         assert written["providers"]["databricks-claude"]["apiKey"] == "tok"
 
+    def test_config_discovers_supplemental_claude_versions_for_pi(self, tmp_path, monkeypatch):
+        pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
+        state = self._state(
+            claude_models={"opus": "system.ai.claude-opus-4-8"},
+        )
+        with (
+            patch.object(
+                pi_mod,
+                "discover_claude_models_unbucketed",
+                return_value=(
+                    ["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"],
+                    None,
+                ),
+            ) as discover,
+            patch("ucode.agents.pi.save_state"),
+        ):
+            pi_mod.write_tool_config(state, "system.ai.claude-opus-4-8", token="tok")
+
+        discover.assert_called_once_with(WS, "tok")
+        assert state["pi_claude_models"] == [
+            "system.ai.claude-opus-4-8",
+            "system.ai.claude-opus-5",
+        ]
+        ids = {
+            model["id"]
+            for model in json.loads(config_file.read_text())["providers"]["databricks-claude"][
+                "models"
+            ]
+        }
+        assert ids == {"system.ai.claude-opus-4-8", "system.ai.claude-opus-5"}
+
+    def test_config_discovers_supplemental_claude_versions_without_opus(
+        self, tmp_path, monkeypatch
+    ):
+        pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
+        state = self._state(
+            claude_models={"sonnet": "system.ai.claude-sonnet-4-6"},
+        )
+        with (
+            patch.object(
+                pi_mod,
+                "discover_claude_models_unbucketed",
+                return_value=(
+                    [
+                        "system.ai.claude-sonnet-4-5",
+                        "system.ai.claude-sonnet-4-6",
+                    ],
+                    None,
+                ),
+            ) as discover,
+            patch("ucode.agents.pi.save_state"),
+        ):
+            pi_mod.write_tool_config(state, "system.ai.claude-sonnet-4-6", token="tok")
+
+        discover.assert_called_once_with(WS, "tok")
+        assert {
+            model["id"]
+            for model in json.loads(config_file.read_text())["providers"]["databricks-claude"][
+                "models"
+            ]
+        } == {
+            "system.ai.claude-sonnet-4-5",
+            "system.ai.claude-sonnet-4-6",
+        }
+
     def test_state_oss_specs_reach_written_model_entry(self, tmp_path, monkeypatch):
         pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
         state = self._state(
@@ -634,6 +738,29 @@ class TestWriteToolConfig:
         assert [model["id"] for model in providers["databricks-mlflow"]["models"]] == [
             "system.ai.deepseek-v4-pro"
         ]
+
+    def test_managed_pi_allowlist_keeps_same_family_claude_versions(self, tmp_path, monkeypatch):
+        pi_mod, config_file, settings_file, _ = self._setup(tmp_path, monkeypatch)
+        state = self._state(
+            pi_models=[
+                "system.ai.claude-opus-4-8",
+                "system.ai.claude-opus-5",
+            ],
+            pi_default_model="system.ai.claude-opus-5",
+        )
+
+        with patch("ucode.agents.pi.save_state"):
+            pi_mod.write_tool_config(state, pi.default_model(state), token="tok")
+
+        written = json.loads(config_file.read_text())
+        assert {model["id"] for model in written["providers"]["databricks-claude"]["models"]} == {
+            "system.ai.claude-opus-4-8",
+            "system.ai.claude-opus-5",
+        }
+        assert written["model"] == "databricks-claude/system.ai.claude-opus-5"
+        settings = json.loads(settings_file.read_text())
+        assert settings["defaultProvider"] == "databricks-claude"
+        assert settings["defaultModel"] == "system.ai.claude-opus-5"
 
     def test_settings_pins_default_provider_and_model(self, tmp_path, monkeypatch):
         # Without this, Pi's `findInitialModel` can fall through to a built-in

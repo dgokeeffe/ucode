@@ -1774,6 +1774,7 @@ class ClaudeModelCapabilities:
     output: int
     supports_1m: bool = False
     force_adaptive_thinking: bool = False
+    supports_xhigh_thinking: bool = False
 
 
 _CLAUDE_FALLBACK_CAPABILITIES = ClaudeModelCapabilities(context=200_000, output=64_000)
@@ -1800,6 +1801,7 @@ def claude_model_capabilities(model_id: str) -> ClaudeModelCapabilities:
             output=128_000,
             supports_1m=True,
             force_adaptive_thinking=True,
+            supports_xhigh_thinking=version in {(4, 7), (4, 8)},
         )
     if family == "sonnet" and version >= (4, 6):
         return ClaudeModelCapabilities(
@@ -1807,6 +1809,7 @@ def claude_model_capabilities(model_id: str) -> ClaudeModelCapabilities:
             output=64_000,
             supports_1m=True,
             force_adaptive_thinking=True,
+            supports_xhigh_thinking=version == (5, 0),
         )
     if family == "sonnet" and version >= (4, 5):
         return ClaudeModelCapabilities(context=1_000_000, output=64_000, supports_1m=True)
@@ -1815,6 +1818,7 @@ def claude_model_capabilities(model_id: str) -> ClaudeModelCapabilities:
             context=1_000_000,
             output=128_000,
             force_adaptive_thinking=True,
+            supports_xhigh_thinking=version == (5, 0),
         )
     return _CLAUDE_FALLBACK_CAPABILITIES
 
@@ -1922,8 +1926,8 @@ def list_model_services(
     ``system.ai`` schema (``parent=schemas/system.ai``) with a bounded
     ``page_size`` (the endpoint 499s without one) and returns the de-duplicated,
     sorted list of ``system.ai.<model-name>`` ids. Returns (ids, reason); reason
-    is None on success, otherwise it describes why the list is empty (HTTP/network
-    error or no services). Scoping matters: the unscoped metastore listing walks
+    is None on a complete success, otherwise it describes an HTTP/network error
+    or an empty or incomplete listing. Scoping matters: the unscoped metastore listing walks
     every schema across dozens of ~2s pages (~50s on a busy workspace) only to
     keep the same ``system.ai.*`` subset — see ``_MODEL_SERVICE_PARENT_SCHEMA``.
 
@@ -1970,6 +1974,10 @@ def list_model_services(
 
     deduped = sorted(set(ids))
     if deduped:
+        # Do not cache an incomplete walk: callers that need the full inventory
+        # can fall back to the legacy gateway listing or retry the UC walk.
+        if last_reason is not None:
+            return deduped, last_reason
         if use_cache:
             _MODEL_SERVICES_CACHE[workspace] = list(deduped)
         return deduped, None
@@ -2044,18 +2052,47 @@ def model_service_exists(
     return False, None
 
 
+def _discover_claude_gateway_ids(workspace: str, token: str) -> tuple[list[str], str | None]:
+    """Return all Claude model ids from the legacy AI Gateway listing."""
+    hostname = workspace_hostname(workspace)
+    payload, reason = _http_get_json(f"https://{hostname}/ai-gateway/anthropic/v1/models", token)
+    if payload is None:
+        return [], reason
+    data = cast(dict, payload) if isinstance(payload, dict) else {}
+    ids = [
+        model["id"]
+        for model in data.get("data", [])
+        if isinstance(model, dict)
+        and isinstance(model.get("id"), str)
+        and not model["id"].endswith("-anthropic")
+    ]
+    if ids:
+        return ids, None
+    return [], "AI Gateway returned no Claude model ids"
+
+
 def discover_claude_models_unbucketed(workspace: str, token: str) -> tuple[list[str], str | None]:
-    """Every `system.ai.claude-*` id on the workspace, unbucketed.
+    """Every Claude model id on the workspace, unbucketed.
 
     `discover_model_services` keeps only the newest id per family because the launch path pins one
     model per Claude family alias. An admin authoring a managed config needs the alternatives too
     (see `managed_setup.claude_family_candidates`), so this returns the full set without disturbing
-    that shape.
+    that shape. When UC model-services is unavailable, fall back to the legacy AI Gateway listing
+    so Pi and managed setup can still see all gateway models.
     """
     ids, reason = list_model_services(workspace, token)
-    if not ids:
-        return [], reason
-    return [m for m in ids if "claude-" in m.lower()], None
+    uc_claude = [model for model in ids if "claude-" in model.lower()]
+    # A non-Claude UC result, or a partial UC walk, must not hide models from
+    # the legacy gateway inventory. Union both successful views when available.
+    if uc_claude and reason is None:
+        return uc_claude, None
+    gateway_ids, gateway_reason = _discover_claude_gateway_ids(workspace, token)
+    gateway_claude = [model for model in gateway_ids if "claude-" in model.lower()]
+    if gateway_claude:
+        return sorted(set(uc_claude) | set(gateway_claude)), None
+    if uc_claude:
+        return uc_claude, None
+    return [], reason or gateway_reason
 
 
 def _prefer_opus_4_8(models: dict[str, str], all_ids: list[str]) -> None:
@@ -3118,18 +3155,7 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
     describes why the dict is empty (HTTP error, network error, or no models
     matching the expected naming convention).
     """
-    hostname = workspace_hostname(workspace)
-    payload, reason = _http_get_json(f"https://{hostname}/ai-gateway/anthropic/v1/models", token)
-    if payload is None:
-        return {}, reason
-
-    data = cast(dict, payload) if isinstance(payload, dict) else {}
-    raw_ids = [
-        m["id"]
-        for m in data.get("data", [])
-        if isinstance(m.get("id"), str) and not m["id"].endswith("-anthropic")
-    ]
-
+    raw_ids, reason = _discover_claude_gateway_ids(workspace, token)
     result: dict[str, str] = {}
     for family in ANTHROPIC_FAMILIES:
         candidates = sorted(
