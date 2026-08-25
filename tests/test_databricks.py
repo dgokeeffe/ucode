@@ -494,6 +494,34 @@ class TestDiscoverModelServices:
         assert codex == ["system.ai.gpt-5"]
         assert claude == {"opus": "system.ai.claude-opus-4-8"}
 
+    def test_partial_uc_listing_supplements_missing_claude_families(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "list_model_services",
+            lambda w, t: (["system.ai.claude-opus-4-8"], "UC page failed"),
+        )
+        monkeypatch.setattr(
+            db_mod,
+            "discover_claude_models",
+            lambda w, t: (
+                {
+                    "opus": "databricks-claude-opus-4-8",
+                    "sonnet": "databricks-claude-sonnet-5",
+                },
+                None,
+            ),
+        )
+        monkeypatch.setattr(db_mod, "discover_oss_model_specs", lambda w, t, ids: ([], None))
+
+        claude, codex, gemini, oss, reason = db_mod.discover_model_services(WS, "token")
+
+        assert reason is None
+        assert claude == {
+            "opus": "system.ai.claude-opus-4-8",
+            "sonnet": "databricks-claude-sonnet-5",
+        }
+        assert (codex, gemini, oss) == ([], [], [])
+
     def test_http_failure_returns_reason(self, monkeypatch):
         monkeypatch.setattr(
             db_mod, "_http_get_json", lambda url, token, timeout=10: (None, "HTTP 500 Server Error")
@@ -2891,6 +2919,81 @@ class TestModelServicesCache:
 
         assert reason is None
         assert models == ["databricks-claude-opus-5", "system.ai.claude-opus-4-8"]
+
+    def test_malformed_legacy_model_data_is_safe(self, monkeypatch):
+        monkeypatch.setattr(db_mod, "list_model_services", lambda w, t: ([], "UC unavailable"))
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=10: ({"data": None}, None),
+        )
+
+        models, reason = db_mod.discover_claude_models_unbucketed(WS, "tok")
+
+        assert models == []
+        assert reason == "UC unavailable"
+
+    def test_repeated_uc_page_token_is_incomplete_and_uses_gateway_fallback(self, monkeypatch):
+        db_mod.clear_model_services_cache()
+
+        def page(url, token):
+            return {
+                "model_services": [
+                    {"name": "model-services/system.ai.claude-opus-4-8"},
+                ],
+                "next_page_token": "repeat",
+            }, None
+
+        monkeypatch.setattr(db_mod, "_get_model_services_page", page)
+        monkeypatch.setattr(
+            db_mod,
+            "_discover_claude_gateway_ids",
+            lambda w, t: (["databricks-claude-opus-5"], None),
+        )
+
+        models, reason = db_mod.discover_claude_models_unbucketed(WS, "tok")
+
+        assert reason is None
+        assert models == ["databricks-claude-opus-5", "system.ai.claude-opus-4-8"]
+        # The incomplete UC result must not poison the process-local cache.
+        assert WS not in db_mod._MODEL_SERVICES_CACHE
+
+    def test_malformed_uc_model_services_degrades_to_empty_result(self, monkeypatch):
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_get_model_services_page",
+            lambda url, token: ({"model_services": None}, None),
+        )
+
+        models, reason = db_mod.list_model_services(WS, "tok")
+
+        assert models == []
+        assert reason == "model-services listing returned invalid model_services"
+        assert WS not in db_mod._MODEL_SERVICES_CACHE
+
+    @pytest.mark.parametrize("invalid_token", [[], {}, 0, False])
+    def test_falsey_non_string_page_token_is_incomplete(self, monkeypatch, invalid_token):
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_get_model_services_page",
+            lambda url, token: (
+                {
+                    "model_services": [
+                        {"name": "model-services/system.ai.claude-opus-4-8"},
+                    ],
+                    "next_page_token": invalid_token,
+                },
+                None,
+            ),
+        )
+
+        models, reason = db_mod.list_model_services(WS, "tok")
+
+        assert models == ["system.ai.claude-opus-4-8"]
+        assert reason == "model-services listing returned an invalid page token"
+        assert WS not in db_mod._MODEL_SERVICES_CACHE
 
     def test_use_cache_false_forces_a_fresh_walk(self, monkeypatch):
         calls: dict = {}

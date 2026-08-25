@@ -428,11 +428,12 @@ def _discover_pi_claude_models(state: dict, token: str, claude_models: dict[str,
     allowed_families = set(claude_models)
     cached = state.get("pi_claude_models")
     if isinstance(cached, list):
-        return [
+        cached_models = [
             model
             for model in cached
             if isinstance(model, str) and classify_model_family(model) in allowed_families
         ]
+        return list(dict.fromkeys([*claude_models.values(), *cached_models]))
 
     try:
         discovered, _ = discover_claude_models_unbucketed(state["workspace"], token)
@@ -440,7 +441,10 @@ def _discover_pi_claude_models(state: dict, token: str, claude_models: dict[str,
         discovered = []
     if discovered:
         state["pi_claude_models"] = discovered
-        return [model for model in discovered if classify_model_family(model) in allowed_families]
+        discovered_models = [
+            model for model in discovered if classify_model_family(model) in allowed_families
+        ]
+        return list(dict.fromkeys([*claude_models.values(), *discovered_models]))
     return list(claude_models.values())
 
 

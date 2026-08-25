@@ -1955,22 +1955,37 @@ def list_model_services(
         payload, reason = _get_model_services_page(url, token)
         if payload is None:
             # Surface the failure only if we have nothing yet; a mid-pagination
-            # blip still returns whatever we collected.
+            # blip still returns whatever we collected, but marks it incomplete
+            # so consumers can retry or use a fallback inventory.
             last_reason = reason
             break
-        data = cast(dict, payload) if isinstance(payload, dict) else {}
-        for service in data.get("model_services", []):
+        if not isinstance(payload, dict):
+            last_reason = "model-services listing returned invalid JSON"
+            break
+        data = cast(dict, payload)
+        raw_services = data.get("model_services", [])
+        if not isinstance(raw_services, list):
+            last_reason = "model-services listing returned invalid model_services"
+            break
+        for service in raw_services:
             if isinstance(service, dict):
                 model_id = _model_service_id(service)
                 if model_id:
                     ids.append(model_id)
-        page_token = data.get("next_page_token") or None
-        if not page_token:
+        next_page_token = data.get("next_page_token")
+        if next_page_token is None or next_page_token == "":
             last_reason = None
             break
-        if page_token in seen_tokens:
+        if not isinstance(next_page_token, str):
+            last_reason = "model-services listing returned an invalid page token"
             break
-        seen_tokens.add(page_token)
+        if next_page_token in seen_tokens:
+            last_reason = "model-services listing repeated a page token"
+            break
+        seen_tokens.add(next_page_token)
+        page_token = next_page_token
+    else:
+        last_reason = "model-services listing exceeded the page limit"
 
     deduped = sorted(set(ids))
     if deduped:
@@ -2058,10 +2073,15 @@ def _discover_claude_gateway_ids(workspace: str, token: str) -> tuple[list[str],
     payload, reason = _http_get_json(f"https://{hostname}/ai-gateway/anthropic/v1/models", token)
     if payload is None:
         return [], reason
-    data = cast(dict, payload) if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        return [], "AI Gateway returned invalid Claude model data"
+    data = cast(dict, payload)
+    raw_models = data.get("data", [])
+    if not isinstance(raw_models, list):
+        return [], "AI Gateway returned invalid Claude model data"
     ids = [
         model["id"]
-        for model in data.get("data", [])
+        for model in raw_models
         if isinstance(model, dict)
         and isinstance(model.get("id"), str)
         and not model["id"].endswith("-anthropic")
@@ -2145,6 +2165,14 @@ def discover_model_services(
     # routing works with the currently-deployed task_v1 router. Revert to
     # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
     _prefer_opus_4_8(claude_models, ids)
+    if reason is not None:
+        # A partial UC walk may omit an entire Claude family. Supplement the
+        # shared map too, not only Pi's unbucketed picker, so every agent gets
+        # the same routing-safe family inventory when the legacy listing works.
+        legacy_claude, _ = discover_claude_models(workspace, token)
+        for family, model in legacy_claude.items():
+            claude_models.setdefault(family, model)
+        _prefer_opus_4_8(claude_models, [*ids, *legacy_claude.values()])
 
     # `gpt-oss-*` also contains "gpt-" but is a chat-completions-only OSS model
     # (served via /ai-gateway/mlflow/v1), NOT an openai-responses codex model —
