@@ -176,13 +176,23 @@ def _policy_summary_lines(managed: dict) -> list[str]:
     return lines
 
 
-def _print_managed_summary(managed: dict, state: dict, tool: str | None) -> None:
+def _print_managed_summary(
+    managed: dict, state: dict, tool: str | None, *, abridged: bool = False
+) -> None:
     """Show which of the admin's settings are in force.
 
     With ``tool`` set (launch path) the per-agent Agent/Provider/Model lines are included;
     with ``tool=None`` (e.g. ``ucode configure`` under a managed config) they are skipped
     since no single agent has been chosen yet.
+
+    ``abridged`` prints only what changes launch-to-launch — the agent and model this run will use,
+    and the policy in force — with a pointer to ``ucode status`` for the rest. Bare ``ucode`` runs
+    every session, so re-enumerating the workspace's full MCP/skills/tier list each time is noise;
+    the full box stays for ``status`` and ``configure``, where the reader asked to see it.
     """
+    if abridged:
+        _print_managed_summary_abridged(managed, state, tool)
+        return
     lines = [f"[bold]Workspace:[/bold] [cyan]{state.get('workspace', '?')}[/cyan]"]
     if tool is not None:
         lines.append(f"[bold]Agent:[/bold] [green]{TOOL_SPECS[tool]['display']}[/green]")
@@ -218,6 +228,27 @@ def _print_managed_summary(managed: dict, state: dict, tool: str | None) -> None
     lines.extend(_policy_summary_lines(managed))
     console.print(
         Panel("\n".join(lines), title="Workspace-managed config", style="green", expand=False)
+    )
+
+
+def _print_managed_summary_abridged(managed: dict, state: dict, tool: str | None) -> None:
+    """One-line launch banner: which agent (and model) this managed run is launching.
+
+    Bare ``ucode`` runs every session, so the full box's MCP/skills/policy enumeration is noise
+    each time; ``ucode status`` still shows all of it. See ``_print_managed_summary``'s ``abridged``
+    note. ``tool`` is always set on the launch path, but is guarded for callers that pass None."""
+    if tool is None:
+        print_note("Using managed config.")
+        return
+    agent = TOOL_SPECS[tool]["display"]
+    model = managed_default_model(managed, tool)
+    model_suffix = f" with [magenta]{model}[/magenta]" if model else ""
+    # "as the default agent" only when this really is the config's default: a budget tier can
+    # override the default and launch a different agent, and the tier note in `_launch_tool` already
+    # explains that case — so claiming "default" here would contradict it.
+    role = " as the default agent" if tool == managed.get("default_agent") else ""
+    console.print(
+        f"[dim]•[/dim] Using managed config — launching [green]{agent}[/green]{role}{model_suffix}"
     )
 
 
@@ -941,6 +972,16 @@ def status() -> int:
     if profile:
         print_kv("CLI profile", profile)
 
+    # When the workspace publishes a managed config and this run has the feature switched on, that
+    # admin-authored config is what launches actually apply — so surface the whole setup as one box
+    # here too, rather than leaving a developer to infer it from the per-agent rows below. Read from
+    # the local cache (no network): status is a quick, offline-safe glance, and the cache is what the
+    # last launch persisted for this workspace.
+    if workspace and managed_agent_config_enabled():
+        managed = load_managed_state(workspace)
+        if managed:
+            _print_managed_summary(managed, state, None)
+
     print_heading("Coding Agents")
     for tool, spec in TOOL_SPECS.items():
         configured = tool in configured_tools
@@ -1086,6 +1127,36 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+def _configure_agents_for_mcp(
+    requested: list[str], *, prompt_optional_updates: bool = True
+) -> set[str]:
+    """Ensure the named coding agents are set up (workspace + models) so a
+    subsequent `ucode mcp add` has them as targets, and return their canonical
+    names. Mirrors `ucode configure --agents`: model agents go through
+    configure_workspace_command (which installs binaries and configures models);
+    Cursor is MCP-only, so it just needs workspace state established and rides
+    along via MCP_ONLY_CLIENTS. Interactive — prompts for the workspace URL on
+    first run."""
+    wants_cursor = "cursor" in requested
+    model_agent_names = ",".join(a for a in requested if a != "cursor")
+    configured: set[str] = set()
+    if model_agent_names:
+        selected_tools = _parse_agents_option(model_agent_names)
+        configure_workspace_command(
+            selected_tools=selected_tools, prompt_optional_updates=prompt_optional_updates
+        )
+        configured.update(selected_tools)
+    if wants_cursor:
+        # Establish workspace state for a Cursor-only run; when model agents were
+        # configured above the workspace is already set, so Cursor just rides along.
+        if not model_agent_names:
+            _configure_shared_workspace_states(
+                [_prompt_for_configuration(None)], tools=[], force_login=True
+            )
+        configured.add("cursor")
+    return configured
+
+
 @mcp_app.command("add")
 def mcp_add(
     location: Annotated[
@@ -1107,15 +1178,32 @@ def mcp_add(
             'an empty `--services ""` adds nothing (no-op).',
         ),
     ] = None,
+    agents: Annotated[
+        str | None,
+        typer.Option(
+            "--agents",
+            help="Comma-separated coding agents to register the server(s) for (e.g. "
+            "claude,codex,cursor). Any that aren't configured yet are set up first "
+            "(workspace + models), so this works as a one-command setup. Without --agents, "
+            "the server is registered for every already-configured agent.",
+        ),
+    ] = None,
 ) -> None:
     """Add Databricks MCP servers to installed coding tools.
 
     Like `ucode configure mcp`, but purely additive: it never removes MCP servers
-    that are already configured, only registers new ones.
+    that are already configured, only registers new ones. Pass --agents to target
+    (and, if needed, set up) specific agents.
     """
     selected = None if services is None else {s.strip() for s in services.split(",") if s.strip()}
+    requested_agents = (
+        None
+        if agents is None
+        else ({a.strip().lower() for a in agents.split(",") if a.strip()} or None)
+    )
     try:
-        add_mcp_command(location=location, services=selected)
+        scope = _configure_agents_for_mcp(sorted(requested_agents)) if requested_agents else None
+        add_mcp_command(location=location, services=selected, agents=scope)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
@@ -1125,14 +1213,30 @@ def mcp_add(
 
 
 @mcp_app.command("remove")
-def mcp_remove() -> None:
+def mcp_remove(
+    agents: Annotated[
+        str | None,
+        typer.Option(
+            "--agents",
+            help="Comma-separated coding agents to remove the server(s) from (e.g. "
+            "claude,codex). A server registered on several agents is unregistered only "
+            "from the named ones and kept on the rest. Without --agents, a selected server "
+            "is removed from every agent it's on.",
+        ),
+    ] = None,
+) -> None:
     """Remove configured Databricks MCP servers from your coding tools.
 
     Interactive: shows the servers you currently have configured and unregisters the
     ones you select. Needs no Databricks login.
     """
+    requested_agents = (
+        None
+        if agents is None
+        else ({a.strip().lower() for a in agents.split(",") if a.strip()} or None)
+    )
     try:
-        remove_mcp_command()
+        remove_mcp_command(agents=requested_agents)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
@@ -2025,7 +2129,7 @@ def _launch_managed_default(
             "Your workspace's managed config names no agent to launch. Ask an admin to set a "
             "default agent, or run `ucode <agent>` directly."
         )
-    _print_managed_summary(managed, state, tool)
+    _print_managed_summary(managed, state, tool, abridged=True)
     _launch_tool(
         tool,
         ctx,
