@@ -87,7 +87,7 @@ The stash includes the old untracked diagnostic files, local `tests/test_e2e.py`
 
 Pi now performs a Pi-only supplemental Claude inventory lookup when writing an unmanaged config. It unions all Claude ids from the cached UC model-services walk with the legacy Anthropic gateway listing when UC is empty, non-Claude-only, or partial. The shared `claude_models` map remains pinned to Opus 4.8 for smart-routing compatibility and therefore remains Pi's default; Opus 5 is registered in Pi's Claude provider and can be selected explicitly. Managed `pi_models` remains authoritative and preserves multiple versions in one Claude family. Fable's existing opt-in behavior is unchanged.
 
-Verification for this revision:
+Verification for this revision (auditable record: `verification/dev-opus5-c45740b.yaml`):
 
 - `uv run --frozen pytest -q tests/test_agent_pi.py tests/test_databricks.py tests/test_cli.py`: **611 passed**.
 - `uv run --frozen pytest -q -k 'not TestStateFileIsNotRewritten and not test_user_agent_arrives_at_gateway'`: **2093 passed, 37 skipped, 13 deselected in 76.51s**.
