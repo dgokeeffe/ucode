@@ -2646,12 +2646,13 @@ def configure(
             # The workspaces were just configured, so enable tracing for them
             # directly instead of re-prompting. Fall back to the workspace that
             # `configure_workspace_command` made current (the interactive pick).
-            tracing_workspaces = workspace_entries
-            if tracing_workspaces is None:
+            if workspace_entries is None:
                 current = load_full_state().get("current_workspace")
-                tracing_workspaces = [(current, None)] if current else None
-            if tracing_workspaces:
-                configure_tracing_command(workspaces=tracing_workspaces)
+                if isinstance(current, str) and current:
+                    fallback_workspaces: list[tuple[str, str | None]] = [(current, None)]
+                    configure_tracing_command(workspaces=fallback_workspaces)
+            elif workspace_entries:
+                configure_tracing_command(workspaces=workspace_entries)
         if mcp is not None:
             # The workspace + agents were just configured above, so the current
             # workspace state now lists the agents whose MCP configs we should

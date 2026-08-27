@@ -239,10 +239,10 @@ def _responses_specs_by_id(raw_specs: object) -> dict[str, dict[str, object]]:
 
 
 def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) -> dict:
-    """Build a Pi openai (codex) model entry with `contextWindow`/`maxTokens`
-    from `databricks.gpt_model_token_limits`. GPT ids aren't in Pi's built-in
-    catalog, so without an explicit window Pi falls back to a small default and
-    truncates long sessions.
+    """Build a Pi Responses model entry with explicit limits and reasoning.
+
+    Gateway ids aren't in Pi's built-in catalog, so capabilities must be
+    declared here rather than inherited from Pi's vendor model registry.
 
     `thinkingLevelMap: {"off": None}` is required alongside `reasoning: True`.
     When a model declares `reasoning` but no off-state, Pi's Responses builder
@@ -263,7 +263,24 @@ def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
         "contextWindow": discovered_context or limits["context"],
         "maxTokens": limits["output"],
     }
-    if "gpt-5" in model_id.lower().replace(".", "-"):
+    normalized_id = model_id.rsplit("/", 1)[-1].lower()
+    for prefix in ("system.ai.", "databricks-"):
+        if normalized_id.startswith(prefix):
+            normalized_id = normalized_id[len(prefix) :]
+            break
+    normalized_id = normalized_id.replace(".", "-")
+    if normalized_id == "grok-4-6":
+        # Grok 4.6 is reasoning-only. Databricks supports low/medium/high/xhigh;
+        # hide Pi's unsupported off/minimal/max choices instead of mapping them
+        # to values the gateway would reject.
+        entry["reasoning"] = True
+        entry["thinkingLevelMap"] = {
+            "off": None,
+            "minimal": None,
+            "xhigh": "xhigh",
+            "max": None,
+        }
+    elif "gpt-5" in normalized_id:
         entry["reasoning"] = True
         entry["input"] = ["text", "image"]
         entry["thinkingLevelMap"] = {"off": None}
