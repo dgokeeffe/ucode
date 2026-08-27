@@ -424,8 +424,30 @@ class TestRenderOverlayAuthAndModels:
         provider = overlay["providers"]["databricks-openai"]
         assert provider["api"] == "openai-responses"
         assert [model["id"] for model in provider["models"]] == [grok]
-        assert provider["models"][0]["contextWindow"] == 500_000
+        entry = provider["models"][0]
+        assert entry["contextWindow"] == 500_000
+        assert entry["reasoning"] is True
+        assert entry["thinkingLevelMap"] == {
+            "off": None,
+            "minimal": None,
+            "xhigh": "xhigh",
+            "max": None,
+        }
         assert overlay["model"] == f"databricks-openai/{grok}"
+
+    def test_databricks_grok_id_gets_same_thinking_levels(self):
+        entry = pi._pi_gpt_model_entry("databricks-grok-4-6")
+        assert entry["reasoning"] is True
+        assert entry["thinkingLevelMap"]["xhigh"] == "xhigh"
+        assert entry["thinkingLevelMap"]["off"] is None
+
+    def test_grok_preview_does_not_inherit_unverified_thinking_levels(self):
+        model = "system.ai.grok-4-6-preview"
+        overlay, _ = _overlay(model, codex_models=[model])
+
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+        assert "reasoning" not in entry
+        assert "thinkingLevelMap" not in entry
 
     def test_gemini_models_listed(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2", "gemini-2-pro"])

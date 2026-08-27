@@ -1,0 +1,111 @@
+handoff_artifact: verification/grok-pi-thinking-3feb9cd.yaml
+handoff_security:
+  classification: "internal development evidence"
+  authorized_audience: ["repository owner", "maintainers"]
+  owner: "parent coding agent"
+  retention: "repository lifetime"
+verification_identity:
+  repository: "/Users/david.okeeffe/Repos/ucode"
+  base_revision: "3feb9cd85969a27644de7e01cb69bd8910ce5ded"
+  head_revision: "3feb9cd85969a27644de7e01cb69bd8910ce5ded plus scoped dirty change"
+  dirty_state_digest: "5cfead9405ae13d5e06568bac235492583317b712b74aa729cb81916d497b22e (Pi, test, CLI type reconciliation, and miniwiki; excludes this record and .pi-subagents)"
+repository_policy:
+  source: "AGENTS.md and user-level .pi/agent/AGENTS.md"
+  pr_required: false
+  required_checks_source: "Local dev integration; no push/release authorized"
+external_action_authorizations: []
+contract:
+  intended_outcomes:
+    - "Exact Grok 4.6 IDs are reasoning-enabled in Pi"
+    - "Pi exposes only Grok-supported low, medium, high, and xhigh effort levels"
+    - "Pi suppresses off, minimal, and max rather than emitting unsupported values"
+    - "Preview/future Grok IDs do not inherit unverified capabilities"
+    - "Existing GPT and non-reasoning model behavior remains unchanged"
+  non_goals:
+    - "Do not diagnose or mask live 429 rate limits in this change"
+    - "Do not alter routes, authentication, or token limits"
+impact_map:
+  production_paths:
+    - "src/ucode/agents/pi.py: Responses model reasoning metadata"
+    - "src/ucode/cli.py: behavior-preserving type-inference reconciliation after dependency update"
+  tests:
+    - "tests/test_agent_pi.py"
+deterministic_plan:
+  - "Assert exact Grok IDs, preview exclusion, and generated Pi thinking levels"
+  - "Execute installed Pi runtime level resolution"
+  - "Run focused and bounded full suites plus type/static checks"
+command_results:
+  - command: "uv run --frozen pytest -q tests/test_agent_pi.py tests/test_databricks.py tests/test_cli.py"
+    exit_code: 0
+    result: "641 passed in 32.66s"
+  - command: "installed Pi getSupportedThinkingLevels on actual generated Grok entry"
+    exit_code: 0
+    result: "low, medium, high, xhigh"
+  - command: "uv run --frozen pytest -q -k 'not TestStateFileIsNotRewritten and not test_user_agent_arrives_at_gateway'"
+    exit_code: 0
+    result: "2178 passed, 37 skipped, 13 deselected in 64.94s"
+  - command: "uv run --frozen ty check src/; ruff check/format; git diff --check"
+    exit_code: 0
+    result: "all passed"
+reviewer_reports:
+  - role: "requirements-reviewer"
+    run_id: "3e8e9600"
+    finding: "Grok substring matching could affect preview IDs"
+    disposition: "fixed with exact normalized model ID"
+  - role: "edge-case-reviewer"
+    run_id: "dc38df65"
+    finding: "Contrary null-map semantics hypothesis"
+    disposition: "refuted by installed Pi source and executable level result"
+  - role: "requirements-reviewer re-review"
+    run_id: "d459d4dc"
+    result: "no blockers"
+  - role: "edge-case-reviewer re-review"
+    run_id: "04c0f1b1"
+    result: "no blockers"
+  - role: "regression-reviewer"
+    run_id: "1258b5a3"
+    result: "no blockers"
+finding_reproductions:
+  - finding: "Grok was registered as non-reasoning because only gpt-5 IDs enabled reasoning"
+    reproduction: "Generated Grok entry lacked reasoning and thinkingLevelMap"
+    fix: "Exact Grok 4.6 capability map"
+  - finding: "Substring match would apply Grok 4.6 assumptions to preview IDs"
+    reproduction: "system.ai.grok-4-6-preview matched the initial condition"
+    fix: "Normalize provider prefix/version spelling and require exact grok-4-6"
+  - finding: "Updated dependency type checker rejected tracing fallback list inference"
+    reproduction: "uv run --frozen ty check src/ failed at cli.py configure_tracing_command"
+    fix: "Behavior-preserving explicitly typed fallback list"
+fixes_and_re_review:
+  - fix: "Exact Grok reasoning metadata and negative preview coverage"
+    re_review: "requirements and edge re-review passed"
+  - fix: "Explicit tracing fallback typing"
+    re_review: "type checker and bounded full suite passed"
+adjudication:
+  role: "verification-adjudicator"
+  run_id: "20085341"
+  decision: "READY_FOR_HUMAN_REVIEW"
+  rationale: "Installed Pi runtime confirms exact supported levels; no reproduced blocker survives"
+unavailable_checks:
+  - "Live Grok request was not run because UCODE_TEST_WORKSPACE is unset"
+residual_risks:
+  - "Reported repeated HTTP 429 remains a distinct live Gateway/upstream rate-limit issue requiring response headers"
+  - "Grok route success and reasoning requests still require live workspace confirmation"
+human_approvals: []
+pr_release_gate:
+  pr: "not-applicable"
+  state: "not-applicable"
+  reviewed_revision: "local dirty integration digest 5cfead9405ae13d5e06568bac235492583317b712b74aa729cb81916d497b22e"
+  required_checks_source: "local integration policy; no release authorized"
+  required_checks: []
+  post_approval_diff: "none"
+  merge_revision: "not-applicable"
+lifecycle_history:
+  - state: "verified"
+    actor: "parent coding agent"
+    timestamp: "2026-08-27"
+    identity: "5cfead9405ae13d5e06568bac235492583317b712b74aa729cb81916d497b22e"
+    evidence: "tests, installed Pi runtime, reviews, adjudicator 20085341"
+final_decision:
+  state: "READY_FOR_HUMAN_REVIEW"
+  owner: "repository owner"
+  next_action: "Capture live 429 response headers separately, then decide whether to push/release"

@@ -137,6 +137,12 @@ Pi and OpenCode had conflated a model's `openai/v1/responses` capability with Co
 
 Verification (auditable record: `verification/native-responses-route-97a25bb.yaml`): focused route/state/user-agent suites completed with **517 passed, 5 deselected**; the bounded full suite completed with **2176 passed, 37 skipped, 13 deselected**; Ruff, format, and diff checks passed. Requirements, edge, regression, and adjudicator run `0005b469` reported no blockers.
 
+### Grok thinking controls in Pi
+
+Pi previously enabled reasoning only for `gpt-5` IDs, so Grok appeared as a non-reasoning model despite being reasoning-only. Exact Grok 4.6 IDs now declare reasoning and expose precisely the Databricks-supported effort levels: `low`, `medium`, `high`, and `xhigh`. Pi's `off`, `minimal`, and `max` choices are suppressed rather than translated into unsupported gateway values; preview/future Grok IDs do not inherit these assumptions without validation. The installed Pi runtime's `getSupportedThinkingLevels` returned exactly those four levels for the generated entry.
+
+Verification (auditable record: `verification/grok-pi-thinking-3feb9cd.yaml`): **641 focused tests passed**; the bounded full suite completed with **2178 passed, 37 skipped, 13 deselected**; `ty`, Ruff, format, and diff checks passed. Requirements and edge re-review reported no blockers, and adjudicator run `20085341` returned `READY_FOR_HUMAN_REVIEW`. A repeated live 429 reported for Grok is tracked separately as a rate-limit/capacity diagnostic requiring response headers; it is not a thinking-metadata failure.
+
 ## Residuals and next action
 
 - The full suite's unchanged real-state tests remain unavailable because they hang; the completed bounded suite excludes that class and the known Claude user-agent test.
