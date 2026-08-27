@@ -1,0 +1,98 @@
+handoff_artifact: verification/native-responses-route-97a25bb.yaml
+handoff_security:
+  classification: "internal development evidence"
+  authorized_audience: ["repository owner", "maintainers"]
+  owner: "parent coding agent"
+  retention: "repository lifetime"
+verification_identity:
+  repository: "/Users/david.okeeffe/Repos/ucode"
+  base_revision: "97a25bb23c647b6669afa5b746c7bc7ce32d0ace"
+  head_revision: "97a25bb23c647b6669afa5b746c7bc7ce32d0ace plus scoped dirty change"
+  dirty_state_digest: "e1e0e98d59370bb111acc15fd602561c2bd36c7152c2573c867efbc9602aa133 (production, tests, miniwiki; excludes this record and preserved user-local files)"
+repository_policy:
+  source: "AGENTS.md and user-level .pi/agent/AGENTS.md"
+  pr_required: false
+  required_checks_source: "Local dev integration; no push/release authorized"
+external_action_authorizations: []
+contract:
+  intended_outcomes:
+    - "Pi and OpenCode Responses adapters use /ai-gateway/openai/v1 so their SDKs call /ai-gateway/openai/v1/responses"
+    - "Codex CLI, Codex smart routing, and web search remain on /ai-gateway/codex/v1"
+    - "Claude, Gemini, MLflow, authentication, and workspace host handling remain unchanged"
+  non_goals:
+    - "Do not claim live Grok success without a workspace request"
+    - "Do not alter Codex coding-agent routing"
+    - "Do not push or release"
+impact_map:
+  production_paths:
+    - "src/ucode/databricks.py: Pi/OpenCode base URL builders"
+    - "src/ucode/agents/pi.py: route documentation"
+    - "src/ucode/agents/opencode.py: route documentation"
+  tests:
+    - "tests/test_databricks.py"
+    - "tests/test_agent_pi.py"
+    - "tests/test_agent_opencode.py"
+    - "tests/test_state.py"
+    - "tests/test_e2e_user_agent.py"
+deterministic_plan:
+  - "Assert Pi/OpenCode native OpenAI base and Codex route isolation"
+  - "Run focused route/state/user-agent suites and bounded full regression"
+command_results:
+  - command: "uv run --frozen pytest -q tests/test_databricks.py tests/test_agent_pi.py tests/test_agent_opencode.py tests/test_state.py tests/test_e2e_user_agent.py -k 'not test_user_agent_arrives_at_gateway'"
+    exit_code: 0
+    result: "517 passed, 5 deselected in 25.20s"
+  - command: "uv run --frozen pytest -q -k 'not TestStateFileIsNotRewritten and not test_user_agent_arrives_at_gateway'"
+    exit_code: 0
+    result: "2176 passed, 37 skipped, 13 deselected in 89.66s"
+  - command: "uv run --frozen ruff check .; uv run --frozen ruff format --check src/ tests/; git diff --check"
+    exit_code: 0
+    result: "all passed; 89 files formatted"
+reviewer_reports:
+  - role: "requirements-reviewer"
+    run_id: "26c4ae25"
+    result: "no blockers; stale test name fixed"
+  - role: "edge-case-reviewer"
+    run_id: "6cd9ce7a"
+    result: "no confirmed blocker"
+  - role: "regression-reviewer"
+    run_id: "17a53cc4"
+    result: "no blocker; optional SDK-capture coverage suggested"
+  - role: "bounded security/correctness reviewer"
+    run_id: "fcc17697"
+    result: "no evidenced changed-path blocker; unrelated redirect hypothesis out of scope"
+finding_reproductions:
+  - finding: "Pi/OpenCode native Responses models were configured with Codex CLI's /codex/v1 base"
+    reproduction: "URL-builder tests and generated provider configs showed /ai-gateway/codex/v1"
+    fix: "Use /ai-gateway/openai/v1 for Pi/OpenCode only; retain Codex base"
+fixes_and_re_review:
+  - fix: "Native Responses route and corresponding fixtures/comments"
+    re_review: "requirements, edge, regression, and adjudication complete"
+adjudication:
+  role: "verification-adjudicator"
+  run_id: "0005b469"
+  decision: "READY_FOR_HUMAN_REVIEW"
+  rationale: "Route split is internally consistent; no reproduced blocker survives"
+unavailable_checks:
+  - "Live Grok request to /ai-gateway/openai/v1/responses was not run because UCODE_TEST_WORKSPACE is unset"
+residual_risks:
+  - "Live workspace confirmation is required before removing Grok's historical Pi e2e exclusion"
+  - "SDK request-path capture would strengthen coverage but no current defect was demonstrated"
+human_approvals: []
+pr_release_gate:
+  pr: "not-applicable"
+  state: "not-applicable"
+  reviewed_revision: "local dirty integration digest e1e0e98d59370bb111acc15fd602561c2bd36c7152c2573c867efbc9602aa133"
+  required_checks_source: "local integration policy; no release authorized"
+  required_checks: []
+  post_approval_diff: "none"
+  merge_revision: "not-applicable"
+lifecycle_history:
+  - state: "verified"
+    actor: "parent coding agent"
+    timestamp: "2026-08-27"
+    identity: "e1e0e98d59370bb111acc15fd602561c2bd36c7152c2573c867efbc9602aa133"
+    evidence: "tests, reviews, and adjudicator 0005b469"
+final_decision:
+  state: "READY_FOR_HUMAN_REVIEW"
+  owner: "repository owner"
+  next_action: "Run live Grok request, then decide whether to remove e2e exclusion and push/release"

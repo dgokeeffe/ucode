@@ -3866,9 +3866,9 @@ def build_opencode_base_urls(workspace: str) -> dict[str, str]:
     return {
         "anthropic": build_tool_base_url("claude", workspace) + "/v1",
         "gemini": build_tool_base_url("gemini", workspace) + "/v1beta",
-        # @ai-sdk/openai appends "/responses" (or "/chat/completions") to baseURL,
-        # so stop just before that — matches the Pi adapter's build_pi_base_urls.
-        "openai": build_tool_base_url("codex", workspace),
+        # @ai-sdk/openai appends `/responses`. OpenCode speaks the native
+        # OpenAI-compatible API, not Codex CLI's coding-agent route.
+        "openai": f"{workspace}/ai-gateway/openai/v1",
         "oss": f"{workspace}/ai-gateway/mlflow/v1",
     }
 
@@ -3887,7 +3887,9 @@ def build_pi_base_urls(workspace: str) -> dict[str, str]:
     # only (MLflow rejects `store` and `tools[].function.strict`).
     return {
         "claude": build_tool_base_url("claude", workspace),
-        "openai": build_tool_base_url("codex", workspace),
+        # Pi's openai-responses adapter speaks the native model-service API.
+        # Keep Codex CLI itself on `/ai-gateway/codex/v1`.
+        "openai": f"{workspace}/ai-gateway/openai/v1",
         "gemini": build_tool_base_url("gemini", workspace) + "/v1beta",
         "oss": f"{workspace}/ai-gateway/mlflow/v1",
     }

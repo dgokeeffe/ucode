@@ -339,7 +339,7 @@ class TestPiUserAgent:
             "base_urls": {
                 "pi": {
                     "claude": f"{capture_server.base_url}/ai-gateway/anthropic",
-                    "openai": f"{capture_server.base_url}/ai-gateway/codex/v1",
+                    "openai": f"{capture_server.base_url}/ai-gateway/openai/v1",
                     "gemini": f"{capture_server.base_url}/ai-gateway/gemini/v1beta",
                 },
             },

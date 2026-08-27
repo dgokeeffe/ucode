@@ -18,7 +18,7 @@ def _base_urls() -> dict[str, str]:
     # Native API per family — see agents/pi.py docstring for path conventions.
     return {
         "claude": f"{WS}/ai-gateway/anthropic",
-        "openai": f"{WS}/ai-gateway/codex/v1",
+        "openai": f"{WS}/ai-gateway/openai/v1",
         "gemini": f"{WS}/ai-gateway/gemini/v1beta",
         "oss": f"{WS}/ai-gateway/mlflow/v1",
     }
@@ -84,7 +84,7 @@ class TestRenderOverlayProviders:
         overlay, _ = _overlay("gpt-5", codex_models=["gpt-5"])
         provider = overlay["providers"]["databricks-openai"]
         assert provider["api"] == "openai-responses"
-        assert provider["baseUrl"] == f"{WS}/ai-gateway/codex/v1"
+        assert provider["baseUrl"] == f"{WS}/ai-gateway/openai/v1"
 
     def test_gpt56_sol_model_entry_pins_1m_context(self):
         # Gateway ids are custom to Pi, so explicit metadata is required to

@@ -131,6 +131,12 @@ Verification for this follow-up (auditable record: `verification/capability-cont
 - Full Ruff, format, diff, ancestry, and conflict-marker checks passed.
 - Review found and the parent fixed explicit-metadata/static-OSS precedence and duplicate endpoint output. Final edge, regression, and bounded security reviews reported no blockers. Adjudicator run `7e1ac5fe` returned `READY_FOR_HUMAN_REVIEW`.
 
+### Native Responses route correction
+
+Pi and OpenCode had conflated a model's `openai/v1/responses` capability with Codex CLI's coding-agent route, configuring `/ai-gateway/codex/v1`. They now use the documented native model-service base `/ai-gateway/openai/v1`, whose SDK adapters append `/responses`. Codex CLI, Codex smart routing, and web search remain on `/ai-gateway/codex/v1`; Claude, Gemini, MLflow, host construction, and authentication are unchanged. This correction is the likely resolution for the historical Pi/Grok 400, but it still requires a live workspace request to confirm.
+
+Verification (auditable record: `verification/native-responses-route-97a25bb.yaml`): focused route/state/user-agent suites completed with **517 passed, 5 deselected**; the bounded full suite completed with **2176 passed, 37 skipped, 13 deselected**; Ruff, format, and diff checks passed. Requirements, edge, regression, and adjudicator run `0005b469` reported no blockers.
+
 ## Residuals and next action
 
 - The full suite's unchanged real-state tests remain unavailable because they hang; the completed bounded suite excludes that class and the known Claude user-agent test.
