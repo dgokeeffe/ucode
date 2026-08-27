@@ -238,10 +238,9 @@ def render_overlay(
         keys.append(["provider", "databricks-google"])
     if openai_models:
         codex_specs_by_id = _responses_specs_by_id(codex_specs)
-        # @ai-sdk/openai supports both the Responses API and the legacy
-        # chat-completions API. Databricks GPT-5 / GPT-5.6 / Codex models are
-        # Responses-only on /ai-gateway/codex/v1, so the per-model flag
-        # `useResponsesApi: true` lives in models.<m>.options where opencode
+        # @ai-sdk/openai supports both Responses and legacy chat completions.
+        # These models use the native `/ai-gateway/openai/v1/responses` route,
+        # so `useResponsesApi: true` lives in models.<m>.options where OpenCode
         # reads it (provider-level options is read by the SDK only).
         providers["databricks-openai"] = {
             "npm": "@ai-sdk/openai",

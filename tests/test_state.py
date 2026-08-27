@@ -33,7 +33,7 @@ FAKE_URLS = {
     "copilot": f"{FAKE_WS}/ai-gateway/mlflow/v1",
     "pi": {
         "claude": f"{FAKE_WS}/ai-gateway/anthropic",
-        "openai": f"{FAKE_WS}/ai-gateway/codex/v1",
+        "openai": f"{FAKE_WS}/ai-gateway/openai/v1",
         "gemini": f"{FAKE_WS}/ai-gateway/gemini/v1beta",
     },
 }

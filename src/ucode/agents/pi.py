@@ -5,7 +5,7 @@ providers in its `models.json`, each speaking the API dialect best suited to
 that family's gateway path:
 
 - `databricks-claude`  (api: anthropic-messages)       → /ai-gateway/anthropic
-- `databricks-openai`  (api: openai-responses)         → /ai-gateway/codex/v1
+- `databricks-openai`  (api: openai-responses)         → /ai-gateway/openai/v1
 - `databricks-gemini`  (api: google-generative-ai)     → /ai-gateway/gemini/v1beta
 - `databricks-mlflow`  (api: openai-completions)       → /ai-gateway/mlflow/v1
 
@@ -252,7 +252,7 @@ def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
     `gpt-5-nano` and `gpt-5-5-pro` reject every request with
     `BAD_REQUEST: Unsupported value: 'none' is not supported with the 'gpt-5'
     model`. An explicit `None` makes Pi omit `reasoning` entirely, which the
-    gateway accepts for all ids (verified against /ai-gateway/codex/v1).
+    gateway accepts for all ids.
     """
     limits = gpt_model_token_limits(model_id)
     discovered_context = (

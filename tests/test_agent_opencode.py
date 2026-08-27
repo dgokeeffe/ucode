@@ -14,7 +14,7 @@ def _base_urls() -> dict[str, str]:
     return {
         "anthropic": f"{WS}/ai-gateway/anthropic/v1",
         "gemini": f"{WS}/ai-gateway/gemini/v1beta",
-        "openai": f"{WS}/ai-gateway/codex/v1",
+        "openai": f"{WS}/ai-gateway/openai/v1",
         "oss": f"{WS}/ai-gateway/mlflow/v1",
     }
 
@@ -308,9 +308,8 @@ class TestRenderOverlay:
 
 
 class TestOpenAIProvider:
-    """OpenCode reaches Databricks GPT-5 / GPT-5.6 / Codex models through the
-    databricks-openai provider (@ai-sdk/openai against /ai-gateway/codex/v1).
-    Without this wiring the codex/openai family is unreachable from OpenCode."""
+    """OpenCode reaches Responses-capable model services through the native
+    databricks-openai provider against /ai-gateway/openai/v1."""
 
     def test_openai_provider_added_when_codex_models_present(self):
         models = {"openai": ["databricks-gpt-5-6-sol"]}
@@ -322,11 +321,11 @@ class TestOpenAIProvider:
         overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
         assert overlay["provider"]["databricks-openai"]["npm"] == "@ai-sdk/openai"
 
-    def test_openai_base_url_points_at_codex_gateway(self):
+    def test_openai_base_url_points_at_native_gateway(self):
         models = {"openai": ["databricks-gpt-5-6-sol"]}
         overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
         options = overlay["provider"]["databricks-openai"]["options"]
-        assert options["baseURL"] == f"{WS}/ai-gateway/codex/v1"
+        assert options["baseURL"] == f"{WS}/ai-gateway/openai/v1"
 
     def test_use_responses_api_set_on_every_codex_model(self):
         models = {"openai": ["databricks-gpt-5-6-sol", "databricks-gpt-codex"]}
