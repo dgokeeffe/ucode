@@ -1520,18 +1520,35 @@ def model_token_limits(model_id: str) -> dict[str, int] | None:
 # The foundation-model API exposes context windows only in free-text
 # descriptions (for example "context length of 1M tokens"). Keep parsing
 # deliberately narrow: unrecognized or invalid text simply yields no override.
-_CONTEXT_LENGTH_RE = re.compile(r"context (?:length|window) of ([\d.,]+)\s*([MK])", re.IGNORECASE)
+_CONTEXT_LENGTH_RES = (
+    re.compile(
+        r"context (?:length|window) (?:of|is) ([\d.,]+)\s*(million|thousand|[MK])?"
+        r"(?:[-\s]*tokens?)?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"([\d.,]+)\s*(million|thousand|[MK])?[-\s]*tokens? context (?:length|window)",
+        re.IGNORECASE,
+    ),
+)
 
 
 def _parse_context_window(description: str) -> int | None:
     if not isinstance(description, str):
         return None
-    match = _CONTEXT_LENGTH_RE.search(description)
+    match = None
+    for pattern in _CONTEXT_LENGTH_RES:
+        match = pattern.search(description)
+        if match:
+            break
     if not match:
         return None
     try:
         value = float(match.group(1).replace(",", ""))
-        multiplier = 1_000_000 if match.group(2).upper() == "M" else 1_000
+        unit = (match.group(2) or "").lower()
+        multiplier = (
+            1_000_000 if unit in ("m", "million") else 1_000 if unit in ("k", "thousand") else 1
+        )
         tokens = int(value * multiplier)
     except (OverflowError, ValueError):
         return None
@@ -1565,6 +1582,133 @@ def _canonical_oss_model_id(model_id: str) -> str:
     if tail.startswith("databricks-"):
         tail = tail[len("databricks-") :]
     return tail
+
+
+def _get_foundation_models_payload(workspace: str, token: str) -> tuple[dict | None, str | None]:
+    """Return one cached, structurally valid foundation-model catalog."""
+    cached = _FOUNDATION_MODELS_CACHE.get(workspace)
+    if cached is not None:
+        return dict(cached), None
+
+    hostname = workspace_hostname(workspace)
+    payload, reason = _http_get_json(
+        f"https://{hostname}/api/2.0/serving-endpoints:foundation-models", token
+    )
+    if payload is None:
+        return None, reason
+    if not isinstance(payload, dict) or not isinstance(payload.get("endpoints"), list):
+        return None, "foundation-models listing returned malformed `endpoints`"
+    typed_payload = cast(dict, payload)
+    _FOUNDATION_MODELS_CACHE[workspace] = dict(typed_payload)
+    return dict(typed_payload), None
+
+
+def _foundation_model_api_types(payload: object) -> dict[str, frozenset[str]]:
+    """Map canonical endpoint ids to their advertised AI Gateway V2 APIs.
+
+    A valid endpoint is represented even when it has no V2 API types, allowing
+    explicit incompatible metadata to override a known-family name fallback.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    raw_endpoints = cast(dict[str, object], payload).get("endpoints")
+    if not isinstance(raw_endpoints, list):
+        return {}
+
+    routes: dict[str, set[str]] = {}
+    for endpoint in raw_endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        endpoint_dict = cast(dict[str, object], endpoint)
+        name = endpoint_dict.get("name")
+        config = endpoint_dict.get("config")
+        if not isinstance(name, str) or not name.strip() or not isinstance(config, dict):
+            continue
+        entities = cast(dict[str, object], config).get("served_entities")
+        if not isinstance(entities, list):
+            continue
+        api_types = routes.setdefault(_canonical_oss_model_id(name), set())
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            foundation_model = cast(dict[str, object], entity).get("foundation_model")
+            if not isinstance(foundation_model, dict):
+                continue
+            foundation_model_dict = cast(dict[str, object], foundation_model)
+            if foundation_model_dict.get("ai_gateway_v2_supported") is not True:
+                continue
+            raw_api_types = foundation_model_dict.get("api_types")
+            if isinstance(raw_api_types, list):
+                api_types.update(value for value in raw_api_types if isinstance(value, str))
+    return {model_id: frozenset(api_types) for model_id, api_types in routes.items()}
+
+
+def _foundation_model_context_windows(
+    payload: object, *, api_type: str | None = None
+) -> dict[str, int]:
+    """Return the largest advertised context window per V2 foundation model."""
+    if not isinstance(payload, dict):
+        return {}
+    raw_endpoints = cast(dict[str, object], payload).get("endpoints")
+    if not isinstance(raw_endpoints, list):
+        return {}
+
+    windows: dict[str, int] = {}
+    for endpoint in raw_endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        endpoint_dict = cast(dict[str, object], endpoint)
+        name = endpoint_dict.get("name")
+        config = endpoint_dict.get("config")
+        if not isinstance(name, str) or not name.strip() or not isinstance(config, dict):
+            continue
+        entities = cast(dict[str, object], config).get("served_entities")
+        if not isinstance(entities, list):
+            continue
+        canonical_id = _canonical_oss_model_id(name)
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            foundation_model = cast(dict[str, object], entity).get("foundation_model")
+            if not isinstance(foundation_model, dict):
+                continue
+            foundation_model_dict = cast(dict[str, object], foundation_model)
+            if foundation_model_dict.get("ai_gateway_v2_supported") is not True:
+                continue
+            raw_api_types = foundation_model_dict.get("api_types")
+            if api_type is not None and (
+                not isinstance(raw_api_types, list) or api_type not in raw_api_types
+            ):
+                continue
+            description = foundation_model_dict.get("description")
+            context_window = (
+                _parse_context_window(description) if isinstance(description, str) else None
+            )
+            if context_window is not None:
+                windows[canonical_id] = max(windows.get(canonical_id, 0), context_window)
+    return windows
+
+
+def discover_responses_model_specs(
+    workspace: str, token: str, model_ids: list[str]
+) -> tuple[list[dict], str | None]:
+    """Project live context windows onto Responses-capable model IDs."""
+    payload, reason = _get_foundation_models_payload(workspace, token)
+    if payload is None:
+        return [], reason
+    api_types_by_id = _foundation_model_api_types(payload)
+    context_by_id = _foundation_model_context_windows(payload, api_type="openai/v1/responses")
+    specs: list[dict] = []
+    for model_id in model_ids:
+        canonical_id = _canonical_oss_model_id(model_id)
+        if "openai/v1/responses" not in api_types_by_id.get(canonical_id, frozenset()):
+            continue
+        context_window = context_by_id.get(canonical_id)
+        if context_window is not None:
+            specs.append({"id": model_id, "context_window": context_window})
+    if specs or not model_ids:
+        return specs, None
+    return [], "Responses model metadata contained no context windows"
 
 
 def _static_oss_spec(model_id: str) -> dict | None:
@@ -1613,7 +1757,7 @@ def _oss_specs_from_foundation_models(payload: object) -> list[dict]:
             continue
 
         api_types: set[str] = set()
-        description = ""
+        context_window: int | None = None
         has_v2_entity = False
         for entity in entities:
             if not isinstance(entity, dict):
@@ -1629,9 +1773,15 @@ def _oss_specs_from_foundation_models(payload: object) -> list[dict]:
             raw_api_types = foundation_model_dict.get("api_types")
             if isinstance(raw_api_types, list):
                 api_types.update(value for value in raw_api_types if isinstance(value, str))
-            raw_description = foundation_model_dict.get("description")
-            if not description and isinstance(raw_description, str):
-                description = raw_description
+                if "mlflow/v1/chat/completions" in raw_api_types:
+                    raw_description = foundation_model_dict.get("description")
+                    parsed_context = (
+                        _parse_context_window(raw_description)
+                        if isinstance(raw_description, str)
+                        else None
+                    )
+                    if parsed_context is not None:
+                        context_window = max(context_window or 0, parsed_context)
 
         if not has_v2_entity or "mlflow/v1/chat/completions" not in api_types:
             continue
@@ -1643,7 +1793,6 @@ def _oss_specs_from_foundation_models(payload: object) -> list[dict]:
         )
         reasoning = capabilities_dict.get("openai_reasoning") is True
         canonical_id = _canonical_oss_model_id(name)
-        context_window = _parse_context_window(description)
         max_tokens = _OSS_MAX_OUTPUT_TOKENS.get(canonical_id)
         static_fallback = _static_oss_spec(name)
         if static_fallback is not None:
@@ -1681,10 +1830,7 @@ def discover_oss_model_specs(
     fails or omits them. Without ``model_ids`` (the serving-endpoint fallback), only
     models validated by the live API metadata are returned.
     """
-    hostname = workspace_hostname(workspace)
-    payload, reason = _http_get_json(
-        f"https://{hostname}/api/2.0/serving-endpoints:foundation-models", token
-    )
+    payload, reason = _get_foundation_models_payload(workspace, token)
     discovered = _oss_specs_from_foundation_models(payload)
 
     if model_ids is None:
@@ -1695,13 +1841,20 @@ def discover_oss_model_specs(
         return [], "no validated chat-completions-only OSS endpoints"
 
     discovered_by_id = {_canonical_oss_model_id(spec["id"]): spec for spec in discovered}
+    advertised_by_id = _foundation_model_api_types(payload)
     specs: list[dict] = []
     for model_id in model_ids:
         if not isinstance(model_id, str) or not model_id.strip():
             continue
-        dynamic = discovered_by_id.get(_canonical_oss_model_id(model_id))
+        canonical_id = _canonical_oss_model_id(model_id)
+        dynamic = discovered_by_id.get(canonical_id)
         if dynamic is not None:
             specs.append({**dynamic, "id": model_id})
+            continue
+        # A matching catalog entry with no MLflow-chat-only spec is explicit
+        # evidence that this model belongs elsewhere or is incompatible. Static
+        # family fallback is only for missing/unavailable per-model metadata.
+        if canonical_id in advertised_by_id:
             continue
         fallback = _static_oss_spec(model_id)
         if fallback is not None:
@@ -1720,6 +1873,10 @@ def discover_oss_model_specs(
 # GPT-5.6 Sol/Terra/Luna support the opt-in 1.05M window; 272k is merely Pi's
 # built-in short-context pricing default, not the model's hard context limit.
 _GPT_TOKEN_LIMITS: tuple[tuple[str, dict[str, int]], ...] = (
+    # Databricks documents Grok 4.6 with a 500K context window. Its output
+    # ceiling is not exposed structurally, so retain the conservative Responses
+    # fallback there while avoiding Pi/OpenCode's incorrect 128K context cap.
+    ("grok-4-6", {"context": 500_000, "output": 16_384}),
     ("gpt-5-6-sol", {"context": 1_050_000, "output": 128_000}),
     ("gpt-5-6-terra", {"context": 1_050_000, "output": 128_000}),
     ("gpt-5-6-luna", {"context": 1_050_000, "output": 128_000}),
@@ -1902,6 +2059,12 @@ def _get_model_services_page(
 # worth a second walk. Failures are never cached, so a transient error still retries.
 _MODEL_SERVICES_CACHE: dict[str, list[str]] = {}
 
+# The foundation-model catalog carries the AI Gateway V2 API dialects needed to
+# classify new system.ai models without vendor-name allowlists. Several
+# discovery paths consume the same workspace-wide snapshot, so cache only
+# successful, structurally valid responses for this short-lived process.
+_FOUNDATION_MODELS_CACHE: dict[str, dict] = {}
+
 # Same idea for the Model Provider Service listing (a different endpoint). It is workspace-wide and
 # filtered per agent afterwards, so `ucode setup` would otherwise re-list it once per MPS-capable
 # agent. Keyed by ``(workspace, parent)`` — a schema-scoped listing is a different result set than
@@ -1912,6 +2075,7 @@ _MODEL_PROVIDER_SERVICES_CACHE: dict[tuple[str, str], list[dict]] = {}
 def clear_model_services_cache() -> None:
     """Forget cached model-service listings (used by tests, and after a workspace switch)."""
     _MODEL_SERVICES_CACHE.clear()
+    _FOUNDATION_MODELS_CACHE.clear()
     _MODEL_PROVIDER_SERVICES_CACHE.clear()
 
 
@@ -2152,10 +2316,11 @@ def discover_model_services(
     - ``claude_models`` maps ``fable``/``opus``/``sonnet``/``haiku`` to the
       newest matching ``system.ai.claude-*`` id (mirrors
       ``discover_claude_models``).
-    - ``codex_models`` is the list of ``system.ai.*gpt-*`` and
-      ``system.ai.*grok-*`` ids, newest first. ``gpt-oss-*`` is excluded because
-      it uses chat completions rather than the Responses API.
-    - ``gemini_models`` is the list of ``system.ai.*gemini-*`` ids, newest first.
+    - ``codex_models`` contains every ``system.ai.*`` id whose live metadata
+      advertises ``openai/v1/responses``, newest first. GPT/Grok names are the
+      safe fallback when metadata is unavailable; ``gpt-oss-*`` stays excluded.
+    - ``gemini_models`` similarly contains every id advertising the native
+      Gemini API, with ``gemini-*`` as its metadata-unavailable fallback.
     - ``oss_models`` is the list of OSS-model ``system.ai.*`` ids.
 
     ``reason`` is None on success, else explains why nothing was found. Family
@@ -2189,16 +2354,48 @@ def discover_model_services(
             claude_models.setdefault(family, model)
         _prefer_opus_4_8(claude_models, [*ids, *legacy_claude.values()])
 
-    # `gpt-oss-*` also contains "gpt-" but is a chat-completions-only OSS model
-    # (served via /ai-gateway/mlflow/v1), NOT an openai-responses codex model —
-    # exclude it here so it isn't offered under the codex provider (which 400s).
+    # The UC listing exposes names but not API dialects. Project the live
+    # foundation-model catalog onto those exact system.ai ids so future models
+    # are admitted by protocol capability rather than a vendor-name allowlist.
+    # A known-family name is only a fallback when that model is absent from the
+    # capability catalog (including a catalog outage); explicit incompatible
+    # metadata wins. Embedding/reranking services are never chat candidates.
+    foundation_payload, _ = _get_foundation_models_payload(workspace, token)
+    api_types_by_id = _foundation_model_api_types(foundation_payload)
+
+    def supports_api(model_id: str, api_type: str, *, known_family: bool) -> bool:
+        canonical_id = _canonical_oss_model_id(model_id)
+        if any(bad in canonical_id for bad in _OSS_NON_CHAT_SUBSTRINGS):
+            return False
+        advertised = api_types_by_id.get(canonical_id)
+        return api_type in advertised if advertised is not None else known_family
+
     codex_models = sorted(
-        [m for m in ids if _is_codex_model(m)],
+        [
+            model_id
+            for model_id in ids
+            if supports_api(
+                model_id,
+                "openai/v1/responses",
+                known_family=_is_codex_model(model_id),
+            )
+        ],
         key=model_version_sort_key,
     )
-    gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
+    gemini_models = sorted(
+        [
+            model_id
+            for model_id in ids
+            if supports_api(
+                model_id,
+                "gemini/v1/generateContent",
+                known_family="gemini-" in model_id.lower(),
+            )
+        ],
+        key=model_version_sort_key,
+    )
 
-    # Project the live endpoint capability listing onto the UC ids. This
+    # Project the same cached capability snapshot onto the UC ids. This
     # broadens discovery beyond the static GLM/Kimi/DeepSeek fallback only when the
     # corresponding endpoint is validated as MLflow chat-completions-only.
     oss_specs, _ = discover_oss_model_specs(workspace, token, ids)
@@ -3267,14 +3464,11 @@ def discover_endpoints_with_api_type(
     describes why the list is empty. `sort_key` overrides the default
     alphabetical ordering of the returned names.
     """
-    hostname = workspace_hostname(workspace)
-    payload, reason = _http_get_json(
-        f"https://{hostname}/api/2.0/serving-endpoints:foundation-models", token
-    )
+    payload, reason = _get_foundation_models_payload(workspace, token)
     if payload is None:
         return [], reason
 
-    data = cast(dict, payload) if isinstance(payload, dict) else {}
+    data = cast(dict, payload)
     raw_endpoints = data.get("endpoints", [])
     endpoints = raw_endpoints if isinstance(raw_endpoints, list) else []
     out: list[str] = []
@@ -3315,7 +3509,7 @@ def discover_endpoints_with_api_type(
         if api_type in api_types:
             out.append(name)
     if out:
-        return sorted(out, key=sort_key), None
+        return sorted(set(out), key=sort_key), None
     if not endpoints:
         if saw_malformed:
             return [], "foundation-models listing returned malformed `endpoints`"

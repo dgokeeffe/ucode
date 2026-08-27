@@ -223,7 +223,22 @@ def _pi_oss_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
     return entry
 
 
-def _pi_gpt_model_entry(model_id: str) -> dict:
+def _responses_specs_by_id(raw_specs: object) -> dict[str, dict[str, object]]:
+    if not isinstance(raw_specs, list):
+        return {}
+    specs: dict[str, dict[str, object]] = {}
+    for raw_spec in raw_specs:
+        if not isinstance(raw_spec, dict):
+            continue
+        typed_spec = cast(dict[str, object], raw_spec)
+        model_id = typed_spec.get("id")
+        context = _positive_int(typed_spec.get("context_window"))
+        if isinstance(model_id, str) and model_id and context is not None:
+            specs.setdefault(model_id, typed_spec)
+    return specs
+
+
+def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) -> dict:
     """Build a Pi openai (codex) model entry with `contextWindow`/`maxTokens`
     from `databricks.gpt_model_token_limits`. GPT ids aren't in Pi's built-in
     catalog, so without an explicit window Pi falls back to a small default and
@@ -240,9 +255,12 @@ def _pi_gpt_model_entry(model_id: str) -> dict:
     gateway accepts for all ids (verified against /ai-gateway/codex/v1).
     """
     limits = gpt_model_token_limits(model_id)
+    discovered_context = (
+        _positive_int(spec.get("context_window")) if isinstance(spec, dict) else None
+    )
     entry: dict = {
         "id": model_id,
-        "contextWindow": limits["context"],
+        "contextWindow": discovered_context or limits["context"],
         "maxTokens": limits["output"],
     }
     if "gpt-5" in model_id.lower().replace(".", "-"):
@@ -262,6 +280,7 @@ def render_overlay(
     oss_models: list[str],
     oss_specs: list[dict] | None = None,
     claude_model_ids: list[str] | None = None,
+    codex_specs: list[dict] | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Pi's private agent config."""
     providers: dict = {}
@@ -292,13 +311,17 @@ def render_overlay(
         }
         keys.append(["providers", "databricks-claude"])
     if codex_models:
+        codex_specs_by_id = _responses_specs_by_id(codex_specs)
         providers["databricks-openai"] = {
             "baseUrl": pi_base_urls["openai"],
             "api": "openai-responses",
             "apiKey": token,
             "authHeader": True,
             "headers": ua_headers,
-            "models": [_pi_gpt_model_entry(m) for m in codex_models],
+            "models": [
+                _pi_gpt_model_entry(model_id, codex_specs_by_id.get(model_id))
+                for model_id in codex_models
+            ],
         }
         keys.append(["providers", "databricks-openai"])
     if gemini_models:
@@ -389,6 +412,7 @@ def _write_tool_config_unlocked(
         oss_models,
         state.get("oss_model_specs") or [],
         claude_model_ids,
+        state.get("codex_model_specs") or [],
     )
     existing = read_json_safe(PI_CONFIG_PATH)
     providers = existing.get("providers")

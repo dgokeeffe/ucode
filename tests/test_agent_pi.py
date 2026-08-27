@@ -32,6 +32,7 @@ def _empty() -> dict:
         "gemini_models": [],
         "oss_models": [],
         "oss_specs": [],
+        "codex_specs": [],
     }
 
 
@@ -47,6 +48,8 @@ def _overlay(model: str, token: str = "tok", **kwargs):
         bundle["gemini_models"],
         bundle["oss_models"],
         bundle["oss_specs"],
+        None,
+        bundle["codex_specs"],
     )
 
 
@@ -121,6 +124,18 @@ class TestRenderOverlayProviders:
         entry = overlay["providers"]["databricks-openai"]["models"][0]
         assert "reasoning" not in entry
         assert "thinkingLevelMap" not in entry
+
+    def test_live_responses_context_overrides_static_fallback(self):
+        model = "system.ai.future-coder-1"
+        overlay, _ = _overlay(
+            model,
+            codex_models=[model],
+            codex_specs=[{"id": model, "context_window": 750_000}],
+        )
+
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+        assert entry["contextWindow"] == 750_000
+        assert entry["maxTokens"] == 16_384
 
     def test_gpt_model_entries_use_model_specific_windows(self):
         overlay, _ = _overlay(
@@ -409,6 +424,7 @@ class TestRenderOverlayAuthAndModels:
         provider = overlay["providers"]["databricks-openai"]
         assert provider["api"] == "openai-responses"
         assert [model["id"] for model in provider["models"]] == [grok]
+        assert provider["models"][0]["contextWindow"] == 500_000
         assert overlay["model"] == f"databricks-openai/{grok}"
 
     def test_gemini_models_listed(self):
