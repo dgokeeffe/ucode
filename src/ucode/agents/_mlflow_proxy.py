@@ -18,12 +18,12 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlsplit
 
-from ucode.gateway_proxy import _HOP_BY_HOP
+from ucode.gateway_proxy import HOP_BY_HOP_HEADERS
 from ucode.ui import print_warning
 
 _STREAM_CHUNK = 8192
 _CHAT_COMPLETIONS_PATH = "/ai-gateway/mlflow/v1/chat/completions"
-_SKIP_REQUEST_HEADERS = _HOP_BY_HOP | {"accept-encoding"}
+_SKIP_REQUEST_HEADERS = HOP_BY_HOP_HEADERS | {"accept-encoding"}
 _ERROR_BODY = b'{"error":"MLflow proxy upstream unavailable"}\n'
 
 
@@ -65,7 +65,7 @@ def _safe_response_headers(headers: Message, *, streaming: bool) -> list[tuple[s
     safe: list[tuple[str, str]] = []
     for key, value in headers.items():
         lowered = key.lower()
-        if lowered in _HOP_BY_HOP:
+        if lowered in HOP_BY_HOP_HEADERS:
             # A non-streaming body is unchanged, so preserving Content-Length
             # avoids relying on EOF framing. Repaired streams can change size.
             if lowered == "content-length" and not streaming:

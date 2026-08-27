@@ -1,0 +1,141 @@
+handoff_artifact: verification/grok-pi-main-sync-261a911.yaml
+handoff_security:
+  classification: "internal development evidence"
+  authorized_audience: ["repository owner", "maintainers"]
+  owner: "parent coding agent"
+  retention: "repository lifetime"
+verification_identity:
+  repository: "/Users/david.okeeffe/Repos/ucode"
+  base_revision: "origin/main@81d03f1"
+  head_revision: "261a91137e4685f813ee64d60ef3b82d88d784dc"
+  dirty_state_digest: "9c3e5a3ebb403394da0f2d762734dde7b6a8e0a088c9e88045661500ad4e49ac (implementation, tests, and miniwiki; excludes this record and preserved user-local files)"
+repository_policy:
+  source: "AGENTS.md and user-level .pi/agent/AGENTS.md"
+  pr_required: false
+  required_checks_source: "Local dev integration; no push/release authorized"
+external_action_authorizations:
+  - action: "fetch origin and merge origin/main into local dev"
+    actor: "parent coding agent"
+    target: "local dev branch"
+    scope: "sync requested by user"
+    policy_evidence: "explicit user request to sync to main again"
+    timestamp: "2026-08-27"
+    expiry: "completed"
+contract:
+  intended_outcomes:
+    - "Current origin/main is an ancestor of local dev"
+    - "UC-first discovery recognizes system.ai.grok-4-6 as an OpenAI Responses model"
+    - "Grok reaches Pi's databricks-openai provider and model picker"
+    - "Grok cannot enter the OSS/MLflow catalog and gpt-oss remains excluded from Responses discovery"
+    - "Inherited Pi MLflow repair proxy remains compatible with main's public hop-by-hop header constant"
+  observable_checks:
+    - "Focused discovery, CLI propagation, Pi rendering, and proxy tests pass"
+    - "Bounded full suite, lint, format, ancestry, diff, and conflict-marker checks pass"
+  non_goals:
+    - "Do not fix known live Grok request-shape incompatibilities in Codex, Pi, or Copilot"
+    - "Do not push, open, approve, merge, deploy, or release"
+  reserved_human_decisions:
+    - "Whether to push or release the local dev branch"
+impact_map:
+  production_paths:
+    - "src/ucode/databricks.py: UC model-service family classification and OSS exclusion"
+    - "src/ucode/agents/pi.py: existing codex_models to databricks-openai model rendering"
+    - "src/ucode/agents/_mlflow_proxy.py: main-sync compatibility import"
+    - "src/ucode/cli.py: existing discovery propagation into state"
+  tests:
+    - "tests/test_databricks.py"
+    - "tests/test_cli.py"
+    - "tests/test_agent_pi.py"
+    - "tests/test_mlflow_proxy.py"
+    - "tests/test_gateway_proxy.py"
+deterministic_plan:
+  - "Prove Grok classification, route exclusion, CLI propagation, and Pi picker rendering"
+  - "Prove main-sync proxy compatibility"
+  - "Run bounded full regression and static checks"
+command_results:
+  - command: "git fetch origin && git merge --no-edit origin/main"
+    exit_code: 0
+    result: "Merge commit 261a911; origin/main@81d03f1 is an ancestor; dev is 21 commits ahead and 0 behind"
+  - command: "uv run --frozen pytest -q tests/test_databricks.py tests/test_cli.py tests/test_agent_pi.py tests/test_agent_opencode.py tests/test_managed_setup.py"
+    exit_code: 0
+    result: "789 passed in 36.43s"
+  - command: "uv run --frozen pytest -q tests/test_mlflow_proxy.py tests/test_gateway_proxy.py"
+    exit_code: 0
+    result: "42 passed in 10.84s"
+  - command: "uv run --frozen pytest -q -k 'not TestStateFileIsNotRewritten and not test_user_agent_arrives_at_gateway'"
+    exit_code: 0
+    result: "2162 passed, 37 skipped, 13 deselected in 65.84s"
+  - command: "uv run --frozen ruff check ."
+    exit_code: 0
+    result: "passed"
+  - command: "uv run --frozen ruff format --check src/ tests/"
+    exit_code: 0
+    result: "89 files already formatted"
+  - command: "git diff --check; ancestry check; conflict-marker scan"
+    exit_code: 0
+    result: "all passed"
+reviewer_reports:
+  - role: "requirements-reviewer"
+    run_id: "bef13276"
+    result: "no blockers"
+  - role: "edge-case-reviewer"
+    run_id: "6792f984"
+    result: "Claude case-normalization finding reproduced and fixed"
+  - role: "regression-reviewer"
+    run_id: "066f71a4"
+    result: "requested caller-level Grok propagation coverage; added"
+  - role: "edge-case-reviewer re-review"
+    run_id: "77baf3de"
+    result: "raised pre-existing direct-render gpt-oss behavior; adjudicated non-blocking"
+  - role: "regression-reviewer re-review"
+    run_id: "c2847457"
+    result: "no blockers"
+  - role: "routine security/correctness reviewer"
+    run_id: "8f8198b2"
+    result: "no blockers for system.ai scope, Grok route isolation, gpt-oss exclusion, or proxy header filtering"
+finding_reproductions:
+  - finding: "Claude classifier was case-sensitive while new family checks were case-insensitive"
+    reproduction: "classify_model_family('SYSTEM.AI.CLAUDE-OPUS-4-8') returned None"
+    disposition: "fixed by normalizing once before all family checks; regression test added"
+  - finding: "Directly supplied stale gpt-oss can be rendered by Pi's pure overlay helper"
+    reproduction: "Existing test and implementation at pre-change 11f8aa1 intentionally demonstrate this"
+    disposition: "dismissed as pre-existing and outside production discovery; discovery and managed classification exclude gpt-oss"
+fixes_and_re_review:
+  - fix: "case-normalized model-family classification"
+    re_review: "edge-case re-review completed"
+  - fix: "added CLI and Pi Grok propagation/model-picker coverage"
+    re_review: "regression re-review completed with no blockers"
+adjudication:
+  role: "verification-adjudicator"
+  run_id: "4a4b9ceb"
+  decision: "READY_FOR_HUMAN_REVIEW"
+  rationale: "All contract claims confirmed; no reproduced blockers survive"
+unavailable_checks:
+  - "Live Databricks e2e was not run because UCODE_TEST_WORKSPACE is unset"
+residual_risks:
+  - "Existing e2e exclusions document that current Codex, Pi, and Copilot request shapes do not successfully invoke Grok; this change makes Grok visible in Pi but does not claim live-call compatibility"
+  - "The bounded full suite excludes the known real-state TestStateFileIsNotRewritten hangs and known Claude user-agent baseline test"
+human_approvals: []
+pr_release_gate:
+  pr: "not-applicable"
+  state: "not-applicable"
+  reviewed_revision: "local dirty integration digest 9c3e5a3ebb403394da0f2d762734dde7b6a8e0a088c9e88045661500ad4e49ac"
+  required_checks_source: "local integration policy; no release authorized"
+  required_checks: []
+  post_approval_diff: "none"
+  merge_revision: "not-applicable"
+lifecycle_history:
+  - state: "main-synced"
+    actor: "parent coding agent"
+    timestamp: "2026-08-27"
+    identity: "261a91137e4685f813ee64d60ef3b82d88d784dc"
+    evidence: "origin/main ancestry and ahead/behind checks"
+  - state: "verified"
+    actor: "parent coding agent"
+    timestamp: "2026-08-27"
+    identity: "9c3e5a3ebb403394da0f2d762734dde7b6a8e0a088c9e88045661500ad4e49ac"
+    evidence: "command_results and reviewer reports above"
+final_decision:
+  state: "READY_FOR_HUMAN_REVIEW"
+  owner: "repository owner"
+  next_action: "Optionally run live workspace e2e, then decide whether to push/release"

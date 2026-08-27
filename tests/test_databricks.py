@@ -390,6 +390,7 @@ class TestDiscoverModelServices:
                 _model_service("system.ai.claude-opus-4-8"),
                 _model_service("system.ai.claude-sonnet-4-6"),
                 _model_service("system.ai.gpt-5"),
+                _model_service("system.ai.grok-4-6"),
                 _model_service("system.ai.gemini-2-5-flash"),
                 _model_service("system.ai.gemini-3-5-flash"),
                 _model_service("system.ai.kimi-k2-7-code"),
@@ -411,7 +412,8 @@ class TestDiscoverModelServices:
             "opus": "system.ai.claude-opus-4-8",
             "sonnet": "system.ai.claude-sonnet-4-6",
         }
-        assert codex == ["system.ai.gpt-5"]
+        assert codex == ["system.ai.gpt-5", "system.ai.grok-4-6"]
+        assert "system.ai.grok-4-6" not in oss
         # Gemini ordered newest-first via the shared sort key.
         assert gemini[0] == "system.ai.gemini-3-5-flash"
         # DeepSeek, GLM, and Kimi are allowlisted OSS families; Llama is not.
@@ -1718,6 +1720,23 @@ class TestDiscoverModelServicesDynamicOss:
         assert reason is None
         assert oss == ["system.ai.qwen35-122b-a10b"]
 
+    def test_grok_stays_on_the_responses_route(self, monkeypatch):
+        model_services = {"model_services": [_model_service("system.ai.grok-4-6")]}
+        foundation_models = _mlflow_chat_payload(["databricks-grok-4-6"])
+
+        def fake_get(url, token, timeout=10):
+            if "model-services" in url:
+                return model_services, None
+            return foundation_models, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        _, codex, _, oss, reason = db_mod.discover_model_services(WS, "token")
+
+        assert reason is None
+        assert codex == ["system.ai.grok-4-6"]
+        assert oss == []
+
 
 class TestResolvePatToken:
     def test_reads_pat_profile_token_from_cfg(self, monkeypatch, tmp_path):
@@ -2825,10 +2844,12 @@ class TestClassifyModelFamily:
         ("model_id", "expected"),
         [
             ("system.ai.claude-opus-4-8", "opus"),
+            ("SYSTEM.AI.CLAUDE-OPUS-4-8", "opus"),
             ("system.ai.claude-sonnet-5", "sonnet"),
             ("databricks-claude-haiku-4-5", "haiku"),
             ("system.ai.claude-fable-5", "fable"),
             ("system.ai.gpt-5-3-codex", "codex"),
+            ("system.ai.grok-4-6", "codex"),
             ("system.ai.gemini-3-flash", "gemini"),
             ("system.ai.kimi-k2-7-code", "oss"),
             ("system.ai.glm-4-6", "oss"),

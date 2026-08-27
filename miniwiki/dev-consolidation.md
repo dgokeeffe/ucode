@@ -99,6 +99,24 @@ Verification for this revision (auditable record: `verification/dev-opus5-c45740
 
 Independent review found and the parent reproduced/fixed: (1) same-family managed Claude ids being dropped, (2) no supplemental discovery for non-Opus Claude-only states, and (3) legacy gateway fallback being skipped for non-Claude or partial UC inventories. Reviewers also raised Fable inclusion, but that conflicts with the pre-existing explicit Fable opt-in invariant and was intentionally not changed.
 
+## 2026-08-27 main sync and Grok visibility in Pi
+
+`origin/main` advanced to `81d03f1` and was merged into `dev` as `261a911`. The merge retained main's managed-config export, Codex routing, and Claude gateway-discovery proxy changes. Main renamed the shared proxy header constant to the public `HOP_BY_HOP_HEADERS`; the inherited Pi MLflow repair proxy was reconciled to that name for both request and response filtering.
+
+The reason `system.ai.grok-4-6` was not auto-detected was the UC-first classifier: it admitted only model names containing `gpt-` to the Responses catalog. When UC returned any GPT model, the catalog was nonempty, so the capability-based legacy fallback never ran and Grok was silently omitted. Discovery now recognizes both GPT and Grok as OpenAI Responses families while continuing to exclude `gpt-oss`. Grok therefore propagates through shared state into Pi's `databricks-openai` provider and model picker; it is explicitly excluded from the OSS/MLflow catalog. Managed Pi model classification follows the same family rule.
+
+Verification for this revision (auditable record: `verification/grok-pi-main-sync-261a911.yaml`):
+
+- Focused discovery, CLI propagation, Pi, OpenCode, and managed-setup suites: **789 passed in 36.43s**.
+- Proxy compatibility suites: **42 passed in 10.84s**.
+- Bounded full suite: **2162 passed, 37 skipped, 13 deselected in 65.84s**.
+- `uv run --frozen ruff check .`: passed.
+- `uv run --frozen ruff format --check src/ tests/`: **89 files already formatted**.
+- `git diff --check`, origin/main ancestry, and conflict-marker scans: passed.
+- Requirements, regression, edge-case, and bounded security/correctness review left no reproduced blockers. Adjudicator run `4a4b9ceb` returned `READY_FOR_HUMAN_REVIEW`.
+
+The existing e2e exclusions for Grok in Codex, Pi, and Copilot remain deliberate: this change makes Grok visible and correctly routed in Pi's catalog but does not claim those clients' current request shapes successfully invoke it.
+
 ## Residuals and next action
 
 - The full suite's unchanged real-state tests remain unavailable because they hang; the completed bounded suite excludes that class and the known Claude user-agent test.

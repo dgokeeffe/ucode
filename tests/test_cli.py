@@ -2098,6 +2098,22 @@ class TestConfigureSharedStateUsePat:
         assert legacy_called == []
         assert "uc_enabled" not in state
 
+    def test_grok_from_uc_listing_reaches_openai_catalog(self, monkeypatch):
+        cli_mod, _, _, saved = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        grok = "system.ai.grok-4-6"
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: ({}, [grok], [], [], None),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        assert state["codex_models"] == [grok]
+        assert state["opencode_models"]["openai"] == [grok]
+        assert state["oss_models"] == []
+        assert saved[-1]["codex_models"] == [grok]
+
     def test_active_listing_replaces_unlisted_gpt_in_state_and_overlays(self, monkeypatch):
         from ucode.agents import opencode as opencode_mod
         from ucode.agents import pi as pi_mod
