@@ -348,6 +348,25 @@ class TestOpenAIProvider:
             "output": 32_768,
         }
 
+    def test_grok_uses_its_full_documented_context(self):
+        model = "system.ai.grok-4-6"
+        models = {"openai": [model]}
+
+        overlay, _ = opencode.render_overlay(model, "tok", _base_urls(), models)
+
+        entry = overlay["provider"]["databricks-openai"]["models"][model]
+        assert entry["limit"]["context"] == 500_000
+
+    def test_live_responses_context_overrides_static_fallback(self):
+        model = "system.ai.future-coder-1"
+        models = {"openai": [model]}
+        specs = [{"id": model, "context_window": 750_000}]
+
+        overlay, _ = opencode.render_overlay(model, "tok", _base_urls(), models, [], specs)
+
+        entry = overlay["provider"]["databricks-openai"]["models"][model]
+        assert entry["limit"] == {"context": 750_000, "output": 16_384}
+
     def test_openai_authorization_header(self):
         models = {"openai": ["databricks-gpt-5-6-sol"]}
         overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)

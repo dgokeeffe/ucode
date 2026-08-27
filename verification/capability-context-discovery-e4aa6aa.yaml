@@ -1,0 +1,134 @@
+handoff_artifact: verification/capability-context-discovery-e4aa6aa.yaml
+handoff_security:
+  classification: "internal development evidence"
+  authorized_audience: ["repository owner", "maintainers"]
+  owner: "parent coding agent"
+  retention: "repository lifetime"
+verification_identity:
+  repository: "/Users/david.okeeffe/Repos/ucode"
+  base_revision: "e4aa6aa6562099b6e08e64537c8223ec24557e9c"
+  head_revision: "e4aa6aa6562099b6e08e64537c8223ec24557e9c plus scoped dirty change"
+  dirty_state_digest: "d883c1b9b30f38c13a3a6f498a52f86ac15f2acb88d23947b5ef823dae0167a1 (production, tests, and miniwiki; excludes this record and preserved user-local files)"
+repository_policy:
+  source: "AGENTS.md and user-level .pi/agent/AGENTS.md"
+  pr_required: false
+  required_checks_source: "Local dev integration; no push/release authorized"
+external_action_authorizations: []
+contract:
+  intended_outcomes:
+    - "Future system.ai models are discovered by positive compatible AI Gateway V2 API metadata rather than vendor-name allowlists"
+    - "Responses models reach Pi/OpenCode; native Gemini models reach Gemini; MLflow-chat-only models reach OSS"
+    - "Embeddings, rerankers, incompatible models, and native-route duplicates remain excluded"
+    - "Known-family fallback applies only when per-model metadata is absent or unavailable"
+    - "Grok 4.6 uses its documented 500K context instead of the generic 128K fallback"
+    - "Live Responses context metadata is persisted and consumed by Pi and OpenCode without widening output caps"
+  non_goals:
+    - "Do not blindly expose every system.ai service"
+    - "Do not change Claude family-slot semantics"
+    - "Do not fix known live Grok request-shape incompatibilities"
+    - "Do not push, deploy, or release"
+impact_map:
+  production_paths:
+    - "src/ucode/databricks.py: capability catalog, route classification, context parsing/specs, cache"
+    - "src/ucode/cli.py: codex_model_specs persistence"
+    - "src/ucode/agents/pi.py: Responses context override"
+    - "src/ucode/agents/opencode.py: Responses context override"
+  tests:
+    - "tests/test_databricks.py"
+    - "tests/test_cli.py"
+    - "tests/test_agent_pi.py"
+    - "tests/test_agent_opencode.py"
+deterministic_plan:
+  - "Exercise unknown Responses, Gemini, MLflow-only, non-chat, incompatible, duplicate, malformed, and cache cases"
+  - "Exercise Grok static 500K and live future-model context propagation in Pi and OpenCode"
+  - "Run focused and bounded full regression lanes plus static checks"
+command_results:
+  - command: "uv run --frozen pytest -q tests/test_databricks.py tests/test_cli.py tests/test_agent_pi.py tests/test_agent_opencode.py tests/test_managed_setup.py tests/test_mlflow_proxy.py tests/test_gateway_proxy.py"
+    exit_code: 0
+    result: "845 passed in 44.76s"
+  - command: "uv run --frozen pytest -q -k 'not TestStateFileIsNotRewritten and not test_user_agent_arrives_at_gateway'"
+    exit_code: 0
+    result: "2176 passed, 37 skipped, 13 deselected in 64.92s"
+  - command: "uv run --frozen pytest -q tests/test_e2e.py"
+    exit_code: 0
+    result: "1 passed, 30 skipped (UCODE_TEST_WORKSPACE unset)"
+  - command: "uv run --frozen ruff check ."
+    exit_code: 0
+    result: "passed"
+  - command: "uv run --frozen ruff format --check src/ tests/"
+    exit_code: 0
+    result: "89 files already formatted"
+  - command: "Grok context/parser assertion, git diff --check, origin/main ancestry, conflict-marker scan"
+    exit_code: 0
+    result: "all passed"
+reviewer_reports:
+  - role: "requirements-reviewer"
+    run_id: "e15e5b88"
+    finding: "Static OSS fallback could override explicit incompatible metadata"
+    disposition: "reproduced and fixed"
+  - role: "edge-case-reviewer"
+    run_id: "75a9a97d"
+    finding: "Duplicate endpoint names could appear twice"
+    disposition: "reproduced and fixed"
+  - role: "requirements-reviewer re-review"
+    run_id: "2f6786cf"
+    result: "no blockers"
+  - role: "edge-case-reviewer final"
+    run_id: "ee53b5a9"
+    result: "no blockers"
+  - role: "regression-reviewer final"
+    run_id: "c16415ea"
+    result: "no blockers"
+  - role: "bounded security/data reviewer"
+    run_id: "2b24c88f"
+    result: "no blockers"
+finding_reproductions:
+  - finding: "Explicit native metadata did not suppress static GLM/Kimi/DeepSeek fallback"
+    reproduction: "A GLM endpoint advertising Responses only was returned as static OSS"
+    fix: "Skip static fallback whenever matching catalog metadata exists but produces no MLflow-chat-only spec"
+  - finding: "Duplicate foundation endpoint records produced duplicate legacy discovery choices"
+    reproduction: "Two identical Responses endpoint records yielded the same id twice"
+    fix: "Deduplicate before sorting endpoint ids"
+  - finding: "Grok context fell through to generic 128K Responses fallback"
+    reproduction: "gpt_model_token_limits('system.ai.grok-4-6') returned fallback context"
+    fix: "Add documented 500K Grok fallback and propagate live Responses context specs"
+fixes_and_re_review:
+  - fix: "Capability-authoritative fallback precedence and endpoint deduplication"
+    re_review: "requirements and edge re-reviews passed"
+  - fix: "API-specific positive context parsing and Pi/OpenCode propagation"
+    re_review: "final edge, regression, and security reviews passed"
+adjudication:
+  role: "verification-adjudicator"
+  run_id: "7e1ac5fe"
+  decision: "READY_FOR_HUMAN_REVIEW"
+  rationale: "Every contract element confirmed in source and no reproduced blockers survive"
+unavailable_checks:
+  - "Live Databricks e2e was not run because UCODE_TEST_WORKSPACE is unset"
+residual_risks:
+  - "Capability metadata proves API dialect, not each coding client's tool-schema compatibility"
+  - "Known Pi/Codex/Copilot live Grok request-shape failure remains disclosed and out of scope"
+  - "Unknown description wording falls back conservatively until the parser recognizes it"
+human_approvals: []
+pr_release_gate:
+  pr: "not-applicable"
+  state: "not-applicable"
+  reviewed_revision: "local dirty integration digest d883c1b9b30f38c13a3a6f498a52f86ac15f2acb88d23947b5ef823dae0167a1"
+  required_checks_source: "local integration policy; no release authorized"
+  required_checks: []
+  post_approval_diff: "none"
+  merge_revision: "not-applicable"
+lifecycle_history:
+  - state: "implemented"
+    actor: "parent coding agent"
+    timestamp: "2026-08-27"
+    identity: "d883c1b9b30f38c13a3a6f498a52f86ac15f2acb88d23947b5ef823dae0167a1"
+    evidence: "command results and reviews above"
+  - state: "verified"
+    actor: "parent coding agent"
+    timestamp: "2026-08-27"
+    identity: "d883c1b9b30f38c13a3a6f498a52f86ac15f2acb88d23947b5ef823dae0167a1"
+    evidence: "adjudicator 7e1ac5fe"
+final_decision:
+  state: "READY_FOR_HUMAN_REVIEW"
+  owner: "repository owner"
+  next_action: "Optionally run live workspace e2e, then decide whether to push/release"

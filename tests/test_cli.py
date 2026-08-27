@@ -1992,6 +1992,7 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
+        monkeypatch.setattr(cli_mod, "discover_responses_model_specs", lambda w, t, ids: ([], None))
         monkeypatch.setattr(
             cli_mod,
             "discover_oss_model_specs",
@@ -2098,21 +2099,27 @@ class TestConfigureSharedStateUsePat:
         assert legacy_called == []
         assert "uc_enabled" not in state
 
-    def test_grok_from_uc_listing_reaches_openai_catalog(self, monkeypatch):
+    def test_future_responses_model_reaches_openai_catalog(self, monkeypatch):
         cli_mod, _, _, saved = self._stub_deps(monkeypatch, pat_token="dapi-pat")
-        grok = "system.ai.grok-4-6"
+        model = "system.ai.future-coder-1"
         monkeypatch.setattr(
             cli_mod,
             "discover_model_services",
-            lambda w, t: ({}, [grok], [], [], None),
+            lambda w, t: ({}, [model], [], [], None),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_responses_model_specs",
+            lambda w, t, ids: ([{"id": model, "context_window": 750_000}], None),
         )
 
         state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
 
-        assert state["codex_models"] == [grok]
-        assert state["opencode_models"]["openai"] == [grok]
+        assert state["codex_models"] == [model]
+        assert state["opencode_models"]["openai"] == [model]
         assert state["oss_models"] == []
-        assert saved[-1]["codex_models"] == [grok]
+        assert state["codex_model_specs"] == [{"id": model, "context_window": 750_000}]
+        assert saved[-1]["codex_models"] == [model]
 
     def test_active_listing_replaces_unlisted_gpt_in_state_and_overlays(self, monkeypatch):
         from ucode.agents import opencode as opencode_mod

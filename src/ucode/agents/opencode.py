@@ -148,11 +148,34 @@ def _oss_model_overlay(
     return overlay
 
 
-def _openai_model_overlay(model: str, ua_header: dict[str, str]) -> dict:
-    """Per-model Responses API options and explicit GPT token limits."""
+def _responses_specs_by_id(raw_specs: object) -> dict[str, dict[str, object]]:
+    if not isinstance(raw_specs, list):
+        return {}
+    specs: dict[str, dict[str, object]] = {}
+    for raw_spec in raw_specs:
+        if not isinstance(raw_spec, dict):
+            continue
+        typed_spec = cast(dict[str, object], raw_spec)
+        model_id = typed_spec.get("id")
+        context = _positive_int(typed_spec.get("context_window"))
+        if isinstance(model_id, str) and model_id and context is not None:
+            specs.setdefault(model_id, typed_spec)
+    return specs
+
+
+def _openai_model_overlay(
+    model: str, ua_header: dict[str, str], spec: dict[str, object] | None = None
+) -> dict:
+    """Per-model Responses API options and explicit token limits."""
+    limits = gpt_model_token_limits(model)
+    discovered_context = (
+        _positive_int(spec.get("context_window")) if isinstance(spec, dict) else None
+    )
+    if discovered_context is not None:
+        limits["context"] = discovered_context
     return {
         "headers": ua_header,
-        "limit": gpt_model_token_limits(model),
+        "limit": limits,
         "options": {"useResponsesApi": True},
     }
 
@@ -163,6 +186,7 @@ def render_overlay(
     opencode_base_urls: dict[str, str],
     opencode_models: dict[str, list[str]],
     oss_specs: list[dict] | None = None,
+    codex_specs: list[dict] | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for opencode.json."""
     auth_headers = {"Authorization": f"Bearer {token}"}
@@ -213,6 +237,7 @@ def render_overlay(
         }
         keys.append(["provider", "databricks-google"])
     if openai_models:
+        codex_specs_by_id = _responses_specs_by_id(codex_specs)
         # @ai-sdk/openai supports both the Responses API and the legacy
         # chat-completions API. Databricks GPT-5 / GPT-5.6 / Codex models are
         # Responses-only on /ai-gateway/codex/v1, so the per-model flag
@@ -225,7 +250,12 @@ def render_overlay(
                 "apiKey": token,
                 "headers": auth_headers,
             },
-            "models": {m: _openai_model_overlay(m, ua_header) for m in openai_models},
+            "models": {
+                model_id: _openai_model_overlay(
+                    model_id, ua_header, codex_specs_by_id.get(model_id)
+                )
+                for model_id in openai_models
+            },
         }
         keys.append(["provider", "databricks-openai"])
     if oss_models:
@@ -268,6 +298,7 @@ def write_tool_config(
         opencode_base_urls,
         state.get("opencode_models") or {},
         state.get("oss_model_specs") or [],
+        state.get("codex_model_specs") or [],
     )
     existing = read_json_safe(OPENCODE_CONFIG_PATH)
     providers = existing.get("provider")

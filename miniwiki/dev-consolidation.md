@@ -117,6 +117,20 @@ Verification for this revision (auditable record: `verification/grok-pi-main-syn
 
 The existing e2e exclusions for Grok in Codex, Pi, and Copilot remain deliberate: this change makes Grok visible and correctly routed in Pi's catalog but does not claim those clients' current request shapes successfully invoke it.
 
+### Capability-gated future models and context windows
+
+The follow-up removes the need to add every future vendor name manually without blindly admitting all `system.ai.*` services. UC model-service IDs are now joined to the cached foundation-model catalog and bucketed only when a live V2 API is compatible: Responses models go to the OpenAI/Codex catalog, native Gemini models to Gemini, and MLflow-chat-only models to OSS. Embeddings and rerankers remain excluded, native routes cannot be duplicated into OSS, and known-family name fallbacks apply only when metadata for that exact model is unavailable. Claude remains family-slotted because its clients require `opus`/`sonnet`/`haiku`/`fable` aliases.
+
+Grok 4.6 had also inherited the generic 128K Responses fallback. Its static metadata now reflects Databricks' documented **500K context window**. For Grok and future Responses models, context windows parsed from the live foundation-model description are persisted as `codex_model_specs` and used by both Pi and OpenCode; existing conservative output ceilings and reasoning compatibility remain unchanged. Common `K`, `M`, `million`, and `500,000-token` description forms are supported. MLflow models likewise choose the largest context advertised by their MLflow-capable entities.
+
+Verification for this follow-up (auditable record: `verification/capability-context-discovery-e4aa6aa.yaml`):
+
+- Focused discovery, CLI, Pi, OpenCode, managed-setup, and proxy suites: **845 passed in 44.76s**.
+- Bounded full suite: **2176 passed, 37 skipped, 13 deselected in 64.92s**.
+- No-workspace e2e collection: **1 passed, 30 skipped**.
+- Full Ruff, format, diff, ancestry, and conflict-marker checks passed.
+- Review found and the parent fixed explicit-metadata/static-OSS precedence and duplicate endpoint output. Final edge, regression, and bounded security reviews reported no blockers. Adjudicator run `7e1ac5fe` returned `READY_FOR_HUMAN_REVIEW`.
+
 ## Residuals and next action
 
 - The full suite's unchanged real-state tests remain unavailable because they hang; the completed bounded suite excludes that class and the known Claude user-agent test.
