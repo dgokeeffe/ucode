@@ -402,6 +402,15 @@ class TestRenderOverlayAuthAndModels:
         ids = {m["id"] for m in overlay["providers"]["databricks-openai"]["models"]}
         assert ids == {"gpt-5", "gpt-5-mini"}
 
+    def test_grok_appears_in_openai_model_picker(self):
+        grok = "system.ai.grok-4-6"
+        overlay, _ = _overlay(grok, codex_models=[grok])
+
+        provider = overlay["providers"]["databricks-openai"]
+        assert provider["api"] == "openai-responses"
+        assert [model["id"] for model in provider["models"]] == [grok]
+        assert overlay["model"] == f"databricks-openai/{grok}"
+
     def test_gemini_models_listed(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2", "gemini-2-pro"])
         ids = {m["id"] for m in overlay["providers"]["databricks-gemini"]["models"]}
@@ -475,9 +484,10 @@ class TestPiDefaultModel:
         }
         assert pi.default_model(state) == "system.ai.gpt-5-6-sol"
 
-    def test_falls_back_to_generic_responses_endpoint(self):
-        state = {"claude_models": {}, "codex_models": ["c1"]}
-        assert pi.default_model(state) == "c1"
+    def test_falls_back_to_grok_responses_endpoint(self):
+        grok = "system.ai.grok-4-6"
+        state = {"claude_models": {}, "codex_models": [grok]}
+        assert pi.default_model(state) == grok
 
     def test_does_not_route_gpt_oss_to_responses(self):
         state = {
@@ -875,13 +885,14 @@ class TestManagedModels:
             "pi_models": [
                 "system.ai.claude-opus-4-8",
                 "system.ai.gpt-5",
+                "system.ai.grok-4-6",
                 "system.ai.gemini-3-flash",
                 "system.ai.deepseek-v4-pro",
             ]
         }
         assert pi._managed_model_families(state) == (
             {"opus": "system.ai.claude-opus-4-8"},
-            ["system.ai.gpt-5"],
+            ["system.ai.gpt-5", "system.ai.grok-4-6"],
             ["system.ai.gemini-3-flash"],
             ["system.ai.deepseek-v4-pro"],
         )

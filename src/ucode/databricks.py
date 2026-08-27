@@ -1409,6 +1409,12 @@ _MODEL_SERVICE_PARENT_SCHEMA = "schemas/system.ai"
 # that they are served exclusively through MLflow chat completions.
 _OSS_MODEL_FAMILIES = ("kimi-", "glm-", "deepseek-")
 
+# Models served through the OpenAI/Responses gateway route. UC model-service
+# discovery cannot expose API dialects, so these known native families need a
+# name-based classification alongside GPT. Keep gpt-oss out: it is
+# chat-completions-only and belongs to the MLflow provider.
+_CODEX_MODEL_FAMILIES = ("gpt-", "grok-")
+
 # Native routes take precedence over the generic MLflow chat-completions route.
 # A foundation model advertising any of these must not be duplicated as OSS.
 _NATIVE_PROVIDER_API_TYPES = frozenset(
@@ -1434,6 +1440,12 @@ def _is_oss_chat_model(model_id: str) -> bool:
 ANTHROPIC_FAMILIES = ("fable", "opus", "sonnet", "haiku")
 
 
+def _is_codex_model(model_id: str) -> bool:
+    """Return whether a model id belongs on the OpenAI/Responses route."""
+    lowered = model_id.lower()
+    return any(family in lowered for family in _CODEX_MODEL_FAMILIES) and "gpt-oss" not in lowered
+
+
 def classify_model_family(model_id: str) -> str | None:
     """Bucket a model FQN into the family ucode keys its state by, or None if unrecognized.
 
@@ -1442,14 +1454,15 @@ def classify_model_family(model_id: str) -> str | None:
     one of ``ANTHROPIC_FAMILIES``, ``"codex"``, ``"gemini"``, or ``"oss"``. Matching is by name
     substring because neither the listing nor the config records a model's API dialect.
     """
+    lowered = model_id.lower()
     for family in ANTHROPIC_FAMILIES:
-        if f"claude-{family}-" in model_id:
+        if f"claude-{family}-" in lowered:
             return family
-    if "gpt-" in model_id:
+    if _is_codex_model(model_id):
         return "codex"
-    if "gemini-" in model_id:
+    if "gemini-" in lowered:
         return "gemini"
-    if any(oss in model_id for oss in _OSS_MODEL_FAMILIES):
+    if any(oss in lowered for oss in _OSS_MODEL_FAMILIES):
         return "oss"
     return None
 
@@ -1590,7 +1603,7 @@ def _oss_specs_from_foundation_models(payload: object) -> list[dict]:
         is_native_family = (
             lowered_name.startswith("claude-")
             or lowered_name.startswith("gemini-")
-            or re.match(r"^gpt-\d(?:-|$)", lowered_name) is not None
+            or _is_codex_model(name)
         )
         if is_native_family or any(bad in lowered_name for bad in _OSS_NON_CHAT_SUBSTRINGS):
             continue
@@ -2139,7 +2152,9 @@ def discover_model_services(
     - ``claude_models`` maps ``fable``/``opus``/``sonnet``/``haiku`` to the
       newest matching ``system.ai.claude-*`` id (mirrors
       ``discover_claude_models``).
-    - ``codex_models`` is the list of ``system.ai.*gpt-*`` ids, newest first.
+    - ``codex_models`` is the list of ``system.ai.*gpt-*`` and
+      ``system.ai.*grok-*`` ids, newest first. ``gpt-oss-*`` is excluded because
+      it uses chat completions rather than the Responses API.
     - ``gemini_models`` is the list of ``system.ai.*gemini-*`` ids, newest first.
     - ``oss_models`` is the list of OSS-model ``system.ai.*`` ids.
 
@@ -2178,7 +2193,7 @@ def discover_model_services(
     # (served via /ai-gateway/mlflow/v1), NOT an openai-responses codex model —
     # exclude it here so it isn't offered under the codex provider (which 400s).
     codex_models = sorted(
-        [m for m in ids if "gpt-" in m and "gpt-oss" not in m],
+        [m for m in ids if _is_codex_model(m)],
         key=model_version_sort_key,
     )
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
