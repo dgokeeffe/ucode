@@ -143,9 +143,34 @@ Pi previously enabled reasoning only for `gpt-5` IDs, so Grok appeared as a non-
 
 Verification (auditable record: `verification/grok-pi-thinking-3feb9cd.yaml`): **641 focused tests passed**; the bounded full suite completed with **2178 passed, 37 skipped, 13 deselected**; `ty`, Ruff, format, and diff checks passed. Requirements and edge re-review reported no blockers, and adjudicator run `20085341` returned `READY_FOR_HUMAN_REVIEW`. A repeated live 429 reported for Grok is tracked separately as a rate-limit/capacity diagnostic requiring response headers; it is not a thinking-metadata failure.
 
+## 2026-08-31 main sync
+
+`origin/main` advanced to `2727132` (`smart routing: route Codex v2 subagents (#409)`) and was merged into `dev` as `1614fe3`. `dev` is now 29 commits ahead of `origin/main` and 0 behind; the ancestry check passes. The pre-sync tip was preserved as `backup/dev-before-main-sync-20260831-*`.
+
+Main contributed Claude/Codex smart-routing v2 (PTY + first-prompt routing), `ucode publish`, role-aware managed-config paths, launch-time speedups, agent-name-preserving banners, Anthropic MPS family pinning, and bounded retries for Claude model discovery (#412).
+
+Four conflicts were resolved deliberately:
+
+- `src/ucode/agents/claude.py`: kept the shared `claude_model_supports_1m` policy for the `[1m]` suffix and dropped main's newly added inline `_CLAUDE_MODEL_RE`. The shared policy already normalizes both the `databricks-claude-*` gateway form and the `system.ai.claude-*` UC form, and additionally covers Sonnet 4.5 and Fable 5, which main's inline regex did not.
+- `src/ucode/databricks.py`: kept `_discover_claude_gateway_ids` as the single legacy AI Gateway inventory path (it is also used by `discover_claude_models_unbucketed` and the UC-partial fallbacks) and routed it through main's `_get_anthropic_models_json`, so the consolidated branch inherits #412's bounded 429/network retries.
+- `src/ucode/cli.py`: unioned the discovery `want_*` sets. `want_codex` keeps OpenCode alongside main's codex/copilot/pi, and `want_oss` keeps OpenCode/Pi alongside main's Codex smart-routing requirement. `_DISCOVERY_CONSUMERS["oss"]` now names `codex` too so the discovery diagnostic matches the actual fetch set.
+- `tests/test_cli.py`: kept both sides' tests, including main's `test_codex_only_configure_persists_discovered_oss_models`.
+
+Two dev tests that stubbed `_http_get_json` with a fixed `timeout=10` signature were widened to `**kwargs` for the new `max_retries` argument.
+
+Verification for this sync:
+
+- `uv run --frozen pytest -q -k 'not TestStateFileIsNotRewritten and not test_user_agent_arrives_at_gateway'`: **2306 passed, 37 skipped, 13 deselected in 114.62s**, with only the two baseline smart-routing socket failures below.
+- `tests/test_claude_smart_routing_v2.py::TestFirstPromptHook::test_blocks_once_then_allows_replay` and `::TestPtyFlow::test_direct_switch_restore_and_replay` fail identically on a detached `origin/main` worktree (`2 failed, 20 passed`): the local prompt-routing unix socket never becomes ready in this environment. Environmental baseline, not a merge regression.
+- `uv run --frozen ruff check .`: passed. `uv run --frozen ruff format --check src/ tests/`: **93 files already formatted**. `uv run --frozen ty check src`: passed.
+- `tests/test_e2e.py` without `UCODE_TEST_WORKSPACE`: **1 passed, 30 skipped**.
+- `git merge-base --is-ancestor origin/main dev`: passed. Conflict-marker scan of `src/` and `tests/`: clean.
+
 ## Residuals and next action
 
 - The full suite's unchanged real-state tests remain unavailable because they hang; the completed bounded suite excludes that class and the known Claude user-agent test.
 - No live Databricks e2e was run in this integration session because `UCODE_TEST_WORKSPACE` was not set.
 - `uv.lock` and `.pi-subagents/` remain pre-existing local worktree changes and were not included in the implementation commit.
 - The local `dev` branch is not pushed by this work. Pushing or opening/updating a PR remains an explicit human action.
+- The two Claude smart-routing v2 socket tests remain unavailable in this environment; they fail the same way on unchanged `origin/main`.
+- No live workspace check of main's new smart-routing v2 PTY path was run against the consolidated Pi/OSS work.
