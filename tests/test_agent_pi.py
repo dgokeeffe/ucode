@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from contextlib import nullcontext
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -63,10 +64,10 @@ class TestPiSpec:
     def test_display(self):
         assert pi.SPEC["display"] == "Pi"
 
-    def test_config_path_under_pi_agent_dir(self):
+    def test_config_path_uses_standard_pi_agent_dir(self):
         assert pi.SPEC["config_path"].name == "models.json"
-        assert pi.SPEC["config_path"].parent.name == "agent"
-        assert pi.PI_UCODE_HOME in pi.SPEC["config_path"].parents
+        assert pi.PI_CONFIG_DIR == Path.home() / ".pi" / "agent"
+        assert pi.SPEC["config_path"].parent == pi.PI_CONFIG_DIR
 
 
 class TestRenderOverlayProviders:

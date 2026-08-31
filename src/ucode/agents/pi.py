@@ -1,4 +1,4 @@
-"""Pi coding agent: writes a ucode-private models.json with Databricks-backed providers.
+"""Pi coding agent: writes the user's ~/.pi/agent/models.json with Databricks-backed providers.
 
 Pi (https://pi.dev) is a multi-provider coding agent. We register four
 providers in its `models.json`, each speaking the API dialect best suited to
@@ -41,6 +41,7 @@ import os
 import signal
 import subprocess
 import threading
+from pathlib import Path
 from typing import cast
 from urllib.parse import urlparse
 
@@ -71,8 +72,9 @@ from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.ui import print_warning
 
-PI_UCODE_HOME = APP_DIR / "pi-home"
-PI_CONFIG_DIR = PI_UCODE_HOME / ".pi" / "agent"
+# Use Pi's standard user configuration directory. Keep ucode's backups and
+# state under APP_DIR, but let Pi share the user's normal ~/.pi/agent config.
+PI_CONFIG_DIR = Path.home() / ".pi" / "agent"
 PI_CONFIG_PATH = PI_CONFIG_DIR / "models.json"
 PI_SETTINGS_PATH = PI_CONFIG_DIR / "settings.json"
 PI_BACKUP_PATH = APP_DIR / "pi-models.backup.json"
@@ -299,7 +301,7 @@ def render_overlay(
     claude_model_ids: list[str] | None = None,
     codex_specs: list[dict] | None = None,
 ) -> tuple[dict, list[list[str]]]:
-    """Return (overlay, managed_key_paths) for Pi's private agent config."""
+    """Return (overlay, managed_key_paths) for Pi's user agent config."""
     providers: dict = {}
     keys: list[list[str]] = [["model"]]
     # Pi expands header values that match an env var name. Our UA contains
