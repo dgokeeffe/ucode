@@ -8,7 +8,6 @@ import subprocess
 import threading
 from typing import cast
 
-from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -47,10 +46,6 @@ PROVIDER_KEYS: list[list[str]] = [
     ["provider", "databricks-openai"],
     ["provider", "databricks-oss"],
 ]
-
-
-def is_update_available() -> tuple[str, str] | None:
-    return available_npm_package_update(SPEC["package"])
 
 
 def _resolve_model_selector(model: str, opencode_models: dict[str, list[str]]) -> str:

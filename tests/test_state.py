@@ -122,10 +122,12 @@ class TestSaveLoadRoundTrip:
         )
 
         persisted = load_full_state()["workspaces"][FAKE_WS]
-        # Preserve the active listing verbatim, but both GPT-capable launchers
-        # select its newest numeric model rather than relying on list order.
+        # Preserve the active listing verbatim, and let each launcher pick its
+        # own default rather than relying on list order.
         assert persisted["codex_models"][0] == "system.ai.gpt-5"
-        assert persisted["agents"]["codex"]["model"] == "system.ai.gpt-5-6-luna"
+        # Codex now defers to its harness default, so ucode persists no pin.
+        assert "model" not in persisted["agents"]["codex"]
+        # Pi still selects the newest numeric GPT rather than trusting list order.
         assert persisted["agents"]["pi"]["model"] == "system.ai.gpt-5-6-luna"
 
     def test_save_respects_dry_run(self):
@@ -223,7 +225,7 @@ class TestHydrateState:
         # Cross-platform helper, not the old POSIX `if [ -n ... ]` pipeline (#116).
         assert "auth-token" in result["agents"]["claude"]["auth_command"]
         assert "if [ -n" not in result["agents"]["claude"]["auth_command"]
-        assert result["agents"]["codex"]["model"] == "gpt-5"
+        assert "model" not in result["agents"]["codex"]
         assert result["agents"]["codex"]["base_url"] == FAKE_URLS["codex"]
         # Codex runs the helper as argv (command + args), never via `sh -c`.
         codex_auth = result["agents"]["codex"]["auth"]

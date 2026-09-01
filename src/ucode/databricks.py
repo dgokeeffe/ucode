@@ -796,6 +796,38 @@ def ensure_databricks_cli_version() -> None:
         ensure_databricks_cli_version()
 
 
+def databricks_cli_version() -> tuple[int, int, int] | None:
+    """Return the installed Databricks CLI's (major, minor, patch), or None if
+    the CLI is absent or its version can't be read/parsed. Unlike
+    ``ensure_databricks_cli_version`` this only reports — it never upgrades — so
+    ``ucode doctor`` can decide what to recommend."""
+    if not shutil.which("databricks"):
+        return None
+    try:
+        result = run(
+            ["databricks", "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    raw = result.stdout or result.stderr or ""
+    output = (raw if isinstance(raw, str) else raw.decode(errors="replace")).strip()
+    return _parse_databricks_cli_version(output)
+
+
+def upgrade_databricks_cli() -> bool:
+    """Upgrade an already-installed Databricks CLI to the latest release.
+    Returns True on success, False if the installer failed."""
+    try:
+        _run_databricks_cli_installer(brew_subcommand="upgrade")
+    except RuntimeError:
+        return False
+    return True
+
+
 def install_databricks_cli() -> None:
     if shutil.which("databricks"):
         ensure_databricks_cli_version()
@@ -3147,6 +3179,46 @@ def map_claude_family_models(targets: list[str]) -> dict[str, str]:
             best_key[family] = key
             result[family] = model_id
     return result
+
+
+# Claude Code starts every session on its opus tier, which the gateway 403s when a Model Provider
+# Service declares no opus target. When opus is missing, fall back to the most capable tier the
+# service does offer. opus > sonnet > haiku.
+_CLAUDE_LAUNCH_TIER_PREFERENCE = ("opus", "sonnet", "haiku")
+
+
+def resolve_provider_launch_model(model: str | None, provider_models: dict[str, str]) -> str | None:
+    """Pick the model a provider-routed Claude session starts on, or None to keep Claude Code's default.
+
+    ``provider_models`` maps the Claude families a service declares to their target ids (see
+    ``map_claude_family_models``). With an explicit ``model`` (``ucode claude --model``) the user's
+    choice wins: a family alias resolves to that tier's declared target (erroring when the service
+    doesn't offer it), any other value is trusted as a raw target id the service allows. Without one,
+    return None when the service offers opus — Claude Code's own default already works, so we avoid
+    setting ANTHROPIC_MODEL and the duplicate ``/model`` picker row it produces — else the most
+    capable tier the service does offer, so the launch doesn't dead-end on an unservable opus.
+    """
+    if model:
+        if model in ANTHROPIC_FAMILIES:
+            target = provider_models.get(model)
+            if not target:
+                available = ", ".join(sorted(provider_models)) or "none"
+                raise RuntimeError(
+                    f"This Model Provider Service does not offer a '{model}' model "
+                    f"(available families: {available})."
+                )
+            return target
+        return model
+    if provider_models.get("opus"):
+        return None
+    return next(
+        (
+            provider_models[fam]
+            for fam in _CLAUDE_LAUNCH_TIER_PREFERENCE
+            if provider_models.get(fam)
+        ),
+        None,
+    )
 
 
 # `list_vector_search_catalog_schemas` walks Vector Search endpoints+indexes.
