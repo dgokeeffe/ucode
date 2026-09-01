@@ -1697,6 +1697,78 @@ def _foundation_model_api_types(payload: object) -> dict[str, frozenset[str]]:
     return {model_id: frozenset(api_types) for model_id, api_types in routes.items()}
 
 
+def _foundation_model_v2_endpoint_ids(payload: object) -> list[str]:
+    """Return every READY, AI-Gateway-v2 endpoint id in the foundation-model catalog.
+
+    The catalog is the gateway's own inventory and it leads UC model-services: a
+    foundation model can be live and routable as ``databricks-<name>`` days before it
+    is registered as a ``system.ai.*`` model service (verified 2026-09: the gateway
+    served ``databricks-gemini-3-7-flash`` while ``system.ai.gemini-3-7-flash``
+    404'd). Names are returned verbatim because the endpoint id is exactly what the
+    gateway routes on.
+
+    Endpoints are kept only when a served entity advertises
+    ``ai_gateway_v2_supported`` (ucode speaks only V2 routes) and the endpoint is not
+    reported as un-ready. Missing ``state`` metadata is treated as ready so a listing
+    that simply omits the field cannot hide a working model.
+    """
+    if not isinstance(payload, dict):
+        return []
+    raw_endpoints = cast(dict[str, object], payload).get("endpoints")
+    if not isinstance(raw_endpoints, list):
+        return []
+
+    names: list[str] = []
+    for endpoint in raw_endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        endpoint_dict = cast(dict[str, object], endpoint)
+        name = endpoint_dict.get("name")
+        config = endpoint_dict.get("config")
+        if not isinstance(name, str) or not name.strip() or not isinstance(config, dict):
+            continue
+        endpoint_state = endpoint_dict.get("state")
+        if isinstance(endpoint_state, dict):
+            ready = cast(dict[str, object], endpoint_state).get("ready")
+            if isinstance(ready, str) and ready.strip().upper() != "READY":
+                continue
+        entities = cast(dict[str, object], config).get("served_entities")
+        if not isinstance(entities, list):
+            continue
+        supports_v2 = False
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            foundation_model = cast(dict[str, object], entity).get("foundation_model")
+            if (
+                isinstance(foundation_model, dict)
+                and cast(dict[str, object], foundation_model).get("ai_gateway_v2_supported") is True
+            ):
+                supports_v2 = True
+                break
+        if supports_v2:
+            names.append(name.strip())
+    return sorted(set(names))
+
+
+def _gateway_only_model_ids(uc_ids: list[str], payload: object) -> list[str]:
+    """Catalog endpoint ids for models the UC ``system.ai`` listing doesn't have yet.
+
+    UC-registered models keep their ``system.ai.*`` id (both spellings route, and the
+    UC id is what every existing config records), so a catalog entry is added only
+    when no UC id normalizes to the same model. Non-chat services stay excluded.
+    """
+    known = {_canonical_oss_model_id(model_id) for model_id in uc_ids if isinstance(model_id, str)}
+    extra: list[str] = []
+    for name in _foundation_model_v2_endpoint_ids(payload):
+        canonical_id = _canonical_oss_model_id(name)
+        if canonical_id in known or any(bad in canonical_id for bad in _OSS_NON_CHAT_SUBSTRINGS):
+            continue
+        known.add(canonical_id)
+        extra.append(name)
+    return extra
+
+
 def _foundation_model_context_windows(
     payload: object, *, api_type: str | None = None
 ) -> dict[str, int]:
@@ -2367,30 +2439,55 @@ def discover_model_services(
 ) -> tuple[dict[str, str], list[str], list[str], list[str], str | None]:
     """Discover models via UC model-services and bucket them by family name.
 
+    The inventory is the UC ``system.ai`` listing unioned with the AI Gateway's own
+    foundation-model catalog: models live on the gateway but not yet registered in UC
+    are included under their routable ``databricks-*`` endpoint id (see
+    :func:`_gateway_only_model_ids`), so a newly shipped gateway model is offered
+    immediately instead of waiting for UC registration.
+
     Returns (claude_models, codex_models, gemini_models, oss_models, reason):
 
     - ``claude_models`` maps ``fable``/``opus``/``sonnet``/``haiku`` to the
-      newest matching ``system.ai.claude-*`` id (mirrors
-      ``discover_claude_models``).
-    - ``codex_models`` contains every ``system.ai.*`` id whose live metadata
-      advertises ``openai/v1/responses``, newest first. GPT/Grok names are the
-      safe fallback when metadata is unavailable; ``gpt-oss-*`` stays excluded.
+      newest matching ``claude-*`` id (mirrors ``discover_claude_models``).
+    - ``codex_models`` contains every id whose live metadata advertises
+      ``openai/v1/responses``, newest first. GPT/Grok names are the safe fallback
+      when metadata is unavailable; ``gpt-oss-*`` stays excluded.
     - ``gemini_models`` similarly contains every id advertising the native
       Gemini API, with ``gemini-*`` as its metadata-unavailable fallback.
-    - ``oss_models`` is the list of OSS-model ``system.ai.*`` ids.
+    - ``oss_models`` is the list of OSS-model ids.
 
     ``reason`` is None on success, else explains why nothing was found. Family
-    bucketing is by name substring because the model-services API does not
-    expose per-model API dialects.
+    bucketing is by name substring because neither listing records a model's API
+    dialect.
     """
     ids, reason = list_model_services(workspace, token)
     if not ids:
         return {}, [], [], [], reason
 
+    # The UC listing exposes names but not API dialects. Project the live
+    # foundation-model catalog onto those exact system.ai ids so future models
+    # are admitted by protocol capability rather than a vendor-name allowlist.
+    # A known-family name is only a fallback when that model is absent from the
+    # capability catalog (including a catalog outage); explicit incompatible
+    # metadata wins. Embedding/reranking services are never chat candidates.
+    foundation_payload, _ = _get_foundation_models_payload(workspace, token)
+    api_types_by_id = _foundation_model_api_types(foundation_payload)
+
+    # The catalog also leads UC registration, so anything live on the gateway but
+    # not yet a `system.ai.*` model service joins the inventory under its routable
+    # `databricks-*` endpoint id. Without this, a newly shipped gateway model is
+    # invisible to every agent until UC catches up.
+    gateway_only_ids = _gateway_only_model_ids(ids, foundation_payload)
+    if gateway_only_ids:
+        ids = sorted({*ids, *gateway_only_ids})
+
     claude_models: dict[str, str] = {}
     for family in ANTHROPIC_FAMILIES:
+        # Sort on the canonical name so a mixed inventory still picks the newest
+        # version rather than the alphabetically-later id prefix.
         candidates = sorted(
-            [m for m in ids if f"claude-{family}-" in m],
+            [m for m in ids if f"claude-{family}-" in m.lower()],
+            key=lambda model_id: (_canonical_oss_model_id(model_id), model_id),
             reverse=True,
         )
         if candidates:
@@ -2409,15 +2506,6 @@ def discover_model_services(
         for family, model in legacy_claude.items():
             claude_models.setdefault(family, model)
         _prefer_opus_4_8(claude_models, [*ids, *legacy_claude.values()])
-
-    # The UC listing exposes names but not API dialects. Project the live
-    # foundation-model catalog onto those exact system.ai ids so future models
-    # are admitted by protocol capability rather than a vendor-name allowlist.
-    # A known-family name is only a fallback when that model is absent from the
-    # capability catalog (including a catalog outage); explicit incompatible
-    # metadata wins. Embedding/reranking services are never chat candidates.
-    foundation_payload, _ = _get_foundation_models_payload(workspace, token)
-    api_types_by_id = _foundation_model_api_types(foundation_payload)
 
     def supports_api(model_id: str, api_type: str, *, known_family: bool) -> bool:
         canonical_id = _canonical_oss_model_id(model_id)
