@@ -1893,6 +1893,94 @@ class TestDiscoverModelServicesDynamicOss:
         assert (claude, codex, gemini, oss) == ({}, [], [], [])
         assert reason is not None
 
+    def test_gateway_models_missing_from_uc_are_offered(self, monkeypatch):
+        # The gateway catalog leads UC registration: these models are routable as
+        # `databricks-*` today, so they must not wait for a `system.ai.*` entry.
+        model_services = {
+            "model_services": [
+                _model_service("system.ai.gemini-3-6-flash"),
+                _model_service("system.ai.kimi-k3"),
+            ]
+        }
+        foundation_models = {
+            "endpoints": [
+                _foundation_endpoint("databricks-gemini-3-6-flash", ["gemini/v1/generateContent"]),
+                _foundation_endpoint("databricks-gemini-3-7-flash", ["gemini/v1/generateContent"]),
+                _foundation_endpoint("databricks-kimi-k3", ["mlflow/v1/chat/completions"]),
+                _foundation_endpoint("databricks-kimi-k3-neo", ["mlflow/v1/chat/completions"]),
+                _foundation_endpoint("databricks-grok-4-7", ["openai/v1/responses"]),
+            ]
+        }
+
+        def fake_get(url, token, timeout=10):
+            if "model-services" in url:
+                return model_services, None
+            return foundation_models, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        _, codex, gemini, oss, reason = db_mod.discover_model_services(WS, "token")
+
+        assert reason is None
+        # UC-registered models keep their system.ai id (no databricks-* twin);
+        # gemini/codex stay ordered newest-version-first.
+        assert gemini == ["databricks-gemini-3-7-flash", "system.ai.gemini-3-6-flash"]
+        assert oss == ["databricks-kimi-k3-neo", "system.ai.kimi-k3"]
+        assert codex == ["databricks-grok-4-7"]
+
+    def test_unready_or_v1_only_gateway_endpoints_are_ignored(self, monkeypatch):
+        model_services = {"model_services": [_model_service("system.ai.gpt-5")]}
+        not_ready = _foundation_endpoint("databricks-gpt-5-9", ["openai/v1/responses"])
+        not_ready["state"] = {"ready": "NOT_READY"}
+        ready = _foundation_endpoint("databricks-gpt-5-8", ["openai/v1/responses"])
+        ready["state"] = {"ready": "READY"}
+        foundation_models = {
+            "endpoints": [
+                _foundation_endpoint("databricks-gpt-5", ["openai/v1/responses"]),
+                not_ready,
+                ready,
+                # v1-only endpoints can't serve ucode's V2 routes.
+                _foundation_endpoint("databricks-gpt-5-7", ["openai/v1/responses"], v2=False),
+                # Non-chat services are never candidates.
+                _foundation_endpoint("databricks-bge-large-embed", ["openai/v1/responses"]),
+            ]
+        }
+
+        def fake_get(url, token, timeout=10):
+            if "model-services" in url:
+                return model_services, None
+            return foundation_models, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        _, codex, _, _, reason = db_mod.discover_model_services(WS, "token")
+
+        assert reason is None
+        assert codex == ["databricks-gpt-5-8", "system.ai.gpt-5"]
+
+    def test_newest_claude_wins_across_mixed_id_spellings(self, monkeypatch):
+        # A gateway-only newer opus must beat the alphabetically-later system.ai id.
+        model_services = {"model_services": [_model_service("system.ai.claude-sonnet-4-6")]}
+        foundation_models = {
+            "endpoints": [
+                _foundation_endpoint("databricks-claude-sonnet-4-6", ["anthropic/v1/messages"]),
+                _foundation_endpoint("databricks-claude-sonnet-5", ["anthropic/v1/messages"]),
+            ]
+        }
+
+        def fake_get(url, token, timeout=10):
+            if "model-services" in url:
+                return model_services, None
+            return foundation_models, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        claude, _, _, oss, reason = db_mod.discover_model_services(WS, "token")
+
+        assert reason is None
+        assert claude == {"sonnet": "databricks-claude-sonnet-5"}
+        assert oss == []
+
     def test_grok_stays_on_the_responses_route(self, monkeypatch):
         model_services = {"model_services": [_model_service("system.ai.grok-4-6")]}
         foundation_models = _mlflow_chat_payload(
