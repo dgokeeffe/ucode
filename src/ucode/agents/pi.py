@@ -45,7 +45,6 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import urlparse
 
-from ucode.agent_updates import available_npm_package_update
 from ucode.agents import _mlflow_proxy
 from ucode.config_io import (
     APP_DIR,
@@ -101,10 +100,6 @@ PROVIDER_KEYS: list[list[str]] = [["providers", name] for name in PROVIDER_NAMES
 # Old provider names earlier ucode versions wrote; cleaned up on each write so
 # users don't end up with stale entries pointing at routes that 400.
 LEGACY_PROVIDER_NAMES = ("databricks-anthropic", "databricks-codex", "databricks-oss")
-
-
-def is_update_available() -> tuple[str, str] | None:
-    return available_npm_package_update(SPEC["package"])
 
 
 def _resolve_model_selector(
