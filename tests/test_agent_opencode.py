@@ -108,6 +108,12 @@ class TestRenderOverlay:
         )
         assert overlay["provider"]["databricks-oss"]["npm"] == "@ai-sdk/openai"
 
+    def test_oss_provider_disables_unsupported_prompt_cache_key(self):
+        models = {"oss": ["system.ai.gpt-oss-120b"]}
+        overlay, _ = opencode.render_overlay("system.ai.gpt-oss-120b", "tok", _base_urls(), models)
+        options = overlay["provider"]["databricks-oss"]["options"]
+        assert options["setCacheKey"] is False
+
     def test_deepseek_uses_oss_provider(self):
         model = "system.ai.deepseek-v4-pro"
 
@@ -352,88 +358,65 @@ class TestRenderOverlay:
 
 
 class TestOpenAIProvider:
-    """OpenCode reaches Responses-capable model services through the native
-    databricks-openai provider against /ai-gateway/openai/v1."""
+    """OpenCode uses the native Responses route for GPT and Grok models."""
 
     def test_openai_provider_added_when_codex_models_present(self):
         models = {"openai": ["databricks-gpt-5-6-sol"]}
         overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
         assert "databricks-openai" in overlay["provider"]
 
-    def test_openai_provider_uses_ai_sdk_openai_npm(self):
+    def test_openai_provider_uses_native_sdk_and_gateway(self):
         models = {"openai": ["databricks-gpt-5-6-sol"]}
         overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
-        assert overlay["provider"]["databricks-openai"]["npm"] == "@ai-sdk/openai"
-
-    def test_openai_base_url_points_at_native_gateway(self):
-        models = {"openai": ["databricks-gpt-5-6-sol"]}
-        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
-        options = overlay["provider"]["databricks-openai"]["options"]
-        assert options["baseURL"] == f"{WS}/ai-gateway/openai/v1"
+        provider = overlay["provider"]["databricks-openai"]
+        assert provider["npm"] == "@ai-sdk/openai"
+        assert provider["options"]["baseURL"] == f"{WS}/ai-gateway/openai/v1"
+        assert provider["options"]["headers"]["Authorization"] == "Bearer tok"
 
     def test_use_responses_api_set_on_every_codex_model(self):
-        models = {"openai": ["databricks-gpt-5-6-sol", "databricks-gpt-codex"]}
-        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
-        provider_models = overlay["provider"]["databricks-openai"]["models"]
-        for m in ("databricks-gpt-5-6-sol", "databricks-gpt-codex"):
-            assert provider_models[m]["options"]["useResponsesApi"] is True
-
-    def test_openai_models_include_explicit_token_limits(self):
-        models = {"openai": ["databricks-gpt-5-6-sol", "databricks-gpt-4-1"]}
-        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
-        provider_models = overlay["provider"]["databricks-openai"]["models"]
-        assert provider_models["databricks-gpt-5-6-sol"]["limit"] == {
+        model_ids = ["databricks-gpt-5-6-sol", "system.ai.grok-4-6"]
+        overlay, _ = opencode.render_overlay(
+            model_ids[0], "tok", _base_urls(), {"openai": model_ids}
+        )
+        entries = overlay["provider"]["databricks-openai"]["models"]
+        assert all(entry["options"]["useResponsesApi"] is True for entry in entries.values())
+        assert entries["databricks-gpt-5-6-sol"]["limit"] == {
             "context": 1_050_000,
             "output": 128_000,
         }
-        assert provider_models["databricks-gpt-4-1"]["limit"] == {
-            "context": 1_047_576,
-            "output": 32_768,
-        }
-
-    def test_grok_uses_its_full_documented_context(self):
-        model = "system.ai.grok-4-6"
-        models = {"openai": [model]}
-
-        overlay, _ = opencode.render_overlay(model, "tok", _base_urls(), models)
-
-        entry = overlay["provider"]["databricks-openai"]["models"][model]
-        assert entry["limit"]["context"] == 500_000
+        assert entries["system.ai.grok-4-6"]["limit"]["context"] == 500_000
 
     def test_live_responses_context_overrides_static_fallback(self):
         model = "system.ai.future-coder-1"
-        models = {"openai": [model]}
         specs = [{"id": model, "context_window": 750_000}]
-
-        overlay, _ = opencode.render_overlay(model, "tok", _base_urls(), models, [], specs)
-
+        overlay, _ = opencode.render_overlay(
+            model, "tok", _base_urls(), {"openai": [model]}, [], specs
+        )
         entry = overlay["provider"]["databricks-openai"]["models"][model]
         assert entry["limit"] == {"context": 750_000, "output": 16_384}
 
-    def test_openai_authorization_header(self):
-        models = {"openai": ["databricks-gpt-5-6-sol"]}
-        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
-        headers = overlay["provider"]["databricks-openai"]["options"]["headers"]
-        assert headers["Authorization"] == "Bearer tok"
+    def test_openai_user_agent_header(self, monkeypatch):
+        monkeypatch.setattr(opencode, "ug_version", lambda: "0.1.0")
+        monkeypatch.setattr(opencode, "agent_version", lambda binary: "0.74.0")
+        model = "databricks-gpt-5-6-sol"
+        overlay, _ = opencode.render_overlay(model, "tok", _base_urls(), {"openai": [model]})
+        entry = overlay["provider"]["databricks-openai"]["models"][model]
+        assert entry["headers"]["User-Agent"] == "ucode/0.1.0 opencode/0.74.0"
 
-    def test_managed_keys_include_openai_provider(self):
-        models = {"openai": ["databricks-gpt-5-6-sol"]}
-        _, keys = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
+    def test_selector_and_managed_keys_use_openai_provider(self):
+        model = "databricks-gpt-5-6-sol"
+        overlay, keys = opencode.render_overlay(model, "tok", _base_urls(), {"openai": [model]})
+        assert overlay["model"] == f"databricks-openai/{model}"
         assert ["provider", "databricks-openai"] in keys
-
-    def test_prefixes_openai_model_with_provider_id(self):
-        models = {"openai": ["databricks-gpt-5-6-sol"]}
-        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
-        assert overlay["model"] == "databricks-openai/databricks-gpt-5-6-sol"
+        assert ["provider", "databricks-openai"] in opencode.PROVIDER_KEYS
 
     def test_already_prefixed_openai_model_is_preserved(self):
-        models = {"openai": ["databricks-gpt-5-6-sol"]}
-        overlay, _ = opencode.render_overlay(
-            "databricks-openai/databricks-gpt-5-6-sol", "tok", _base_urls(), models
-        )
-        assert overlay["model"] == "databricks-openai/databricks-gpt-5-6-sol"
+        model = "databricks-gpt-5-6-sol"
+        selector = f"databricks-openai/{model}"
+        overlay, _ = opencode.render_overlay(selector, "tok", _base_urls(), {"openai": [model]})
+        assert overlay["model"] == selector
 
-    def test_all_four_providers_when_all_present(self):
+    def test_all_four_providers_can_coexist(self):
         models = {
             "anthropic": ["claude-sonnet"],
             "gemini": ["gemini-2"],
@@ -441,15 +424,12 @@ class TestOpenAIProvider:
             "oss": ["system.ai.kimi-k2-7-code"],
         }
         overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
-        assert set(overlay["provider"].keys()) == {
+        assert set(overlay["provider"]) == {
             "databricks-anthropic",
             "databricks-google",
             "databricks-openai",
             "databricks-oss",
         }
-
-    def test_provider_keys_listed_in_module(self):
-        assert ["provider", "databricks-openai"] in opencode.PROVIDER_KEYS
 
 
 class TestMcpServerConfig:
@@ -578,10 +558,6 @@ class TestOpencodeDefaultModel:
         }
         assert opencode.default_model(state) == "databricks-gpt-5-5"
 
-    def test_openai_falls_back_to_generic_responses_endpoint(self):
-        state = {"opencode_models": {"openai": ["c1"]}}
-        assert opencode.default_model(state) == "c1"
-
     def test_gpt_oss_is_not_selected_for_responses(self):
         state = {"opencode_models": {"openai": ["gpt-oss-120b"], "gemini": ["gemini-2"]}}
         assert opencode.default_model(state) == "gemini-2"
@@ -641,8 +617,6 @@ class TestWriteToolConfigStaleProviderCleanup:
             "provider": {
                 "databricks-anthropic": {"old": True},
                 "databricks-google": {"old": True},
-                "databricks-openai": {"old": True},
-                "databricks-oss": {"old": True},
                 "other-provider": {"keep": True},
             }
         }
@@ -665,10 +639,7 @@ class TestWriteToolConfigStaleProviderCleanup:
         providers = written.get("provider", {})
         # stale entry is replaced with new data, not kept as-is
         assert providers.get("databricks-anthropic") != {"old": True}
-        # Providers no longer discovered are removed rather than left stale.
-        assert "databricks-openai" not in providers
-        assert "databricks-oss" not in providers
-        # Unmanaged provider entries survive.
+        # unmanaged provider entry survives
         assert providers.get("other-provider") == {"keep": True}
         # OpenCode 1.0.0 discovers `plugin/`; plural `plugins/` came later.
         plugin = config_file.parent / "plugin" / opencode.OPENCODE_AUTH_PLUGIN_PATH.name

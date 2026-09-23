@@ -1998,6 +1998,14 @@ def discover_oss_model_specs(
 # GPT-5.6 Sol/Terra/Luna support the opt-in 1.05M window; 272k is merely Pi's
 # built-in short-context pricing default, not the model's hard context limit.
 _GPT_TOKEN_LIMITS: tuple[tuple[str, dict[str, int]], ...] = (
+    # GPT-6 Astra/Sol/Luna are all documented at a 1.05M context window (922k
+    # max input) with a 128k output ceiling. The bare ``gpt-6`` entry is the
+    # family floor so a newly shipped GPT-6 variant inherits these limits
+    # instead of silently dropping to the conservative 128k fallback.
+    ("gpt-6-astra", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-6-sol", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-6-luna", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-6", {"context": 1_050_000, "output": 128_000}),
     # Databricks documents Grok 4.6 with a 500K context window. Its output
     # ceiling is not exposed structurally, so retain the conservative Responses
     # fallback there while avoiding Pi/OpenCode's incorrect 128K context cap.

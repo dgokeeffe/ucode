@@ -4199,12 +4199,17 @@ class TestConfigureSharedStateUsePat:
             lambda w, t, ids: ([{"id": model, "context_window": 750_000}], None),
         )
 
-        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+        state = cli_mod.configure_shared_state(
+            self.WS,
+            profile="DEFAULT",
+            tools=["opencode"],
+        )
 
         assert state["codex_models"] == [model]
         assert state["opencode_models"]["openai"] == [model]
         assert state["oss_models"] == []
         assert state["codex_model_specs"] == [{"id": model, "context_window": 750_000}]
+        assert state["opencode_models"]["openai"] == [model]
         assert saved[-1]["codex_models"] == [model]
 
     def test_active_listing_replaces_unlisted_gpt_in_state_and_overlays(self, monkeypatch):
