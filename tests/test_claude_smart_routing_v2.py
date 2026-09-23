@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -14,6 +15,20 @@ import pytest
 from ucode.agents import claude
 from ucode.databricks import AnthropicModelCatalog
 from ucode.smart_routing import claude_hooks, claude_pty, routing, v2
+
+
+@pytest.fixture
+def short_socket_dir():
+    """A directory short enough to hold a bindable AF_UNIX path.
+
+    pytest's ``tmp_path`` is ~120 chars on macOS (a long ``/private/var/folders``
+    prefix plus the username and test name), but ``AF_UNIX`` caps the whole
+    socket path near 104 bytes. Binding under ``tmp_path`` therefore fails with
+    ``OSError('AF_UNIX path too long')`` on a developer machine while passing in
+    CI, where the temp prefix is short.
+    """
+    with tempfile.TemporaryDirectory(prefix="ucode-sock-") as name:
+        yield Path(name)
 
 
 class TestManagedModelPicker:
@@ -122,8 +137,8 @@ class TestFirstPromptHook:
         assert "Selected Model : GLM 5.3 Flash" in result["reason"]
         assert "anthropic-aigw-77df06ea" not in result["reason"]
 
-    def test_blocks_once_then_allows_replay(self, tmp_path):
-        socket_path = tmp_path / "first.sock"
+    def test_blocks_once_then_allows_replay(self, short_socket_dir):
+        socket_path = short_socket_dir / "first.sock"
         blocked: list[tuple[str, str]] = []
         stop = threading.Event()
         claude_pty.serve_first_prompt_socket(
@@ -730,11 +745,11 @@ class TestPtyFlow:
                 socket_path=tmp_path / "missing.sock",
             )
 
-    def test_direct_switch_restore_and_replay(self, tmp_path):
+    def test_direct_switch_restore_and_replay(self, tmp_path, short_socket_dir):
         fake_claude = tmp_path / "fake_claude.py"
         capture = tmp_path / "capture.json"
         restored = tmp_path / "restored"
-        socket_path = tmp_path / "first.sock"
+        socket_path = short_socket_dir / "first.sock"
         fake_claude.write_text(
             """
 import json

@@ -428,13 +428,16 @@ E2E_MODEL_SKIP_HARNESSES: dict[str, frozenset[str]] = {
     "-codex": frozenset({"copilot"}),
     "gpt-5-5": frozenset({"copilot"}),
     # Copilot's chat-completions route cannot combine reasoning with function tools for these
-    # models. Pi also fails against the Luna and Sol variants.
+    # models. Pi also fails against the GPT-5.6 Luna and Sol variants.
     "gpt-5-6-luna": frozenset({"copilot", "pi"}),
     "gpt-5-6-sol": frozenset({"copilot", "pi"}),
     "gpt-5-6-terra": frozenset({"copilot"}),
+    # GPT-6 ran on Pi once Sol/Luna got their documented 1.05M context window and
+    # reasoning metadata; before that Pi advertised a 128k window and no reasoning
+    # capability for them, which is what the original pi skip was working around.
     "gpt-6-astra": frozenset({"copilot"}),
-    "gpt-6-luna": frozenset({"copilot", "pi"}),
-    "gpt-6-sol": frozenset({"copilot", "pi"}),
+    "gpt-6-luna": frozenset({"copilot"}),
+    "gpt-6-sol": frozenset({"copilot"}),
 }
 
 

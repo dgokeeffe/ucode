@@ -30,6 +30,7 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     it can never touch the developer's real ~/.ucode/state.json or invoke the
     privileged writer for an OS-managed agent config.
     """
+    import ucode.codex_config as codex_config_mod
     import ucode.config_io as config_io_mod
     import ucode.databricks as databricks_mod
     import ucode.managed_config as managed_config_mod
@@ -56,6 +57,20 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
         codex_mod, "CODEX_MODEL_CATALOG_PATH", state_dir / "codex-model-catalog.json"
     )
     monkeypatch.setattr(codex_mod, "CODEX_CONFIG_PATH", tmp_path / ".codex" / "ucode.config.toml")
+    # `custom_catalog_path` resolves Codex config precedence through *this* module's own
+    # globals, so patching the `codex` agent's copies above does not redirect it. Without
+    # these, the suite reads the developer's real ~/.codex/config.toml and any
+    # `model_catalog_json` it points at, letting a personal catalog decide the model a
+    # smart-routing test asserts on.
+    monkeypatch.setattr(codex_config_mod, "codex_managed_config_path", lambda: None)
+    monkeypatch.setattr(
+        codex_config_mod,
+        "DEFAULT_CODEX_CONFIG_PATH",
+        tmp_path / ".codex" / "ucode.config.toml",
+    )
+    # CODEX_HOME overrides the profile path inside `codex_config_precedence_paths`, so a
+    # developer's ambient value would reintroduce the same leak.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
     def reject_privileged_write(path, _desired_text):
         pytest.fail(
