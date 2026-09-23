@@ -1,5 +1,5 @@
 """Databricks workspace integration: CLI auth, token retrieval, model
-discovery, AI Gateway checks, SQL warehouse discovery, URL builders."""
+discovery, AI Gateway checks, and URL builders."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from concurrent.futures import (
@@ -24,17 +25,21 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from email.message import Message
+from enum import Enum
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, cast, overload
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import quote, urlencode, urlparse
 
-from databricks.sql.exc import ServerOperationError
-
 from ucode.config_io import APP_DIR
+from ucode.constants import (
+    MODEL_PROVIDER_SERVICE_HEADER,
+    MODEL_SERVICE_PARENT_SCHEMA_HEADER,
+)
 from ucode.ui import (
     err_console,
     normalize_workspace_url,
@@ -52,16 +57,18 @@ UNIX_DATABRICKS_INSTALL_URL = (
 WINDOWS_DATABRICKS_INSTALL_URL = (
     "https://raw.githubusercontent.com/databricks/setup-cli/main/install.ps1"
 )
-AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
+AI_GATEWAY_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
 ANTHROPIC_MODELS_PATH = "/ai-gateway/anthropic/v1/models"
 # v1.0.0 is the release that ships `databricks aitools`.
 MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
+# v1.11.0 fixes `fs cp` (create -> finalize), which the skills MCP uploads rely on.
+SKILLS_MCP_MIN_DATABRICKS_CLI_VERSION = (1, 11, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
 # Substrings the Databricks CLI emits when it loses the token-cache write lock
-# to a concurrent `databricks auth token` (e.g. another ucode helper process or
-# MLflow tracing refreshing the shared ~/.databricks/token-cache.json at the same
-# instant). These are transient — the credential is fine, only the local write
-# raced — so we retry rather than treat them as an expired session.
+# to a concurrent `databricks auth token` (e.g. another ucode helper process
+# refreshing the shared ~/.databricks/token-cache.json at the same instant).
+# These are transient — the credential is fine, only the local write raced — so
+# we retry rather than treat them as an expired session.
 _TOKEN_CACHE_LOCK_MARKERS = ("cache update", "exit status 45")
 _TOKEN_FETCH_MAX_ATTEMPTS = 4
 _HTTP_GET_RETRYABLE_STATUS_CODES = frozenset({429})
@@ -69,6 +76,25 @@ _HTTP_GET_RETRY_BASE_SECONDS = 1.0
 _HTTP_GET_RETRY_MAX_SECONDS = 5.0
 _HTTP_GET_RETRY_AFTER_JITTER_SECONDS = 0.25
 _ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES = 2
+
+
+@dataclass(frozen=True)
+class AnthropicModelCatalog:
+    """Models advertised by AI Gateway's Anthropic endpoint."""
+
+    model_ids: list[str]
+    model_id_to_display_name: dict[str, str]
+    error_msg: str | None = None
+    model_id_to_description: dict[str, str] = field(default_factory=dict)
+
+
+class CodexMpsModelCatalogUnavailable(RuntimeError):
+    """The workspace does not expose the Codex model-catalog route."""
+
+
+class CodexCatalogSource(Enum):
+    PROVIDER = (MODEL_PROVIDER_SERVICE_HEADER, "Provider")
+    PARENT_SCHEMA = (MODEL_SERVICE_PARENT_SCHEMA_HEADER, "Parent schema")
 
 
 def _debug_enabled() -> bool:
@@ -239,12 +265,37 @@ def _http_get_retry_delay(retry_after: str | None, retry_index: int) -> float:
     return backoff + random.uniform(0, min(backoff * 0.25, 0.5))
 
 
+# Databricks stamps every authenticated API response with the caller's numeric workspace (org) id in
+# this header, so any call ucode already makes reveals it with no dedicated lookup. Captured by
+# hostname as responses go by; session-only, like the listing caches below.
+_ORG_ID_HEADER = "X-Databricks-Org-Id"
+_WORKSPACE_ORG_IDS: dict[str, str] = {}
+
+
+def _capture_org_id(url: str, headers: Message | None) -> None:
+    org_id = headers.get(_ORG_ID_HEADER) if headers is not None else None
+    hostname = urlparse(url).hostname
+    if org_id and hostname:
+        _WORKSPACE_ORG_IDS[hostname] = org_id
+
+
+def workspace_org_id(workspace: str) -> str | None:
+    """The numeric workspace (org) id for ``workspace``, or None if no response has revealed it yet."""
+    return _WORKSPACE_ORG_IDS.get(workspace_hostname(workspace))
+
+
+def clear_workspace_org_id_cache() -> None:
+    """Forget captured workspace org ids (used by tests, and after a workspace switch)."""
+    _WORKSPACE_ORG_IDS.clear()
+
+
 def _http_get_json(
     url: str,
     token: str,
     *,
     timeout: int = 10,
     max_retries: int = 0,
+    headers: dict[str, str] | None = None,
 ) -> tuple[dict | list | None, str | None]:
     """GET a JSON endpoint. Returns (payload, None) on success, (None, reason) on failure.
 
@@ -257,14 +308,14 @@ def _http_get_json(
     if max_retries < 0:
         raise ValueError("max_retries must be non-negative")
 
-    request = urllib_request.Request(
-        url,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-    )
+    request_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    request_headers.update(headers or {})
+    request = urllib_request.Request(url, headers=request_headers)
     for attempt in range(max_retries + 1):
         try:
             with urllib_request.urlopen(request, timeout=timeout) as response:
                 body = response.read().decode("utf-8")
+                _capture_org_id(url, getattr(response, "headers", None))
             _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
             if _debug_enabled():
                 _debug("body", body[:4000])
@@ -413,6 +464,7 @@ def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes |
     try:
         with urllib_request.urlopen(request, timeout=timeout) as response:
             body = response.read()
+            _capture_org_id(url, getattr(response, "headers", None))
         _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
         return body, None
     except urllib_error.HTTPError as exc:
@@ -573,117 +625,9 @@ def get_current_user_name(workspace: str, token: str) -> str | None:
     return None
 
 
-# Experiment tag Databricks sets when an experiment's traces are written to a
-# Unity Catalog table. Its value is the UC destination, e.g.
-# "my_catalog.my_schema.my_table". A plain (file/DBFS-backed) experiment does
-# not carry this tag, so its presence is our signal that traces land in UC.
-UC_TRACE_DESTINATION_TAG = "mlflow.experiment.databricksTraceDestinationPath"
-
-
-def _experiment_tags(experiment: dict) -> dict[str, str | None]:
-    """Flatten an experiment's ``tags`` list ([{key, value}, ...]) into a dict."""
-    out: dict[str, str | None] = {}
-    tags = experiment.get("tags")
-    if isinstance(tags, list):
-        for tag in tags:
-            if isinstance(tag, dict) and isinstance(tag.get("key"), str):
-                out[tag["key"]] = tag.get("value")
-    return out
-
-
-def _uc_trace_destination(experiment: dict) -> str | None:
-    """The Unity Catalog destination (``catalog.schema.table``) an experiment
-    logs traces to, or None when it isn't UC-backed. Any three-part UC name
-    qualifies — the specific catalog/schema/table is not constrained."""
-    value = _experiment_tags(experiment).get(UC_TRACE_DESTINATION_TAG)
-    if isinstance(value, str):
-        parts = value.split(".")
-        if len(parts) == 3 and all(parts):
-            return value
-    return None
-
-
-def find_uc_backed_experiment(
-    workspace: str, token: str, leaf_name: str
-) -> tuple[dict | None, str | None]:
-    """Find an existing experiment whose final path segment is ``leaf_name`` and
-    whose traces are backed by Unity Catalog.
-
-    Returns (experiment, reason). On success ``experiment`` is
-    ``{"experiment_id", "experiment_name", "uc_destination"}`` and reason is
-    None. On failure ``experiment`` is None and reason explains why (no such
-    experiment, or it exists but isn't UC-backed) so the caller can tell the
-    user to create one."""
-    hostname = workspace_hostname(workspace)
-    # Leaf-match in the filter (anything ending in the name), then confirm the
-    # exact leaf segment in Python so "/Users/<me>/ucode-traces" matches but
-    # "team-ucode-traces" does not.
-    safe_leaf = leaf_name.replace("'", "")
-    payload, reason = _http_post_json(
-        f"https://{hostname}/api/2.0/mlflow/experiments/search",
-        token,
-        {"filter": f"name LIKE '%{safe_leaf}'", "max_results": 1000},
-    )
-    if not isinstance(payload, dict):
-        return None, reason or "could not search MLflow experiments"
-
-    experiments = payload.get("experiments")
-    named = [
-        exp
-        for exp in (experiments if isinstance(experiments, list) else [])
-        if isinstance(exp, dict)
-        and str(exp.get("name") or "").rsplit("/", 1)[-1] == leaf_name
-        and exp.get("experiment_id")
-    ]
-    if not named:
-        return None, f"no experiment named '{leaf_name}' exists on this workspace"
-
-    for exp in named:
-        dest = _uc_trace_destination(exp)
-        if dest:
-            return {
-                "experiment_id": str(exp["experiment_id"]),
-                "experiment_name": str(exp.get("name") or leaf_name),
-                "uc_destination": dest,
-            }, None
-
-    return (
-        None,
-        f"experiment '{leaf_name}' exists but its traces are not backed by Unity Catalog",
-    )
-
-
-def resolve_sql_warehouse_id(workspace: str, token: str) -> tuple[str | None, str | None]:
-    """Pick a SQL warehouse for writing traces to a UC-backed experiment.
-
-    Writing traces to a Unity Catalog table requires a SQL warehouse
-    (``MLFLOW_TRACING_SQL_WAREHOUSE_ID``); without one the MLflow exporter
-    silently drops them. We prefer a RUNNING warehouse so the first trace isn't
-    blocked on a cold start, falling back to any existing warehouse (a stopped
-    one auto-starts on first query). Returns (warehouse_id, reason); reason is
-    None on success, else explains why none could be resolved."""
-    hostname = workspace_hostname(workspace)
-    payload, reason = _http_get_json(f"https://{hostname}/api/2.0/sql/warehouses", token)
-    if not isinstance(payload, dict):
-        return None, reason or "could not list SQL warehouses"
-
-    warehouses = payload.get("warehouses")
-    warehouses = (
-        [w for w in warehouses if isinstance(w, dict) and w.get("id")]
-        if isinstance(warehouses, list)
-        else []
-    )
-    if not warehouses:
-        return None, "no SQL warehouse exists on this workspace"
-
-    running = next((w for w in warehouses if str(w.get("state")).upper() == "RUNNING"), None)
-    chosen = running or warehouses[0]
-    return str(chosen["id"]), None
-
-
 @overload
 def run(
-    args: list[str],
+    args: list[str] | str,
     *,
     check: bool = True,
     capture_output: bool = False,
@@ -695,7 +639,7 @@ def run(
 
 @overload
 def run(
-    args: list[str],
+    args: list[str] | str,
     *,
     check: bool = True,
     capture_output: bool = False,
@@ -706,7 +650,7 @@ def run(
 
 
 def run(
-    args: list[str],
+    args: list[str] | str,
     *,
     check: bool = True,
     capture_output: bool = False,
@@ -764,10 +708,22 @@ def _run_databricks_cli_installer(brew_subcommand: str = "install") -> None:
         else:
             raise RuntimeError("Neither curl nor wget is available.")
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as exc:
-        raise RuntimeError("Failed to install/upgrade Databricks CLI automatically.") from exc
+        message = "Failed to install/upgrade Databricks CLI automatically."
+        # The official installer only tells you to remove /usr/local/bin/databricks,
+        # but a stale copy in ~/.local/bin can shadow it and break the install. Point
+        # at it explicitly so users know to delete that one too.
+        local_bin = Path("~/.local/bin/databricks").expanduser()
+        if local_bin.exists():
+            message += (
+                f"\nIf you have an existing Databricks CLI installation, please first "
+                f"remove it using\n  rm '{local_bin}'"
+            )
+        raise RuntimeError(message) from exc
 
 
-def ensure_databricks_cli_version() -> None:
+def ensure_databricks_cli_version(
+    minimum: tuple[int, int, int] = MIN_DATABRICKS_CLI_VERSION,
+) -> None:
     try:
         result = run(
             ["databricks", "--version"],
@@ -786,14 +742,14 @@ def ensure_databricks_cli_version() -> None:
         raise RuntimeError(
             f"Could not parse Databricks CLI version from `databricks --version` output: {output!r}"
         )
-    if version < MIN_DATABRICKS_CLI_VERSION:
+    if version < minimum:
         current = ".".join(str(n) for n in version)
-        required = ".".join(str(n) for n in MIN_DATABRICKS_CLI_VERSION)
+        required = ".".join(str(n) for n in minimum)
         print_warning(
             f"Databricks CLI v{current} is too old (need v{required} or newer). Upgrading..."
         )
         _run_databricks_cli_installer(brew_subcommand="upgrade")
-        ensure_databricks_cli_version()
+        ensure_databricks_cli_version(minimum)
 
 
 def databricks_cli_version() -> tuple[int, int, int] | None:
@@ -828,9 +784,11 @@ def upgrade_databricks_cli() -> bool:
     return True
 
 
-def install_databricks_cli() -> None:
+def install_databricks_cli(
+    minimum: tuple[int, int, int] = MIN_DATABRICKS_CLI_VERSION,
+) -> None:
     if shutil.which("databricks"):
-        ensure_databricks_cli_version()
+        ensure_databricks_cli_version(minimum)
         return
 
     print_section("Bootstrap")
@@ -841,7 +799,7 @@ def install_databricks_cli() -> None:
         raise RuntimeError(
             "Databricks CLI install completed, but `databricks` is still not on PATH."
         )
-    ensure_databricks_cli_version()
+    ensure_databricks_cli_version(minimum)
 
 
 def install_ai_tools(agent_tokens: list[str], profile: str | None = None) -> None:
@@ -888,11 +846,45 @@ def _profile_args(profile: str | None) -> list[str]:
     return ["--profile", profile] if profile else []
 
 
+def external_bearer_configured() -> bool:
+    """Whether something outside ucode owns auth for this process.
+
+    True when either hatch is set: ``DATABRICKS_BEARER`` (a pre-fetched bearer)
+    or ``DATABRICKS_BEARER_COMMAND`` (one minted on demand). Both make an
+    interactive login pointless, since ``get_databricks_token`` returns before
+    it ever reaches the OAuth path."""
+    return bool(
+        os.environ.get("DATABRICKS_BEARER", "").strip()
+        or os.environ.get("DATABRICKS_BEARER_COMMAND", "").strip()
+    )
+
+
+def save_databricks_cli_oauth_profile(workspace: str, profile: str, client_id: str) -> None:
+    """Persist the profile metadata normally written by ``databricks auth login``."""
+    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or "~/.databrickscfg").expanduser()
+    parser = configparser.ConfigParser(default_section="@ucode-no-defaults@", interpolation=None)
+    try:
+        parser.read(cfg_path, encoding="utf-8")
+        if parser.has_section(profile):
+            parser.remove_section(profile)
+        parser[profile] = {
+            "host": workspace,
+            "auth_type": "databricks-cli",
+            "client_id": client_id,
+        }
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=cfg_path.parent, prefix=f".{cfg_path.name}.")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            parser.write(handle)
+        os.replace(tmp_name, cfg_path)
+    except (configparser.Error, OSError) as exc:
+        raise RuntimeError(f"Could not save Databricks CLI profile '{profile}'.") from exc
+
+
 def has_valid_databricks_auth(workspace: str, profile: str | None = None) -> bool:
-    # Honor the CI short-circuit (see ``get_databricks_token``): if a
-    # pre-fetched bearer is available, treat auth as valid and skip the
-    # `databricks auth token` shell-out (which only knows user-OAuth).
-    if os.environ.get("DATABRICKS_BEARER", "").strip():
+    # Auth owned elsewhere is valid by definition: skip the `databricks auth
+    # token` shell-out (which only knows user-OAuth) and any login it triggers.
+    if external_bearer_configured():
         return True
     _log_auth_diagnostics()
     # Mirror run_databricks_login: when ~/.databrickscfg has multiple
@@ -1032,7 +1024,7 @@ def resolve_pat_token(profile: str | None) -> str | None:
     """Return the static PAT of a PAT-type Databricks CLI profile, or None.
 
     Only consulted when the user explicitly opted in via
-    ``ucode configure --profiles <name> --use-pat`` — ucode never picks up a
+    ``ucode configure --profile <name> --use-pat`` — ucode never picks up a
     PAT implicitly."""
     if profile and profile_auth_type(profile) == "pat":
         return _read_databrickscfg_token(profile)
@@ -1119,6 +1111,46 @@ def ensure_databricks_auth(
     run_databricks_login(workspace, profile)
 
 
+def _bearer_from_command(command: str) -> str:
+    """Run ``DATABRICKS_BEARER_COMMAND`` and return the bearer it prints.
+
+    Fails closed instead of falling through to OAuth: a caller that set this
+    owns auth, and its profile usually carries no OAuth cache, so a fallback
+    would report a misleading stale-login error instead of the real cause.
+    Mirrors how ``auth-token --use-pat`` fails closed for the same reason."""
+    _debug("get_databricks_token", "using DATABRICKS_BEARER_COMMAND")
+    try:
+        # Windows takes the command line as one string and lets CreateProcess
+        # split it: shlex's POSIX rules would eat the backslashes in `C:\...`,
+        # and posix=False would keep the quotes around a path with spaces. This
+        # is the inverse of what build_auth_shell_command emits there.
+        argv = command if os.name == "nt" else shlex.split(command)
+        result = run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"DATABRICKS_BEARER_COMMAND could not be run: {type(exc).__name__}: {exc}. "
+            f"Command: {command}"
+        ) from exc
+    # Deliberately not _format_subprocess_result: that includes stdout on a
+    # non-zero exit, and this command's stdout is the bearer itself.
+    stderr = (result.stderr or "").strip()[:500]
+    _debug("bearer command", f"rc={result.returncode} stderr={stderr!r}")
+    token = (result.stdout or "").strip()
+    if result.returncode == 0 and token:
+        return token
+    # A non-zero exit fails closed even when something reached stdout: that is a
+    # diagnostic, not a bearer, and forwarding it only resurfaces as a 401.
+    reason = f"exited {result.returncode}" if result.returncode else "printed no token"
+    detail = f" Stderr: {stderr}" if stderr else ""
+    raise RuntimeError(f"DATABRICKS_BEARER_COMMAND {reason}. Command: {command}.{detail}")
+
+
 def get_databricks_token(
     workspace: str,
     profile: str | None = None,
@@ -1135,6 +1167,14 @@ def get_databricks_token(
     if bearer:
         _debug("get_databricks_token", "using DATABRICKS_BEARER env var")
         return bearer
+
+    # ``DATABRICKS_BEARER_COMMAND`` is the same escape hatch in command form,
+    # for callers whose bearer expires and has to be re-minted (an external
+    # credential broker, a sidecar). A static env var cannot be rewritten in a
+    # running process, so the command is re-run on every fetch instead.
+    command = os.environ.get("DATABRICKS_BEARER_COMMAND", "").strip()
+    if command:
+        return _bearer_from_command(command)
 
     _log_auth_diagnostics()
     # See has_valid_databricks_auth: resolve the profile from the host when
@@ -1241,136 +1281,6 @@ def get_databricks_token(
     return token
 
 
-def _extract_connection_page(payload: object) -> tuple[list[dict], str | None]:
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)], None
-    if not isinstance(payload, dict):
-        raise RuntimeError("Databricks connections listing returned invalid JSON.")
-
-    payload_dict = cast(dict[str, object], payload)
-    raw_connections = payload_dict.get("connections") or []
-    if not isinstance(raw_connections, list):
-        raise RuntimeError("Databricks connections listing returned invalid JSON.")
-
-    next_page_token = payload_dict.get("next_page_token")
-    if next_page_token is not None and not isinstance(next_page_token, str):
-        raise RuntimeError("Databricks connections listing returned invalid JSON.")
-
-    return [item for item in raw_connections if isinstance(item, dict)], next_page_token
-
-
-def list_databricks_connections(workspace: str, profile: str | None = None) -> list[dict]:
-    env = build_databricks_cli_env(workspace)
-    connections: list[dict] = []
-    page_token: str | None = None
-    seen_page_tokens: set[str] = set()
-
-    try:
-        while True:
-            cmd = [
-                "databricks",
-                "connections",
-                "list",
-                *_profile_args(profile),
-                "--max-results",
-                "0",
-                "--output",
-                "json",
-            ]
-            if page_token:
-                cmd.extend(["--page-token", page_token])
-
-            result = run(
-                cmd,
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=30,
-            )
-            payload = json.loads(result.stdout or "{}")
-            page_connections, page_token = _extract_connection_page(payload)
-            connections.extend(page_connections)
-
-            if not page_token:
-                return connections
-            if page_token in seen_page_tokens:
-                raise RuntimeError("Databricks connections listing returned a repeated page token.")
-            seen_page_tokens.add(page_token)
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(
-            "Failed to list Databricks connections via `databricks connections list`."
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Timed out while listing Databricks connections.") from exc
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Databricks connections listing returned invalid JSON.") from exc
-
-
-def _extract_genie_spaces_page(payload: object) -> tuple[list[dict], str | None]:
-    if not isinstance(payload, dict):
-        raise RuntimeError("Databricks Genie spaces listing returned invalid JSON.")
-
-    payload_dict = cast(dict[str, object], payload)
-    raw_spaces = payload_dict.get("spaces") or []
-    if not isinstance(raw_spaces, list):
-        raise RuntimeError("Databricks Genie spaces listing returned invalid JSON.")
-
-    next_page_token = payload_dict.get("next_page_token")
-    if next_page_token is not None and not isinstance(next_page_token, str):
-        raise RuntimeError("Databricks Genie spaces listing returned invalid JSON.")
-
-    return [item for item in raw_spaces if isinstance(item, dict)], next_page_token
-
-
-def list_genie_spaces(workspace: str, profile: str | None = None) -> list[dict]:
-    env = build_databricks_cli_env(workspace)
-    spaces: list[dict] = []
-    page_token: str | None = None
-    seen_page_tokens: set[str] = set()
-
-    try:
-        while True:
-            cmd = [
-                "databricks",
-                "genie",
-                "list-spaces",
-                *_profile_args(profile),
-                "--page-size",
-                "100",
-                "--output",
-                "json",
-            ]
-            if page_token:
-                cmd.extend(["--page-token", page_token])
-
-            result = run(
-                cmd,
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=30,
-            )
-            payload = json.loads(result.stdout or "{}")
-            page_spaces, page_token = _extract_genie_spaces_page(payload)
-            spaces.extend(page_spaces)
-
-            if not page_token:
-                return spaces
-            if page_token in seen_page_tokens:
-                raise RuntimeError(
-                    "Databricks Genie spaces listing returned a repeated page token."
-                )
-            seen_page_tokens.add(page_token)
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(
-            "Failed to list Databricks Genie spaces via `databricks genie list-spaces`."
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Timed out while listing Databricks Genie spaces.") from exc
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Databricks Genie spaces listing returned invalid JSON.") from exc
-
-
 def _extract_apps_payload(payload: object) -> list[dict]:
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
@@ -1380,6 +1290,34 @@ def _extract_apps_payload(payload: object) -> list[dict]:
         if isinstance(raw_apps, list):
             return [item for item in raw_apps if isinstance(item, dict)]
     raise RuntimeError("Databricks apps listing returned invalid JSON.")
+
+
+class PermissionDeniedError(RuntimeError):
+    """A workspace API returned an authorization failure (HTTP 403 / permission denied).
+
+    Callers use this only to skip V2 MCP discovery gracefully instead of aborting setup (see the
+    discovery wrappers in :mod:`ucode.mcp`), while other errors still surface.
+
+    It deliberately does NOT try to distinguish a consumer-only identity (no `workspace-access`
+    entitlement) from a workspace user missing a grant on a specific resource: no service exposes
+    a signal that reliably tells them apart. The `workspace-access` entitlement is enforced with a
+    named 403 only on guarded AI Gateway / Model Serving *inference* and model-listing paths (which
+    ucode already exercises at model setup, so a consumer is gated there) — NOT on the Apps / UC /
+    Vector Search listing calls the MCP flow uses, which return an empty list or a generic ACL
+    denial for a consumer."""
+
+
+def _looks_like_cli_permission_error(stderr: str | None) -> bool:
+    """Whether a Databricks CLI stderr indicates an authorization failure.
+
+    The CLI exit code is generic, so we match on the stable markers the CLI/API emit
+    for a denied workspace call rather than the status alone."""
+    if not stderr:
+        return False
+    lowered = stderr.lower()
+    if "permission" in lowered and ("denied" in lowered or "insufficient" in lowered):
+        return True
+    return "403" in lowered or "not authorized" in lowered or "unauthorized" in lowered
 
 
 def list_databricks_apps(workspace: str, profile: str | None = None) -> list[dict]:
@@ -1403,6 +1341,11 @@ def list_databricks_apps(workspace: str, profile: str | None = None) -> list[dic
         )
         return _extract_apps_payload(json.loads(result.stdout or "[]"))
     except subprocess.CalledProcessError as exc:
+        # A 403 here means the caller isn't authorized to list apps (a consumer-only identity, or
+        # a workspace user without apps permission); raise PermissionDeniedError so callers can skip
+        # discovery gracefully (AIGTWY-4471). Other CLI failures stay hard errors.
+        if _looks_like_cli_permission_error(exc.stderr):
+            raise PermissionDeniedError("Not authorized to list Databricks apps.") from exc
         raise RuntimeError("Failed to list Databricks apps via `databricks apps list`.") from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("Timed out while listing Databricks apps.") from exc
@@ -1410,26 +1353,27 @@ def list_databricks_apps(workspace: str, profile: str | None = None) -> list[dic
         raise RuntimeError("Databricks apps listing returned invalid JSON.") from exc
 
 
-def _ucode_binary() -> str:
-    """Resolve the absolute path to the running `ucode` executable.
+def ug_binary() -> str:
+    """Resolve the absolute path to the canonical `ug` executable.
 
     Agents persist the auth command into config files and re-run it on every
     token refresh, possibly from launchers without a full PATH (desktop GUIs).
     An absolute path keeps the helper working regardless of PATH. Falls back to
     the bare name when resolution fails."""
-    return shutil.which("ucode") or "ucode"
+    return shutil.which("ug") or "ug"
 
 
 def build_auth_token_argv(
     workspace: str, profile: str | None = None, *, use_pat: bool = False
 ) -> list[str]:
-    """Argv for the cross-platform token helper: `ucode auth-token ...`.
+    """Argv for the cross-platform token helper: `ug auth-token ...`.
 
     Unlike the previous POSIX `databricks ... | jq` pipeline, this is a single
     executable with plain arguments — no `sh`, no `jq`, no shell quoting — so it
     runs identically on macOS, Linux, and Windows (issue #116). The DATABRICKS_BEARER
-    short-circuit and the PAT path both live inside `auth-token` itself."""
-    argv = [_ucode_binary(), "auth-token", "--host", workspace.rstrip("/")]
+    short-circuit, its DATABRICKS_BEARER_COMMAND counterpart, and the PAT path all
+    live inside `auth-token` itself."""
+    argv = [ug_binary(), "auth-token", "--host", workspace.rstrip("/")]
     if profile:
         argv += ["--profile", profile]
     if use_pat:
@@ -1440,17 +1384,17 @@ def build_auth_token_argv(
 def build_mcp_proxy_argv(
     url: str, workspace: str, profile: str | None = None, *, use_pat: bool = False
 ) -> list[str]:
-    """Argv for the stdio MCP bridge: `ucode mcp-proxy --url ... --host ...`.
+    """Argv for the stdio MCP bridge: `ug mcp-proxy --url ... --host ...`.
 
     Every coding agent registers this single command as a local stdio MCP
     server instead of a per-client HTTP endpoint with a bearer header. The proxy
     forwards to ``url`` and mints a fresh OAuth token on each upstream request,
     so tokens never expire mid-session — the client only ever spawns a process,
     which keeps registration uniform across CLIs that disagree on HTTP-auth
-    syntax. Like `build_auth_token_argv`, this resolves the absolute `ucode`
+    syntax. Like `build_auth_token_argv`, this resolves the absolute `ug`
     path and passes plain arguments (no shell), so it runs identically on every
     platform."""
-    argv = [_ucode_binary(), "mcp-proxy", "--url", url, "--host", workspace.rstrip("/")]
+    argv = [ug_binary(), "mcp-proxy", "--url", url, "--host", workspace.rstrip("/")]
     if profile:
         argv += ["--profile", profile]
     if use_pat:
@@ -1464,9 +1408,31 @@ def build_auth_shell_command(
     """Single-line, shell-quoted form of :func:`build_auth_token_argv`.
 
     Used where a tool wants the helper as one command *string* (Claude Code's
-    `apiKeyHelper`). On every platform this resolves to the `ucode auth-token`
+    `apiKeyHelper`). On every platform this resolves to the `ug auth-token`
     executable rather than a POSIX shell pipeline, so no `sh`/`jq` is required."""
     argv = build_auth_token_argv(workspace, profile, use_pat=use_pat)
+    if platform.system() == "Windows":
+        return subprocess.list2cmdline(argv)
+    return shlex.join(argv)
+
+
+def build_otel_headers_argv(
+    workspace: str, profile: str | None = None, *, use_pat: bool = False
+) -> list[str]:
+    """Argv for Claude Code's refreshing OTLP headers helper."""
+    argv = [ug_binary(), "otel-headers", "--host", workspace.rstrip("/")]
+    if profile:
+        argv += ["--profile", profile]
+    if use_pat:
+        argv.append("--use-pat")
+    return argv
+
+
+def build_otel_headers_shell_command(
+    workspace: str, profile: str | None = None, *, use_pat: bool = False
+) -> str:
+    """Shell-quoted form of :func:`build_otel_headers_argv`."""
+    argv = build_otel_headers_argv(workspace, profile, use_pat=use_pat)
     if platform.system() == "Windows":
         return subprocess.list2cmdline(argv)
     return shlex.join(argv)
@@ -1522,7 +1488,8 @@ def _is_oss_chat_model(model_id: str) -> bool:
 # Claude model families ucode buckets, newest tier first. Each maps to a
 # Claude Code family alias (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). Add an entry to
 # support a new family in both discovery paths (`claude-<family>-*` via the
-# model-services listing and `databricks-claude-<family>-*` via the AI Gateway).
+# model-services listing and either `databricks-claude-<family>-*` or
+# `system.ai.claude-<family>-*` via the AI Gateway).
 ANTHROPIC_FAMILIES = ("fable", "opus", "sonnet", "haiku")
 
 
@@ -2452,20 +2419,6 @@ def discover_claude_models_unbucketed(workspace: str, token: str) -> tuple[list[
     return [], reason or gateway_reason
 
 
-def _prefer_opus_4_8(models: dict[str, str], all_ids: list[str]) -> None:
-    """Swap the opus slot to claude-opus-4-8 when it's available.
-
-    Discovery picks the newest opus (opus-5) but smart routing's
-    CLAUDE_ROUTE_ARMS require claude-opus-4-8. Pin to 4-8 when both
-    exist so the routing availability check passes.
-    """
-    opus = models.get("opus")
-    if opus and "claude-opus-5" in opus:
-        opus_48 = next((m for m in all_ids if "claude-opus-4-8" in m), None)
-        if opus_48:
-            models["opus"] = opus_48
-
-
 def discover_model_services(
     workspace: str, token: str
 ) -> tuple[dict[str, str], list[str], list[str], list[str], str | None]:
@@ -2524,12 +2477,6 @@ def discover_model_services(
         )
         if candidates:
             claude_models[family] = candidates[0]
-    # Smart routing's CLAUDE_ROUTE_ARMS require claude-opus-4-8, but the
-    # newest-wins sort above picks opus-5 when both exist — making the
-    # routing availability check fail. Pin opus-4-8 when it's available so
-    # routing works with the currently-deployed task_v1 router. Revert to
-    # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
-    _prefer_opus_4_8(claude_models, ids)
     if reason is not None:
         # A partial UC walk may omit an entire Claude family. Supplement the
         # shared map too, not only Pi's unbucketed picker, so every agent gets
@@ -2537,7 +2484,6 @@ def discover_model_services(
         legacy_claude, _ = discover_claude_models(workspace, token)
         for family, model in legacy_claude.items():
             claude_models.setdefault(family, model)
-        _prefer_opus_4_8(claude_models, [*ids, *legacy_claude.values()])
 
     def supports_api(model_id: str, api_type: str, *, known_family: bool) -> bool:
         canonical_id = _canonical_oss_model_id(model_id)
@@ -2674,22 +2620,17 @@ def fetch_external_model_prices(workspace: str, token: str) -> tuple[list[dict],
     return models, None
 
 
-# Every field ucode's manifest can set, as `update_mask` paths for a PATCH. The server rejects a
-# missing or empty mask, and rejects paths outside its own mutable set — this is that set minus the
-# fields ucode doesn't author: `budget_id` (deprecated in favour of `budget_policy.budget_id`, and
-# rejected on write) and `default_options`/`tiers` (the legacy model-only shape superseded by
-# `enabled_agents`/`budget_policy`). Sending every path ucode owns, rather than only the ones
-# currently populated, is what lets a re-run *clear* a field the admin removed: the server merges
-# per path, so an omitted path leaves the old value in place.
+# The `update_mask` paths a config PATCH sends. The server rejects paths outside its mutable set,
+# so this omits `spec_version` (an estore-internal format marker, still sent in the body; naming it
+# in the mask is the 400 this fixes) and the reserved/deprecated fields (`display_name`, `tracing`,
+# `budget_id`/`default_options`/`tiers`).
+# Sending all owned paths lets a re-run clear an admin-removed field, since the server merges per path.
 MANAGED_CONFIG_UPDATE_MASK_PATHS: tuple[str, ...] = (
-    "spec_version",
-    "display_name",
     "default_agent",
     "enabled_agents",
     "mcp_servers",
     "skills",
-    "tracing",
-    "budget_policy",
+    "spend_tiers",
 )
 
 
@@ -2841,11 +2782,15 @@ def build_skills_mcp_url(workspace: str, locations: list[str]) -> str:
 # Maps the gateway routing dialect a coding tool speaks to the Model Provider
 # Service `provider_type`s it can be backed by. claude speaks Anthropic's API,
 # which both the `anthropic` and `amazon_bedrock` provider types serve (Bedrock
-# just exposes different model ids); codex speaks OpenAI's. Tags are the short
-# form produced by `_provider_type_tag` (e.g. `amazon_bedrock`).
+# just exposes different model ids); codex speaks OpenAI's, which the `openai`,
+# `azure_openai`, and `microsoft_foundry` provider types all serve (the gateway
+# fronts Azure OpenAI and Foundry with the OpenAI surface); gemini speaks
+# Google's, served by a Gemini Enterprise provider. Tags are the short form
+# produced by `_provider_type_tag` (e.g. `amazon_bedrock`).
 _TOOL_PROVIDER_TYPES: dict[str, tuple[str, ...]] = {
     "claude": ("anthropic", "amazon_bedrock"),
-    "codex": ("openai",),
+    "codex": ("openai", "azure_openai", "microsoft_foundry"),
+    "gemini": ("gemini_enterprise",),
 }
 
 # Provider types that expose Bedrock-style model ids (e.g.
@@ -3181,22 +3126,25 @@ def map_claude_family_models(targets: list[str]) -> dict[str, str]:
     return result
 
 
-# Claude Code starts every session on its opus tier, which the gateway 403s when a Model Provider
-# Service declares no opus target. When opus is missing, fall back to the most capable tier the
-# service does offer. opus > sonnet > haiku.
-_CLAUDE_LAUNCH_TIER_PREFERENCE = ("opus", "sonnet", "haiku")
+# A bare launch pins the first tier the service offers, so it never dead-ends on a model the
+# gateway 403s. Sonnet first: it's Claude Code's own default tier, so we keep that balanced default
+# rather than jumping to opus, then fall back to the next offered tier when sonnet isn't allowed.
+_CLAUDE_LAUNCH_TIER_PREFERENCE = ("sonnet", "opus", "haiku")
 
 
 def resolve_provider_launch_model(model: str | None, provider_models: dict[str, str]) -> str | None:
-    """Pick the model a provider-routed Claude session starts on, or None to keep Claude Code's default.
+    """Pick the model a provider-routed Claude session starts on, or None if it declares no tier.
 
     ``provider_models`` maps the Claude families a service declares to their target ids (see
     ``map_claude_family_models``). With an explicit ``model`` (``ucode claude --model``) the user's
     choice wins: a family alias resolves to that tier's declared target (erroring when the service
     doesn't offer it), any other value is trusted as a raw target id the service allows. Without one,
-    return None when the service offers opus — Claude Code's own default already works, so we avoid
-    setting ANTHROPIC_MODEL and the duplicate ``/model`` picker row it produces — else the most
-    capable tier the service does offer, so the launch doesn't dead-end on an unservable opus.
+    pin the service's preferred offered tier (``_CLAUDE_LAUNCH_TIER_PREFERENCE``).
+
+    We always pin a concrete offered target rather than letting Claude Code fall back to its own
+    launch default: that default (observed: ``claude-sonnet-5``) isn't guaranteed to be in a curated
+    service's allowlist, so deferring to it can 403, while an offered tier can't. The relayed and
+    non-relayed paths resolve identically; the user can still switch tiers in-session via ``/model``.
     """
     if model:
         if model in ANTHROPIC_FAMILIES:
@@ -3209,8 +3157,6 @@ def resolve_provider_launch_model(model: str | None, provider_models: dict[str, 
                 )
             return target
         return model
-    if provider_models.get("opus"):
-        return None
     return next(
         (
             provider_models[fam]
@@ -3221,17 +3167,10 @@ def resolve_provider_launch_model(model: str | None, provider_models: dict[str, 
     )
 
 
-# `list_vector_search_catalog_schemas` walks Vector Search endpoints+indexes.
-# `list_uc_functions_catalog_schemas` walks UC catalogs+schemas in parallel and
-# keeps only schemas with at least one user function.
-
 _UC_LIST_PAGE_SIZE = 200
 _UC_LIST_MAX_PAGES = 50
-_UC_FUNCTION_PROBE_WORKERS = 16
+_SCHEMA_PROBE_WORKERS = 16
 _UC_LIST_HTTP_TIMEOUT = 10
-_UC_FUNCTION_PROBE_TIMEOUT = 5
-_VECTOR_SEARCH_DEADLINE_SECONDS = 15.0
-_UC_FUNCTIONS_DEADLINE_SECONDS = 20.0
 # Most MCP services live outside `system.ai`, so this workspace-wide walk needs
 # enough time to enumerate them; a slow workspace still degrades to partial
 # results once the budget is exceeded instead of hanging indefinitely.
@@ -3304,115 +3243,30 @@ def _paginated_json_items(
     return items, last_reason
 
 
-def _vector_index_catalog_schema(index: dict) -> tuple[str, str] | None:
-    """Pull (catalog, schema) from one vector-search index entry."""
-    catalog = index.get("catalog_name")
-    schema = index.get("schema_name")
-    if isinstance(catalog, str) and isinstance(schema, str) and catalog and schema:
-        return catalog, schema
-    # Fallback: `name` is the fully-qualified UC name `catalog.schema.index`.
-    name = index.get("name")
-    if isinstance(name, str):
-        parts = name.split(".")
-        if len(parts) >= 3 and parts[0] and parts[1]:
-            return parts[0], parts[1]
-    return None
-
-
-def list_vector_search_catalog_schemas(
+def walk_catalog_schemas[T](
     workspace: str,
     token: str,
     *,
-    deadline_seconds: float = _VECTOR_SEARCH_DEADLINE_SECONDS,
-    on_progress: Callable[[int, int, int], None] | None = None,
-) -> tuple[list[tuple[str, str]], str | None]:
-    """Return sorted unique `(catalog, schema)` pairs that contain at least
-    one Databricks Vector Search index. Walks the per-endpoint index listings
-    in parallel under a wall-clock budget; returns partial results once
-    `deadline_seconds` is exceeded.
+    deadline: float,
+    probe: Callable[[str, str], T],
+    collect: Callable[[T, int, int], None],
+    skip_catalogs: frozenset[str] = _UC_FUNCTIONS_SKIP_CATALOGS,
+    max_workers: int = _SCHEMA_PROBE_WORKERS,
+) -> str | None:
+    """Discover every user `<catalog>.<schema>` in the workspace and probe each one in parallel.
 
-    `on_progress`, if given, is called as each endpoint's listing completes with
-    `(endpoints_done, endpoints_total, pairs_found)` for live count reporting.
-    It is invoked serially from the draining thread (not the workers)."""
+    Catalogs and their schemas are listed (skipping `skip_catalogs` and `information_schema`), then
+    each schema is probed concurrently until `deadline` (an absolute `time.monotonic()` value)
+    passes, so a slow workspace returns partial results instead of hanging. The caller supplies two
+    callables and owns whatever they accumulate:
+
+      - `probe(catalog, schema) -> result`: fetch one schema's data (e.g. its MCP services).
+      - `collect(result, done, total)`: handle each probe result as it lands — accumulating,
+        de-duping, streaming — where `done`/`total` are the completed and total schema counts.
+
+    Returns None once the probes run, or a short reason string if there are no catalogs or schemas
+    to probe."""
     hostname = workspace_hostname(workspace)
-    deadline = time.monotonic() + deadline_seconds
-    endpoints, reason = _paginated_json_items(
-        f"https://{hostname}/api/2.0/vector-search/endpoints",
-        token,
-        items_key="endpoints",
-        timeout=_UC_LIST_HTTP_TIMEOUT,
-    )
-    if not endpoints:
-        return [], reason or "no vector search endpoints found"
-
-    endpoint_names = [e["name"] for e in endpoints if isinstance(e.get("name"), str) and e["name"]]
-    if not endpoint_names:
-        return [], "no vector search endpoints with names"
-
-    pairs: set[tuple[str, str]] = set()
-    endpoints_total = len(endpoint_names)
-    endpoints_done = 0
-    workers = max(1, min(_UC_FUNCTION_PROBE_WORKERS, endpoints_total))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(
-                _paginated_json_items,
-                f"https://{hostname}/api/2.0/vector-search/indexes",
-                token,
-                items_key="vector_indexes",
-                extra_params={"endpoint_name": name},
-                timeout=_UC_LIST_HTTP_TIMEOUT,
-            ): name
-            for name in endpoint_names
-        }
-
-        def collect(result, _endpoint):
-            nonlocal endpoints_done
-            indexes, _ = result
-            for index in indexes:
-                pair = _vector_index_catalog_schema(index)
-                if pair:
-                    pairs.add(pair)
-            endpoints_done += 1
-            if on_progress is not None:
-                on_progress(endpoints_done, endpoints_total, len(pairs))
-
-        _drain_with_deadline(futures, deadline, collect)
-        pool.shutdown(wait=False, cancel_futures=True)
-
-    if not pairs:
-        return [], "no vector search indexes found"
-    return sorted(pairs), None
-
-
-def _schema_has_user_function(hostname: str, token: str, catalog: str, schema: str) -> bool:
-    """One-shot probe: does `{catalog}.{schema}` expose any UC function?"""
-    url = (
-        f"https://{hostname}/api/2.1/unity-catalog/functions"
-        f"?{urlencode({'catalog_name': catalog, 'schema_name': schema, 'max_results': '1'})}"
-    )
-    payload, _reason = _http_get_json(url, token, timeout=_UC_FUNCTION_PROBE_TIMEOUT)
-    if not isinstance(payload, dict):
-        return False
-    functions = payload.get("functions") or []
-    return isinstance(functions, list) and any(isinstance(item, dict) for item in functions)
-
-
-def list_uc_functions_catalog_schemas(
-    workspace: str,
-    token: str,
-    *,
-    deadline_seconds: float = _UC_FUNCTIONS_DEADLINE_SECONDS,
-    on_progress: Callable[[int, int, int], None] | None = None,
-) -> tuple[list[tuple[str, str]], str | None]:
-    """Return sorted unique `(catalog, schema)` pairs containing at least one
-    user-defined UC function.
-
-    `on_progress`, if given, is called during the function-probe phase with
-    `(schemas_done, schemas_total, pairs_found)` for live count reporting. It is
-    invoked serially from the draining thread (not the workers)."""
-    hostname = workspace_hostname(workspace)
-    deadline = time.monotonic() + deadline_seconds
 
     catalogs, catalogs_reason = _paginated_json_items(
         f"https://{hostname}/api/2.1/unity-catalog/catalogs",
@@ -3421,23 +3275,20 @@ def list_uc_functions_catalog_schemas(
         timeout=_UC_LIST_HTTP_TIMEOUT,
     )
     if not catalogs:
-        return [], catalogs_reason or "no UC catalogs found"
+        return catalogs_reason or "no UC catalogs found"
 
     catalog_names = [
         c["name"]
         for c in catalogs
-        if isinstance(c.get("name"), str)
-        and c["name"]
-        and c["name"] not in _UC_FUNCTIONS_SKIP_CATALOGS
+        if isinstance(c.get("name"), str) and c["name"] and c["name"] not in skip_catalogs
     ]
     if not catalog_names:
-        return [], "no user UC catalogs found"
+        return "no user UC catalogs found"
     if time.monotonic() > deadline:
-        return [], "deadline exceeded while listing UC catalogs"
+        return "deadline exceeded while listing UC catalogs"
 
-    # Parallel per-catalog schema listing.
-    candidate_pairs: list[tuple[str, str]] = []
-    schema_workers = max(1, min(_UC_FUNCTION_PROBE_WORKERS, len(catalog_names)))
+    schema_refs: list[tuple[str, str]] = []
+    schema_workers = max(1, min(max_workers, len(catalog_names)))
     with ThreadPoolExecutor(max_workers=schema_workers) as pool:
         schema_futures = {
             pool.submit(
@@ -3455,49 +3306,39 @@ def list_uc_functions_catalog_schemas(
             schemas, _ = result
             for schema in schemas:
                 schema_name = schema.get("name")
-                # `information_schema` is auto-attached to every catalog and
-                # never holds user functions.
                 if (
                     isinstance(schema_name, str)
                     and schema_name
                     and schema_name != "information_schema"
                 ):
-                    candidate_pairs.append((catalog, schema_name))
+                    schema_refs.append((catalog, schema_name))
 
         _drain_with_deadline(schema_futures, deadline, collect_schemas)
         pool.shutdown(wait=False, cancel_futures=True)
 
-    if not candidate_pairs:
+    if not schema_refs:
         if time.monotonic() > deadline:
-            return [], "deadline exceeded while listing UC schemas"
-        return [], "no UC schemas found"
+            return "deadline exceeded while listing UC schemas"
+        return "no UC schemas found"
 
-    # Parallel function-existence probes.
-    pairs: set[tuple[str, str]] = set()
-    schemas_total = len(candidate_pairs)
+    schemas_total = len(schema_refs)
     schemas_done = 0
-    with ThreadPoolExecutor(max_workers=_UC_FUNCTION_PROBE_WORKERS) as pool:
+    probe_workers = max(1, min(max_workers, schemas_total))
+    with ThreadPoolExecutor(max_workers=probe_workers) as pool:
         probe_futures = {
-            pool.submit(_schema_has_user_function, hostname, token, cat, schema): (cat, schema)
-            for cat, schema in candidate_pairs
+            pool.submit(probe, catalog, schema): (catalog, schema)
+            for catalog, schema in schema_refs
         }
 
-        def collect_pair(has_fn, pair):
+        def collect_probe(result, _ref):
             nonlocal schemas_done
-            if has_fn:
-                pairs.add(pair)
             schemas_done += 1
-            if on_progress is not None:
-                on_progress(schemas_done, schemas_total, len(pairs))
+            collect(result, schemas_done, schemas_total)
 
-        _drain_with_deadline(probe_futures, deadline, collect_pair)
+        _drain_with_deadline(probe_futures, deadline, collect_probe)
         pool.shutdown(wait=False, cancel_futures=True)
 
-    if not pairs:
-        if time.monotonic() > deadline:
-            return [], "deadline exceeded probing UC schemas for functions"
-        return [], "no UC schemas with user functions found"
-    return sorted(pairs), None
+    return None
 
 
 def list_all_mcp_services(
@@ -3506,6 +3347,7 @@ def list_all_mcp_services(
     *,
     deadline_seconds: float = _MCP_SERVICES_WALK_DEADLINE_SECONDS,
     on_progress: Callable[[int, int, int], None] | None = None,
+    on_services: Callable[[list[str]], None] | None = None,
 ) -> tuple[list[str], str | None]:
     """Return sorted unique MCP-service full names across every `<catalog>.<schema>`
     in the workspace. The mcp-services API is one-schema-per-call, so this walks
@@ -3514,90 +3356,31 @@ def list_all_mcp_services(
 
     `on_progress`, if given, is called as each schema's listing completes with
     `(schemas_done, schemas_total, services_found)` so callers can render a live
-    count. It is invoked serially from the draining thread (not the workers).
+    count. `on_services`, if given, is called with each schema's newly-found service
+    names (deduped against everything emitted so far) so callers can stream results
+    into a picker as the walk progresses instead of waiting for the full result. Both
+    are invoked serially from the draining thread (not the workers).
 
     This walk is the slow, workspace-wide counterpart to `list_mcp_services`
     (single schema)."""
-    hostname = workspace_hostname(workspace)
     deadline = time.monotonic() + deadline_seconds
-
-    catalogs, catalogs_reason = _paginated_json_items(
-        f"https://{hostname}/api/2.1/unity-catalog/catalogs",
-        token,
-        items_key="catalogs",
-        timeout=_UC_LIST_HTTP_TIMEOUT,
-    )
-    if not catalogs:
-        return [], catalogs_reason or "no UC catalogs found"
-
-    catalog_names = [
-        c["name"]
-        for c in catalogs
-        if isinstance(c.get("name"), str)
-        and c["name"]
-        and c["name"] not in _UC_FUNCTIONS_SKIP_CATALOGS
-    ]
-    if not catalog_names:
-        return [], "no user UC catalogs found"
-    if time.monotonic() > deadline:
-        return [], "deadline exceeded while listing UC catalogs"
-
-    # Parallel per-catalog schema listing.
-    schema_refs: list[str] = []
-    schema_workers = max(1, min(_UC_FUNCTION_PROBE_WORKERS, len(catalog_names)))
-    with ThreadPoolExecutor(max_workers=schema_workers) as pool:
-        schema_futures = {
-            pool.submit(
-                _paginated_json_items,
-                f"https://{hostname}/api/2.1/unity-catalog/schemas",
-                token,
-                items_key="schemas",
-                extra_params={"catalog_name": cat},
-                timeout=_UC_LIST_HTTP_TIMEOUT,
-            ): cat
-            for cat in catalog_names
-        }
-
-        def collect_schemas(result, catalog):
-            schemas, _ = result
-            for schema in schemas:
-                schema_name = schema.get("name")
-                if (
-                    isinstance(schema_name, str)
-                    and schema_name
-                    and schema_name != "information_schema"
-                ):
-                    schema_refs.append(f"{catalog}.{schema_name}")
-
-        _drain_with_deadline(schema_futures, deadline, collect_schemas)
-        pool.shutdown(wait=False, cancel_futures=True)
-
-    if not schema_refs:
-        if time.monotonic() > deadline:
-            return [], "deadline exceeded while listing UC schemas"
-        return [], "no UC schemas found"
-
-    # Parallel per-schema mcp-services listing.
     names: set[str] = set()
-    schemas_total = len(schema_refs)
-    schemas_done = 0
-    probe_workers = max(1, min(_UC_FUNCTION_PROBE_WORKERS, schemas_total))
-    with ThreadPoolExecutor(max_workers=probe_workers) as pool:
-        service_futures = {
-            pool.submit(list_mcp_services, workspace, token, ref): ref for ref in schema_refs
-        }
 
-        def collect_services(result, _ref):
-            nonlocal schemas_done
-            found, _ = result
-            names.update(found)
-            schemas_done += 1
-            if on_progress is not None:
-                on_progress(schemas_done, schemas_total, len(names))
+    def probe(catalog, schema):
+        return list_mcp_services(workspace, token, f"{catalog}.{schema}")
 
-        _drain_with_deadline(service_futures, deadline, collect_services)
-        pool.shutdown(wait=False, cancel_futures=True)
+    def collect(result, schemas_done, schemas_total):
+        found, _ = result
+        new = [n for n in found if n not in names]
+        names.update(found)
+        if on_progress is not None:
+            on_progress(schemas_done, schemas_total, len(names))
+        if on_services is not None and new:
+            on_services(sorted(new))
 
+    reason = walk_catalog_schemas(workspace, token, deadline=deadline, probe=probe, collect=collect)
+    if reason is not None:
+        return [], reason
     if not names:
         if time.monotonic() > deadline:
             return [], "deadline exceeded while listing MCP services"
@@ -3605,12 +3388,18 @@ def list_all_mcp_services(
     return sorted(names), None
 
 
-def _get_anthropic_models_json(workspace: str, token: str) -> tuple[dict | list | None, str | None]:
+def _get_anthropic_models_json(
+    workspace: str, token: str, *, parent_schema: str | None = None
+) -> tuple[dict | list | None, str | None]:
     hostname = workspace_hostname(workspace)
+    headers = (
+        {MODEL_SERVICE_PARENT_SCHEMA_HEADER: parent_schema} if parent_schema is not None else None
+    )
     return _http_get_json(
         f"https://{hostname}{ANTHROPIC_MODELS_PATH}",
         token,
         max_retries=_ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES,
+        **({"headers": headers} if headers is not None else {}),
     )
 
 
@@ -3621,12 +3410,22 @@ def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | 
     using that mode must not apply ucode's legacy ``databricks-claude-*`` family
     validation.
     """
-    payload, reason = _get_anthropic_models_json(workspace, token)
+    catalog = list_anthropic_model_catalog(workspace, token)
+    return catalog.model_ids, catalog.error_msg
+
+
+def list_anthropic_model_catalog(
+    workspace: str, token: str, *, parent_schema: str | None = None
+) -> AnthropicModelCatalog:
+    """Return advertised Anthropic model ids and their optional display metadata."""
+    payload, reason = _get_anthropic_models_json(workspace, token, parent_schema=parent_schema)
     if payload is None:
-        return [], reason
+        return AnthropicModelCatalog(model_ids=[], model_id_to_display_name={}, error_msg=reason)
 
     data = cast(dict, payload) if isinstance(payload, dict) else {}
     model_ids: list[str] = []
+    display_names: dict[str, str] = {}
+    descriptions: dict[str, str] = {}
     seen: set[str] = set()
     for model in data.get("data", []):
         if not isinstance(model, dict):
@@ -3635,9 +3434,23 @@ def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | 
         if isinstance(model_id, str) and model_id and model_id not in seen:
             seen.add(model_id)
             model_ids.append(model_id)
+            display_name = model.get("display_name")
+            if isinstance(display_name, str) and display_name:
+                display_names[model_id] = display_name
+            description = model.get("description")
+            if isinstance(description, str) and description:
+                descriptions[model_id] = description
     if model_ids:
-        return model_ids, None
-    return [], "AI Gateway returned no Anthropic model ids"
+        return AnthropicModelCatalog(
+            model_ids=model_ids,
+            model_id_to_display_name=display_names,
+            model_id_to_description=descriptions,
+        )
+    return AnthropicModelCatalog(
+        model_ids=[],
+        model_id_to_display_name={},
+        error_msg="AI Gateway returned no Anthropic model ids",
+    )
 
 
 def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], str | None]:
@@ -3651,13 +3464,11 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
     result: dict[str, str] = {}
     for family in ANTHROPIC_FAMILIES:
         candidates = sorted(
-            [m for m in raw_ids if f"databricks-claude-{family}-" in m],
+            [m for m in raw_ids if f"claude-{family}-" in m],
             reverse=True,
         )
         if candidates:
             result[family] = candidates[0]
-    # Same opus-4-8 pin as discover_model_services — see comment there.
-    _prefer_opus_4_8(result, raw_ids)
     if result:
         return result, None
     if not raw_ids:
@@ -3666,7 +3477,7 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
     families = ",".join(ANTHROPIC_FAMILIES)
     return {}, (
         "AI Gateway returned model ids but none matched "
-        f"`databricks-claude-{{{families}}}-*` (got: {sample})"
+        f"`*-claude-{{{families}}}-*` (got: {sample})"
     )
 
 
@@ -3820,18 +3631,40 @@ def fetch_codex_models(workspace: str, token: str) -> list[str]:
     return models
 
 
-def _probe_ai_gateway_v2(workspace: str, token: str) -> tuple[bool, str | None]:
-    hostname = workspace_hostname(workspace)
-    url = f"https://{hostname}/api/ai-gateway/v2/endpoints?page_size=1"
-    payload, reason = _http_get_json(url, token)
-    return payload is not None, reason
+class GatewayProbe(NamedTuple):
+    reachable: bool
+    detail: str
+    resource_available: bool = False
+    conclusive: bool = True
 
 
-def _probe_ai_gateway_v3(workspace: str, token: str) -> tuple[bool, str | None]:
+_MODEL_SERVICE_PROBE_PAGE_SIZE = 50
+_MODEL_SERVICE_PROBE_MAX_PAGES = 20
+_MODEL_SERVICE_EMPTY_DETAIL = (
+    "reachable, no accessible model services returned; "
+    "check USE CATALOG on system, and USE SCHEMA and EXECUTE on system.ai"
+)
+
+
+def _probe_model_services(workspace: str, token: str) -> GatewayProbe:
     hostname = workspace_hostname(workspace)
-    url = f"https://{hostname}/api/2.1/unity-catalog/model-services?page_size=1"
-    payload, reason = _http_get_json(url, token)
-    return payload is not None, reason
+    base = f"https://{hostname}/api/2.1/unity-catalog/model-services"
+    page_token: str | None = None
+    for page in range(_MODEL_SERVICE_PROBE_MAX_PAGES):
+        params: dict[str, object] = {"page_size": _MODEL_SERVICE_PROBE_PAGE_SIZE}
+        if page_token:
+            params["page_token"] = page_token
+        payload, reason = _http_get_json(f"{base}?{urlencode(params)}", token)
+        if payload is None:
+            if page == 0:
+                return GatewayProbe(False, reason or "unknown error")
+            return GatewayProbe(True, "reachable", conclusive=False)
+        if isinstance(payload, dict) and payload.get("model_services"):
+            return GatewayProbe(True, "reachable, accessible model service returned", True)
+        page_token = payload.get("next_page_token") if isinstance(payload, dict) else None
+        if not page_token:
+            return GatewayProbe(True, _MODEL_SERVICE_EMPTY_DETAIL)
+    return GatewayProbe(True, "reachable", conclusive=False)
 
 
 def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
@@ -3843,61 +3676,65 @@ def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
     )
 
 
-def _raise_ai_gateway_v3_permission_failure(
-    workspace: str, v3_reason: str, v2_reason: str | None
-) -> NoReturn:
+def _raise_ai_gateway_scope_failure(workspace: str, reason: str) -> NoReturn:
     raise RuntimeError(
-        f"Databricks AI Gateway V3 access could not be verified on {workspace} ({v3_reason}). "
-        f"The V2 fallback also failed ({v2_reason or 'unknown error'}). The V3 probe requires "
-        "permission to list Unity Catalog model services. Verify USE CATALOG on `system` and "
-        "USE SCHEMA on `system.ai`."
+        f"The access token for {workspace} is missing an OAuth scope required by the "
+        f"AI Gateway APIs ({reason}). Re-authenticate to mint a token with the needed "
+        f"scopes:\n"
+        f"  databricks auth login --host {workspace}"
     )
 
 
-def _raise_ai_gateway_v2_permission_failure(
-    workspace: str, v2_reason: str, v3_reason: str | None
-) -> NoReturn:
+def _raise_model_service_permission_failure(workspace: str, model_service_reason: str) -> NoReturn:
     raise RuntimeError(
-        f"Databricks AI Gateway V2 access could not be verified on {workspace} ({v2_reason}). "
-        f"The V3 probe also failed ({v3_reason or 'unknown error'}). Verify the caller's "
-        "workspace permissions for the AI Gateway V2 endpoints listing."
+        "Databricks Unity Gateway model service access could not be verified on "
+        f"{workspace} ({model_service_reason}). Listing Unity Catalog model services requires "
+        "USE CATALOG on `system`, and USE SCHEMA and EXECUTE on `system.ai`."
     )
 
 
-def ensure_ai_gateway(workspace: str, token: str) -> None:
-    """Pass if either AI Gateway V2 or V3 is available."""
-    v3_ok, v3_reason = _probe_ai_gateway_v3(workspace, token)
-    if v3_ok:
-        return
-    if v3_reason and _looks_like_definitive_auth_failure(v3_reason):
-        _raise_ai_gateway_auth_failure(workspace, v3_reason)
+def probe_unity_gateway_capabilities(workspace: str, token: str) -> GatewayProbe:
+    """Return the model service probe, raising if model service access can't be verified."""
+    model_service_probe = _probe_model_services(workspace, token)
+    if model_service_probe.reachable:
+        # resource_available, reachable-but-empty, and inconclusive are all non-fatal: the
+        # caller surfaces the detail as a warning when no accessible model service came back.
+        return model_service_probe
 
-    v2_ok, v2_reason = _probe_ai_gateway_v2(workspace, token)
-    if v2_ok:
-        return
-    if v2_reason and _looks_like_definitive_auth_failure(v2_reason):
-        _raise_ai_gateway_auth_failure(workspace, v2_reason)
-    if v3_reason and _looks_like_permission_failure(v3_reason):
-        _raise_ai_gateway_v3_permission_failure(workspace, v3_reason, v2_reason)
-    if v2_reason and _looks_like_permission_failure(v2_reason):
-        _raise_ai_gateway_v2_permission_failure(workspace, v2_reason, v3_reason)
+    reason = model_service_probe.detail
+    if _looks_like_definitive_auth_failure(reason):
+        _raise_ai_gateway_auth_failure(workspace, reason)
+    if _looks_like_scope_failure(reason):
+        _raise_ai_gateway_scope_failure(workspace, reason)
+    if _looks_like_permission_failure(reason):
+        _raise_model_service_permission_failure(workspace, reason)
 
     raise RuntimeError(
-        "Databricks AI Gateway is not enabled on this workspace: neither V3 "
-        f"({v3_reason or 'unknown error'}) nor V2 ({v2_reason or 'unknown error'}) is available. "
-        f"See {AI_GATEWAY_V2_DOCS_URL}"
+        "Databricks Unity Gateway is not enabled on this workspace: model services "
+        f"({reason}) are not available. See {AI_GATEWAY_DOCS_URL}"
     )
 
 
 def _looks_like_definitive_auth_failure(reason: str) -> bool:
-    """True when retrying another workspace API cannot rescue this token.
+    """True when the token itself is rejected (401, or an invalid-token 400).
 
-    A 403 can be endpoint-specific authorization, so the version-agnostic
-    preflight must still try V3 before surfacing it as an auth failure.
+    A 403 is left to the scope and permission routing, since it can mean a
+    missing OAuth scope or missing Unity Catalog grants rather than a bad token.
     """
     if "HTTP 401" in reason:
         return True
     return "HTTP 400" in reason and "invalid token" in reason.lower()
+
+
+def _looks_like_scope_failure(reason: str) -> bool:
+    """True for a 403 that reports the OAuth *token* is missing a required scope.
+
+    Matched to the OAuth-token wording so a PAT's permission 403 -- which
+    re-login cannot fix -- is not misrouted to the re-login hint and instead
+    falls through to the grant guidance.
+    """
+    lowered = reason.lower()
+    return "http 403" in lowered and "oauth token" in lowered and "required scopes" in lowered
 
 
 def _looks_like_permission_failure(reason: str) -> bool:
@@ -3960,138 +3797,14 @@ def _parse_decimal(value: object) -> Decimal | None:
     return None
 
 
-class SqlWarehouse(NamedTuple):
-    http_path: str
-    label: str
-    state: str
-
-
-def discover_sql_warehouses(
-    workspace: str,
-    token: str,
-    *,
-    warehouse_id: str | None = None,
-) -> list[SqlWarehouse]:
-    """Candidate warehouses to run the usage query against, RUNNING ones first.
-
-    Several are returned because a warehouse can report RUNNING and still refuse
-    connections, so callers fall through to the next one. An explicit
-    `warehouse_id` skips discovery entirely.
-    """
-    if warehouse_id:
-        return [SqlWarehouse(_warehouse_http_path(warehouse_id), warehouse_id, "REQUESTED")]
-
-    hostname = workspace_hostname(workspace)
-    request = urllib_request.Request(
-        f"https://{hostname}/api/2.0/sql/warehouses",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        },
-    )
-
-    try:
-        with urllib_request.urlopen(request, timeout=20) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib_error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-        detail = body.strip() or f"HTTP {exc.code}"
-        raise RuntimeError(f"Failed to list SQL warehouses: {detail}") from exc
-    except urllib_error.URLError as exc:
-        raise RuntimeError(f"Could not reach workspace hostname {hostname}: {exc.reason}") from exc
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Databricks warehouse discovery returned invalid JSON.") from exc
-
-    warehouses = payload.get("warehouses")
-    if not isinstance(warehouses, list) or not warehouses:
-        raise RuntimeError(
-            "No SQL warehouses found in this workspace. Create one or pass `--warehouse-id`."
-        )
-
-    candidates: list[SqlWarehouse] = []
-    for entry in warehouses:
-        if not isinstance(entry, dict):
-            continue
-        entry_id = entry.get("id")
-        if not isinstance(entry_id, str) or not entry_id.strip():
-            continue
-        name = entry.get("name")
-        state = entry.get("state", "UNKNOWN")
-        label = name if isinstance(name, str) and name else entry_id
-        candidates.append(SqlWarehouse(_warehouse_http_path(entry_id), label, str(state)))
-
-    if not candidates:
-        raise RuntimeError("No usable SQL warehouse was returned by Databricks.")
-    # Stopped warehouses work too, but cold-starting one costs minutes.
-    candidates.sort(key=lambda w: w.state != "RUNNING")
-    return candidates
-
-
-def _warehouse_http_path(warehouse_id: str) -> str:
-    return f"/sql/1.0/warehouses/{warehouse_id.strip()}"
-
-
-def run_usage_query(
-    workspace: str,
-    http_path: str,
-    token: str,
-    query: str,
-    on_connected: Callable[[], None] | None = None,
-) -> tuple[list[str], list[tuple]]:
-    """Run `query` on one warehouse.
-
-    `on_connected` fires once the connection opens — the point a stopped
-    warehouse has finished starting — so callers can update their progress
-    message.
-    """
-    try:
-        logging.getLogger("databricks.sql").setLevel(logging.ERROR)
-        from databricks import sql
-    except ImportError as exc:
-        raise RuntimeError(
-            "`databricks-sql-connector` is not installed. "
-            "Install it with `pip install databricks-sql-connector`."
-        ) from exc
-
-    try:
-        with sql.connect(
-            server_hostname=workspace_hostname(workspace),
-            http_path=http_path,
-            access_token=token,
-        ) as connection:
-            if on_connected is not None:
-                on_connected()
-            with connection.cursor() as cursor:
-                cursor.execute(query)
-                columns = [desc[0] for desc in (cursor.description or [])]
-                rows = cast(list[tuple], cursor.fetchall())
-    except ServerOperationError as exc:
-        if _is_usage_table_access_error(exc):
-            raise RuntimeError(
-                "Unable to read `system.ai_gateway.usage`. Ask your workspace admin "
-                "to enable READ access to `system.ai_gateway.usage` for your account."
-            ) from exc
-        raise RuntimeError(f"Usage query failed: {exc}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"Usage query failed: {exc}") from exc
-
-    return columns, rows
-
-
-def _is_usage_table_access_error(exc: BaseException) -> bool:
-    """Return True when a `ServerOperationError` blocks reads of
-    `system.ai_gateway.usage` — gated on one of the bracketed error codes
-    `INSUFFICIENT_PERMISSIONS` plus a `system.ai_gateway` substring (identifier quoting
-    stripped first)."""
-    normalized = str(exc).lower().translate(str.maketrans("", "", """`[]"'"""))
-    if "system.ai_gateway" not in normalized:
-        return False
-    return "insufficient_permissions" in normalized
-
-
 # ---------------------------------------------------------------------------
 # URL builders (AI Gateway v2 only — no fallback to /serving-endpoints)
 # ---------------------------------------------------------------------------
+
+
+def build_otel_traces_endpoint(workspace: str) -> str:
+    """Return the AI Gateway OTLP HTTP trace endpoint for ``workspace``."""
+    return f"{workspace.rstrip('/')}/ai-gateway/otel/v1/traces"
 
 
 def build_tool_base_url(tool: str, workspace: str) -> str:
@@ -4112,6 +3825,32 @@ def build_tool_base_url(tool: str, workspace: str) -> str:
     if tool == "pi":
         raise RuntimeError("Pi has multiple base URLs — use build_pi_base_urls() instead.")
     raise RuntimeError(f"Unsupported tool '{tool}'.")
+
+
+def _fetch_codex_model_catalog(
+    workspace: str,
+    token: str,
+    *,
+    source: CodexCatalogSource,
+    identifier: str,
+) -> dict:
+    header_name, kind = source.value
+    payload, reason = _http_get_json(
+        f"{build_tool_base_url('codex', workspace)}/models",
+        token,
+        max_retries=2,
+        headers={header_name: identifier},
+    )
+    if reason:
+        message = f"Could not discover Codex models for {identifier}: {reason}"
+        if "codex/v1/models is not enabled for this workspace" in reason.lower():
+            raise CodexMpsModelCatalogUnavailable(message)
+        raise RuntimeError(message)
+    if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+        raise RuntimeError(f"{kind} {identifier} returned an invalid Codex model catalog.")
+    if not payload["models"]:
+        raise RuntimeError(f"{kind} {identifier} returned no Codex models.")
+    return payload
 
 
 def build_opencode_base_urls(workspace: str) -> dict[str, str]:

@@ -25,8 +25,15 @@ from ucode.databricks import (
     build_tool_base_url,
     get_databricks_token,
 )
-from ucode.state import mark_tool_managed, save_state
-from ucode.telemetry import agent_version, ucode_version
+from ucode.state import (
+    get_provider_service,
+    mark_tool_managed,
+    save_state,
+    set_provider_service,
+)
+from ucode.telemetry import agent_version, ug_version
+
+from .args import LaunchOptions
 
 GEMINI_CONFIG_DIR = Path.home() / ".gemini"
 GEMINI_ENV_PATH = GEMINI_CONFIG_DIR / "ucode.env"
@@ -115,12 +122,18 @@ def _ensure_local_settings_selected_type() -> None:
     write_json_file(GEMINI_SETTINGS_PATH, settings)
 
 
-def render_env_overlay(workspace: str, model: str, token: str) -> dict[str, str]:
+def render_env_overlay(
+    workspace: str, model: str, token: str, *, provider: str | None = None
+) -> dict[str, str]:
     # Gemini CLI parses GEMINI_CLI_CUSTOM_HEADERS as comma-separated
     # `Key:Value` pairs and spreads them after the SDK's default User-Agent,
     # so a key named `User-Agent` overrides the default. Resolved via
     # upstream issue google-gemini/gemini-cli#10088.
-    custom_headers = f"User-Agent:ucode/{ucode_version()} gemini/{agent_version('gemini')}"
+    custom_headers = f"User-Agent:ucode/{ug_version()} gemini/{agent_version('gemini')}"
+    if provider:
+        # A Model Provider Service routes by this header; the request still names
+        # the service's target model in `GEMINI_MODEL` (pinned by the launch path).
+        custom_headers += f",Databricks-Model-Provider-Service:{provider}"
     return {
         "GEMINI_MODEL": model,
         "GOOGLE_GEMINI_BASE_URL": build_tool_base_url("gemini", workspace),
@@ -131,10 +144,12 @@ def render_env_overlay(workspace: str, model: str, token: str) -> dict[str, str]
     }
 
 
-def build_runtime_env(workspace: str, model: str, token: str) -> dict[str, str]:
+def build_runtime_env(
+    workspace: str, model: str, token: str, *, provider: str | None = None
+) -> dict[str, str]:
     _ensure_local_settings_selected_type()
     env = os.environ.copy()
-    env.update(render_env_overlay(workspace, model, token))
+    env.update(render_env_overlay(workspace, model, token, provider=provider))
     # Newer Gemini CLI releases refuse to run in untrusted directories;
     # opt every launch into trust so `ucode gemini` works in any folder.
     env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
@@ -148,16 +163,21 @@ def write_tool_config(
     token: str | None = None,
     *,
     force_refresh: bool = False,
+    provider: str | None = None,
 ) -> tuple[dict, str]:
     backup_existing_file(GEMINI_ENV_PATH, GEMINI_BACKUP_PATH)
     if token is None:
         token = get_databricks_token(
             state["workspace"], state.get("profile"), force_refresh=force_refresh
         )
-    overlay = render_env_overlay(state["workspace"], model, token)
+    overlay = render_env_overlay(state["workspace"], model, token, provider=provider)
     existing = parse_dotenv(GEMINI_ENV_PATH)
     existing.update(overlay)
     write_dotenv(GEMINI_ENV_PATH, existing)
+    if provider:
+        # Persist so the token-refresh thread and later bare `ucode gemini` re-emit
+        # the routing header; `--provider` on a launch overrides this saved choice.
+        state = set_provider_service(state, "gemini", provider)
     state = mark_tool_managed(state, "gemini", MANAGED_KEYS)
     save_state(state)
     return state, token
@@ -170,11 +190,35 @@ def default_model(state: dict) -> str | None:
     return gemini_models[0] if gemini_models else None
 
 
+def persisted_provider_model() -> str | None:
+    """The Gemini model currently pinned in the env file, if any.
+
+    A provider launch writes the service's target here; reusing it lets a bare
+    ``ucode gemini`` relaunch (or reconfigure) run without re-passing ``--model``.
+    """
+    return parse_dotenv(GEMINI_ENV_PATH).get("GEMINI_MODEL")
+
+
+def _launch_model(state: dict, provider: str | None) -> str | None:
+    """The model this session runs on.
+
+    Under a provider it is the service's target model, pinned into the env file
+    by ``write_tool_config`` (``default_model`` would return a Databricks id the
+    gateway can't resolve behind the provider header). Otherwise the usual default.
+    """
+    if provider:
+        written = persisted_provider_model()
+        if written:
+            return written
+    return default_model(state)
+
+
 def _refresh_token_once(state: dict, *, force_refresh: bool = False) -> str:
-    model = default_model(state)
+    provider = get_provider_service(state, "gemini")
+    model = _launch_model(state, provider)
     if not model:
         raise RuntimeError("No Gemini model is configured.")
-    _, token = write_tool_config(state, model, force_refresh=force_refresh)
+    _, token = write_tool_config(state, model, force_refresh=force_refresh, provider=provider)
     return token
 
 
@@ -186,12 +230,13 @@ def _refresh_forever(state: dict, stop_event: threading.Event) -> None:
             continue
 
 
-def launch(state: dict, tool_args: list[str]) -> None:
+def launch(state: dict, tool_args: list[str], *, options: LaunchOptions) -> None:
+    provider = get_provider_service(state, "gemini")
     token = _refresh_token_once(state)
-    model = default_model(state)
+    model = _launch_model(state, provider)
     if not model:
         raise RuntimeError("No Gemini model is configured.")
-    env = build_runtime_env(state["workspace"], model, token)
+    env = build_runtime_env(state["workspace"], model, token, provider=provider)
 
     stop_event = threading.Event()
     refresher = threading.Thread(
@@ -216,19 +261,3 @@ def launch(state: dict, tool_args: list[str]) -> None:
 
 def validate_cmd(binary: str) -> list[str]:
     return [binary, "-p", "say hi in 5 words or less"]
-
-
-def validate_env(state: dict) -> dict[str, str]:
-    """Inject env vars for the validation subprocess.
-
-    The Gemini CLI's .env auto-loading skips ~/.gemini/.env when run from an
-    untrusted folder, so we cannot rely on it during validation.
-    """
-    workspace = state.get("workspace")
-    if not workspace:
-        raise RuntimeError("No workspace configured.")
-    model = default_model(state)
-    if not model:
-        raise RuntimeError("No Gemini model is configured.")
-    token = get_databricks_token(workspace, state.get("profile"))
-    return build_runtime_env(workspace, model, token)

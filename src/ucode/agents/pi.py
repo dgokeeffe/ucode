@@ -30,8 +30,11 @@ the persisted gateway capability specs, with conservative static fallback.
 At launch this provider alone is routed through a loopback repair proxy because
 some models (notably Inkling) omit the terminal `finish_reason` Pi requires.
 
-The bearer token is baked into the file and refreshed by a background thread
-while the session runs (same pattern as OpenCode/Copilot).
+Each provider's `apiKey` is pi's `!command` config value rather than a baked
+bearer, so pi mints one per request via `ug auth-token` and nothing that
+expires is written to `models.json` (the on-demand model OpenCode's auth plugin
+already uses). A token still reaches the process environment: `launch` exports
+`OAUTH_TOKEN` as before.
 """
 
 from __future__ import annotations
@@ -56,7 +59,7 @@ from ucode.config_io import (
 )
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
-    TOKEN_REFRESH_INTERVAL_SECONDS,
+    build_auth_shell_command,
     build_pi_base_urls,
     classify_model_family,
     claude_model_capabilities,
@@ -68,8 +71,10 @@ from ucode.databricks import (
     preferred_gpt_model,
 )
 from ucode.state import mark_tool_managed, save_state
-from ucode.telemetry import agent_version, ucode_version
+from ucode.telemetry import agent_version, ug_version
 from ucode.ui import print_warning
+
+from .args import LaunchOptions
 
 # Use Pi's standard user configuration directory. Keep ucode's backups and
 # state under APP_DIR, but let Pi share the user's normal ~/.pi/agent config.
@@ -286,7 +291,7 @@ def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
 
 def render_overlay(
     model: str,
-    token: str,
+    api_key: str,
     pi_base_urls: dict[str, str],
     claude_models: dict[str, str],
     codex_models: list[str],
@@ -296,19 +301,22 @@ def render_overlay(
     claude_model_ids: list[str] | None = None,
     codex_specs: list[dict] | None = None,
 ) -> tuple[dict, list[list[str]]]:
-    """Return (overlay, managed_key_paths) for Pi's user agent config."""
+    """Return (overlay, managed_key_paths) for Pi's user agent config.
+
+    ``api_key`` is a pi config value, not necessarily a literal bearer: see
+    ``build_pi_api_key`` for the `!command` form every provider gets."""
     providers: dict = {}
     keys: list[list[str]] = [["model"]]
     # Pi expands header values that match an env var name. Our UA contains
     # `/` and a space so it can never collide — safe to pass as a literal.
-    ua_headers = {"User-Agent": f"ucode/{ucode_version()} pi/{agent_version('pi')}"}
+    ua_headers = {"User-Agent": f"ucode/{ug_version()} pi/{agent_version('pi')}"}
 
     claude_ids = sorted(set(claude_models.values()) | set(claude_model_ids or []))
     if claude_ids:
         providers["databricks-claude"] = {
             "baseUrl": pi_base_urls["claude"],
             "api": "anthropic-messages",
-            "apiKey": token,
+            "apiKey": api_key,
             "authHeader": True,
             # Gateway's Anthropic translator rejects per-tool
             # `eager_input_streaming` on the streaming + tools path. Pi sends
@@ -329,7 +337,7 @@ def render_overlay(
         providers["databricks-openai"] = {
             "baseUrl": pi_base_urls["openai"],
             "api": "openai-responses",
-            "apiKey": token,
+            "apiKey": api_key,
             "authHeader": True,
             "headers": ua_headers,
             "models": [
@@ -342,7 +350,7 @@ def render_overlay(
         providers["databricks-gemini"] = {
             "baseUrl": pi_base_urls["gemini"],
             "api": "google-generative-ai",
-            "apiKey": token,
+            "apiKey": api_key,
             "authHeader": True,
             "headers": ua_headers,
             "models": [{"id": m} for m in gemini_models],
@@ -353,7 +361,7 @@ def render_overlay(
         providers["databricks-mlflow"] = {
             "baseUrl": pi_base_urls["oss"],
             "api": "openai-completions",
-            "apiKey": token,
+            "apiKey": api_key,
             "authHeader": True,
             # MLflow chat-completions gateway rejects OpenAI's `store` field
             # and per-tool `strict`. Pi omits both when these are false.
@@ -377,29 +385,40 @@ def render_overlay(
     return overlay, keys
 
 
+def build_pi_api_key(state: dict) -> str:
+    """Return the `!command` apiKey value pi resolves before every request.
+
+    Pi runs a leading-`!` config value as a command and uses its stdout, and it
+    resolves the provider apiKey per provider request rather than once per
+    process, so the token is minted on demand and never lands in the config.
+
+    No `--force-refresh`: pi has no token cache of its own on this path, so
+    forcing a mint would round-trip to the workspace every turn. Plain
+    `auth-token` serves the CLI's cached token until it nears expiry."""
+    return "!" + build_auth_shell_command(
+        state["workspace"],
+        state.get("profile"),
+        use_pat=bool(state.get("use_pat")),
+    )
+
+
 def write_tool_config(
     state: dict,
     model: str,
     token: str | None = None,
-    *,
-    force_refresh: bool = False,
 ) -> tuple[dict, str]:
     with _CONFIG_WRITE_LOCK:
-        return _write_tool_config_unlocked(state, model, token, force_refresh=force_refresh)
+        return _write_tool_config_unlocked(state, model, token)
 
 
 def _write_tool_config_unlocked(
     state: dict,
     model: str,
     token: str | None = None,
-    *,
-    force_refresh: bool = False,
 ) -> tuple[dict, str]:
     backup_existing_file(PI_CONFIG_PATH, PI_BACKUP_PATH)
     if token is None:
-        token = get_databricks_token(
-            state["workspace"], state.get("profile"), force_refresh=force_refresh
-        )
+        token = get_databricks_token(state["workspace"], state.get("profile"))
     pi_base_urls = state.get("base_urls", {}).get("pi") or build_pi_base_urls(state["workspace"])
     managed_families = _managed_model_families(state)
     claude_model_ids: list[str] | None = None
@@ -418,7 +437,7 @@ def _write_tool_config_unlocked(
         claude_model_ids = _managed_pi_claude_models(state)
     overlay, managed_keys = render_overlay(
         model,
-        token,
+        build_pi_api_key(state),
         pi_base_urls,
         claude_models,
         codex_models,
@@ -561,23 +580,17 @@ def default_model(state: dict) -> str | None:
     if gemini_models:
         return gemini_models[0]
     oss_models = state.get("oss_models") or []
-    return oss_models[0] if oss_models else None
+    if oss_models:
+        return oss_models[0]
+    return next(iter(claude_models.values()), None)
 
 
-def _refresh_token_once(state: dict, *, force_refresh: bool = False) -> str:
+def _configure_launch(state: dict) -> str:
     model = default_model(state)
     if not model:
         raise RuntimeError("No Pi model is available on this workspace.")
-    _, token = write_tool_config(state, model, force_refresh=force_refresh)
+    _, token = write_tool_config(state, model)
     return token
-
-
-def _refresh_forever(state: dict, stop_event: threading.Event) -> None:
-    while not stop_event.wait(TOKEN_REFRESH_INTERVAL_SECONDS):
-        try:
-            _refresh_token_once(state, force_refresh=True)
-        except RuntimeError:
-            continue
 
 
 def build_runtime_env(token: str) -> dict[str, str]:
@@ -662,26 +675,21 @@ def _restore_direct_oss_config_unlocked(state: dict, token: str | None) -> None:
         write_json_file(PI_CONFIG_PATH, existing)
 
 
-def launch(state: dict, tool_args: list[str]) -> None:
+def launch(state: dict, tool_args: list[str], *, options: LaunchOptions) -> None:
+    """Launch Pi behind the MLflow stream-repair proxy.
+
+    Pi re-resolves each provider's `!command` apiKey per request, so no token
+    refresher thread is needed; only the proxy needs lifecycle management.
+    """
     proxy: tuple[threading.Thread, _mlflow_proxy.ThreadingHTTPServer] | None = None
-    stop_event = threading.Event()
-    refresher: threading.Thread | None = None
-    proc: subprocess.Popen | None = None
     token: str | None = None
     primary_error: BaseException | None = None
     try:
         # The proxy must be live and its URL in state before the first config
-        # write; refreshes then keep writing the same live loopback endpoint.
+        # write; later writes then keep the same live loopback endpoint.
         proxy = _start_oss_proxy(state)
-        token = _refresh_token_once(state)
+        token = _configure_launch(state)
         env = build_runtime_env(token)
-
-        refresher = threading.Thread(
-            target=_refresh_forever,
-            args=(state, stop_event),
-            daemon=True,
-        )
-        refresher.start()
 
         proc = subprocess.Popen([SPEC["binary"], *tool_args], env=env)
         try:
@@ -693,9 +701,6 @@ def launch(state: dict, tool_args: list[str]) -> None:
         primary_error = exc
         raise
     finally:
-        stop_event.set()
-        if refresher is not None:
-            refresher.join(timeout=1)
         if proxy is not None:
             proxy_thread, server = proxy
             restore_error: Exception | None = None
@@ -716,10 +721,3 @@ def launch(state: dict, tool_args: list[str]) -> None:
 
 def validate_cmd(binary: str) -> list[str]:
     return [binary, "--print", "say hi in 5 words or less"]
-
-
-def validate_env(state: dict) -> dict[str, str]:
-    workspace = state.get("workspace")
-    if not workspace:
-        raise RuntimeError("No workspace configured.")
-    return build_runtime_env(get_databricks_token(workspace, state.get("profile")))

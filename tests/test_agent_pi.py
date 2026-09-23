@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import json
 import threading
-from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from ucode.agents import pi
+from ucode.agents.args import LaunchOptions
 
 WS = "https://example.databricks.com"
 
@@ -335,7 +335,7 @@ class TestRenderOverlayOssEnrichment:
 
 class TestRenderOverlayUserAgent:
     def test_user_agent_set_on_all_three_providers(self, monkeypatch):
-        monkeypatch.setattr(pi, "ucode_version", lambda: "0.1.0")
+        monkeypatch.setattr(pi, "ug_version", lambda: "0.1.0")
         monkeypatch.setattr(pi, "agent_version", lambda binary: "0.74.0")
         overlay, _ = _overlay(
             "claude-sonnet",
@@ -370,11 +370,12 @@ class TestRenderOverlayCompatFlags:
 
 
 class TestRenderOverlayAuthAndModels:
-    def test_token_in_api_key(self):
+    def test_api_key_config_value_embedded_verbatim(self):
+        # render_overlay takes a pi config value, so it must not reinterpret it.
         overlay, _ = _overlay(
-            "claude-sonnet", token="mytoken", claude_models={"sonnet": "claude-sonnet"}
+            "claude-sonnet", token="!mint.sh", claude_models={"sonnet": "claude-sonnet"}
         )
-        assert overlay["providers"]["databricks-claude"]["apiKey"] == "mytoken"
+        assert overlay["providers"]["databricks-claude"]["apiKey"] == "!mint.sh"
 
     def test_auth_header_flag_set_on_all_providers(self):
         overlay, _ = _overlay(
@@ -570,21 +571,6 @@ class TestBuildRuntimeEnv:
         assert env["HOME"] == "/real-user-home"
 
 
-class TestPiValidateCmd:
-    def test_starts_with_binary(self):
-        cmd = pi.validate_cmd("pi")
-        assert cmd[0] == "pi"
-
-    def test_uses_print_flag(self):
-        # `--print` puts pi in non-interactive mode; without it the TUI hangs on stdin.
-        cmd = pi.validate_cmd("pi")
-        assert "--print" in cmd
-
-    def test_has_prompt(self):
-        cmd = pi.validate_cmd("pi")
-        assert len(cmd) > 2
-
-
 class TestWriteToolConfig:
     def _setup(self, tmp_path, monkeypatch):
         import ucode.agents.pi as pi_mod
@@ -670,7 +656,7 @@ class TestWriteToolConfig:
             assert legacy not in written_providers
         assert "databricks-claude" in written_providers
 
-    def test_config_written_with_correct_model_and_token(self, tmp_path, monkeypatch):
+    def test_config_written_with_correct_model_and_auth_command(self, tmp_path, monkeypatch):
         pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
 
         with (
@@ -681,7 +667,36 @@ class TestWriteToolConfig:
 
         written = json.loads(config_file.read_text())
         assert written["model"] == "databricks-claude/claude-sonnet"
-        assert written["providers"]["databricks-claude"]["apiKey"] == "tok"
+        api_key = written["providers"]["databricks-claude"]["apiKey"]
+        assert api_key.startswith("!")
+        assert "auth-token" in api_key
+
+    def test_bearer_never_written_to_the_config(self, tmp_path, monkeypatch):
+        # The whole point: a token on disk is a token that can go stale, and pi
+        # resolves the command per request instead.
+        pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
+
+        with (
+            patch("ucode.agents.pi.get_databricks_token", return_value="dapi-secret"),
+            patch("ucode.agents.pi.save_state"),
+        ):
+            pi_mod.write_tool_config(self._state(), "claude-sonnet")
+
+        assert "dapi-secret" not in config_file.read_text()
+
+    def test_every_provider_gets_the_auth_command(self, tmp_path, monkeypatch):
+        pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
+        state = self._state(codex_models=["gpt-5"], gemini_models=["gemini-2"])
+
+        with (
+            patch("ucode.agents.pi.get_databricks_token", return_value="tok"),
+            patch("ucode.agents.pi.save_state"),
+        ):
+            pi_mod.write_tool_config(state, "claude-sonnet", token="tok")
+
+        providers = json.loads(config_file.read_text())["providers"]
+        for name in ("databricks-claude", "databricks-openai", "databricks-gemini"):
+            assert providers[name]["apiKey"].startswith("!"), name
 
     def test_cached_pi_inventory_always_keeps_shared_default(self):
         state = {
@@ -882,29 +897,6 @@ class TestWriteToolConfig:
         assert merged["theme"] == "Default Dark"
 
 
-class TestValidateAllToolsPiRollback:
-    def test_failed_pi_validation_rolls_back_settings(self, tmp_path, monkeypatch):
-        import ucode.agents as agents_mod
-        import ucode.agents.pi as pi_mod
-
-        settings_file = tmp_path / "settings.json"
-        settings_file.write_text("{}", encoding="utf-8")
-        monkeypatch.setattr(pi_mod, "PI_SETTINGS_PATH", settings_file)
-        monkeypatch.setattr(pi_mod, "PI_SETTINGS_BACKUP_PATH", tmp_path / "settings.backup.json")
-        # Keep the generic models.json rollback off the user's real config dir.
-        monkeypatch.setitem(agents_mod.TOOL_SPECS["pi"], "config_path", tmp_path / "models.json")
-        monkeypatch.setitem(
-            agents_mod.TOOL_SPECS["pi"], "backup_path", tmp_path / "models.backup.json"
-        )
-        monkeypatch.setattr(agents_mod, "validate_tool", lambda tool: (False, "boom"))
-        monkeypatch.setattr(agents_mod, "save_state", lambda s: None)
-        monkeypatch.setattr(agents_mod, "spinner", lambda *_a, **_kw: nullcontext())
-
-        agents_mod.validate_all_tools({"available_tools": ["pi"], "managed_configs": {"pi": True}})
-
-        assert not settings_file.exists()
-
-
 class TestManagedModels:
     """A managed config's models arrive as `pi_models` and must not come from the shared keys."""
 
@@ -1072,7 +1064,7 @@ class TestMlflowProxyLifecycle:
         )
         assert restored["providers"]["databricks-mlflow"]["apiKey"] == "existing-token"
 
-    def test_refresh_keeps_live_proxy_url(self, tmp_path, monkeypatch):
+    def test_config_write_keeps_live_proxy_url(self, tmp_path, monkeypatch):
         config_path = tmp_path / "models.json"
         settings_path = tmp_path / "settings.json"
         monkeypatch.setattr(pi, "PI_CONFIG_PATH", config_path)
@@ -1090,10 +1082,11 @@ class TestMlflowProxyLifecycle:
             patch.object(pi, "get_databricks_token", return_value="refreshed-token"),
             patch.object(pi, "save_state"),
         ):
-            pi._refresh_token_once(state, force_refresh=True)
+            pi._configure_launch(state)
         provider = json.loads(config_path.read_text())["providers"]["databricks-mlflow"]
         assert provider["baseUrl"] == "http://127.0.0.1:54321/ai-gateway/mlflow/v1"
-        assert provider["apiKey"] == "refreshed-token"
+        # Pi resolves the bearer per request via its `!command` apiKey.
+        assert provider["apiKey"] == pi.build_pi_api_key(state)
 
     def test_restore_waits_for_inflight_refresh_and_writes_direct_last(self, monkeypatch):
         state = {
@@ -1108,7 +1101,7 @@ class TestMlflowProxyLifecycle:
         restore_done = threading.Event()
         write_order: list[str] = []
 
-        def fake_write(current, model, token=None, *, force_refresh=False):
+        def fake_write(current, model, token=None):
             write_order.append(str(token))
             if token == "refresh-token":
                 refresh_started.set()
@@ -1148,7 +1141,7 @@ class TestMlflowProxyLifecycle:
             order.append("proxy")
             return proxy
 
-        def refresh(current, *, force_refresh=False):
+        def configure(current):
             assert current["base_urls"]["pi"]["oss"] == "http://live"
             order.append("config")
             return "tok"
@@ -1157,13 +1150,12 @@ class TestMlflowProxyLifecycle:
         proc.wait.return_value = 0
         with (
             patch.object(pi, "_start_oss_proxy", side_effect=start),
-            patch.object(pi, "_refresh_token_once", side_effect=refresh),
-            patch.object(pi, "_refresh_forever", return_value=None),
+            patch.object(pi, "_configure_launch", side_effect=configure),
             patch.object(pi, "_restore_direct_oss_config") as restore,
             patch.object(pi.subprocess, "Popen", return_value=proc),
             pytest.raises(SystemExit) as exit_info,
         ):
-            pi.launch(state, [])
+            pi.launch(state, [], options=LaunchOptions())
         assert exit_info.value.code == 0
         assert order[:2] == ["proxy", "config"]
         restore.assert_called_once_with(state, "tok")
@@ -1178,13 +1170,12 @@ class TestMlflowProxyLifecycle:
         state = {"workspace": WS, "oss_models": ["system.ai.inkling"]}
         with (
             patch.object(pi, "_start_oss_proxy", return_value=proxy),
-            patch.object(pi, "_refresh_token_once", return_value="tok"),
-            patch.object(pi, "_refresh_forever", return_value=None),
+            patch.object(pi, "_configure_launch", return_value="tok"),
             patch.object(pi, "_restore_direct_oss_config") as restore,
             patch.object(pi.subprocess, "Popen", return_value=proc),
             pytest.raises(SystemExit) as exit_info,
         ):
-            pi.launch(state, [])
+            pi.launch(state, [], options=LaunchOptions())
         assert exit_info.value.code == 130
         proc.send_signal.assert_called_once_with(pi.signal.SIGINT)
         restore.assert_called_once_with(state, "tok")
@@ -1195,21 +1186,20 @@ class TestMlflowProxyLifecycle:
     def test_setup_failure_still_cleans_proxy(self, failure_stage):
         proxy, _, server = self._proxy_pair()
         state = {"workspace": WS, "oss_models": ["system.ai.inkling"]}
-        refresh = MagicMock(return_value="tok")
+        configure = MagicMock(return_value="tok")
         popen = MagicMock(return_value=MagicMock())
         if failure_stage == "config":
-            refresh.side_effect = RuntimeError("token failed")
+            configure.side_effect = RuntimeError("token failed")
         else:
             popen.side_effect = OSError("binary missing")
         with (
             patch.object(pi, "_start_oss_proxy", return_value=proxy),
-            patch.object(pi, "_refresh_token_once", refresh),
-            patch.object(pi, "_refresh_forever", return_value=None),
+            patch.object(pi, "_configure_launch", configure),
             patch.object(pi, "_restore_direct_oss_config") as restore,
             patch.object(pi.subprocess, "Popen", popen),
             pytest.raises((RuntimeError, OSError)) as exc_info,
         ):
-            pi.launch(state, [])
+            pi.launch(state, [], options=LaunchOptions())
         expected = "token failed" if failure_stage == "config" else "binary missing"
         assert str(exc_info.value) == expected
         expected_token = None if failure_stage == "config" else "tok"
@@ -1222,8 +1212,7 @@ class TestMlflowProxyLifecycle:
         state = {"workspace": WS, "oss_models": ["system.ai.inkling"]}
         with (
             patch.object(pi, "_start_oss_proxy", return_value=proxy),
-            patch.object(pi, "_refresh_token_once", return_value="tok"),
-            patch.object(pi, "_refresh_forever", return_value=None),
+            patch.object(pi, "_configure_launch", return_value="tok"),
             patch.object(
                 pi, "_restore_direct_oss_config", side_effect=RuntimeError("restore failed")
             ),
@@ -1231,7 +1220,7 @@ class TestMlflowProxyLifecycle:
             patch.object(pi.subprocess, "Popen", side_effect=OSError("binary missing")),
             pytest.raises(OSError, match="binary missing"),
         ):
-            pi.launch(state, [])
+            pi.launch(state, [], options=LaunchOptions())
         warning.assert_called_once()
         server.shutdown.assert_called_once()
         server.server_close.assert_called_once()
@@ -1243,13 +1232,12 @@ class TestMlflowProxyLifecycle:
         state = {"workspace": WS, "oss_models": ["system.ai.inkling"]}
         with (
             patch.object(pi, "_start_oss_proxy", return_value=proxy),
-            patch.object(pi, "_refresh_token_once", return_value="tok"),
-            patch.object(pi, "_refresh_forever", return_value=None),
+            patch.object(pi, "_configure_launch", return_value="tok"),
             patch.object(pi, "_restore_direct_oss_config", side_effect=OSError("restore failed")),
             patch.object(pi.subprocess, "Popen", return_value=proc),
             pytest.raises(OSError, match="restore failed"),
         ):
-            pi.launch(state, [])
+            pi.launch(state, [], options=LaunchOptions())
         server.shutdown.assert_called_once()
         server.server_close.assert_called_once()
 
@@ -1267,3 +1255,28 @@ class TestManagedDefaultModel:
     def test_falls_back_to_pi_models_without_default(self):
         state = {"pi_models": ["system.ai.claude-opus-4-8"]}
         assert pi.default_model(state) == "system.ai.claude-opus-4-8"
+
+
+class TestBuildPiApiKey:
+    """Pi resolves a leading-`!` config value as a command before every provider
+    request, so the apiKey is that command rather than a baked bearer."""
+
+    def test_is_a_pi_command_value_running_auth_token(self, monkeypatch):
+        monkeypatch.setattr("ucode.databricks.shutil.which", lambda command: f"/tools/{command}")
+        api_key = pi.build_pi_api_key({"workspace": WS})
+
+        assert api_key == f"!/tools/ug auth-token --host {WS}"
+
+    def test_omits_force_refresh(self):
+        # Pi has no token cache on this path, so --force-refresh would round-trip
+        # to the workspace on every turn.
+        assert "--force-refresh" not in pi.build_pi_api_key({"workspace": WS})
+
+    def test_passes_the_profile_through(self):
+        api_key = pi.build_pi_api_key({"workspace": WS, "profile": "stablebox"})
+
+        assert "--profile stablebox" in api_key
+
+    def test_forwards_use_pat(self):
+        assert "--use-pat" in pi.build_pi_api_key({"workspace": WS, "use_pat": True})
+        assert "--use-pat" not in pi.build_pi_api_key({"workspace": WS})

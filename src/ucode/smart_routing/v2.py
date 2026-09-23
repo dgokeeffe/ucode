@@ -10,19 +10,26 @@ import sys
 import time
 import urllib.request
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from pathlib import Path
 from typing import NoReturn, TextIO
 
-import tomlkit
-
+from ucode.codex_config import (
+    codex_config_args,
+    custom_catalog_models,
+    custom_catalog_path,
+)
 from ucode.config_io import APP_DIR, read_json_safe, read_toml_safe, write_json_file
 from ucode.constants import LOOPBACK_HOST
+from ucode.custom_oauth import custom_oauth_cli_enabled, get_custom_client_token
 from ucode.databricks import (
+    AnthropicModelCatalog,
     build_auth_token_argv,
     get_databricks_token,
+    list_anthropic_model_catalog,
     list_anthropic_models,
 )
+from ucode.launcher import exec_or_spawn
 from ucode.smart_routing import claude_routing, codex_interposer, routing
 from ucode.smart_routing.claude_hooks import (
     FIRST_PROMPT_SOCKET_ENV,
@@ -30,10 +37,13 @@ from ucode.smart_routing.claude_hooks import (
     sync_smart_routing_hooks,
 )
 from ucode.smart_routing.codex_hooks import merge_pre_tool_use_hooks, routing_models
-from ucode.ui import print_note
+from ucode.ui import print_warning
 
-ENV_VAR = "ENABLE_SMART_ROUTING_V2"
+ENABLE_SMART_ROUTING_ENV_VAR = "ENABLE_SMART_ROUTING_V2"
+ENABLE_SUBAGENT_ROUTING_ENV_VAR = "ENABLE_SMART_ROUTING_SUBAGENT_ONLY"
 LEGACY_STATE_KEY = "smart_routing_enabled"
+
+_SMART_ROUTING_ENV_VARS = (ENABLE_SMART_ROUTING_ENV_VAR, ENABLE_SUBAGENT_ROUTING_ENV_VAR)
 
 CODEX_INTERPOSER_LOG = APP_DIR / "codex-v2-interposer.log"
 
@@ -53,8 +63,102 @@ CLAUDE_ROUTED_AGENT_PROMPT = (
 )
 
 
-def enabled() -> bool:
-    return os.environ.get(ENV_VAR) == "1"
+def _launch_token(state: dict, workspace: str) -> str:
+    custom_oauth = state.get("custom_oauth")
+    if custom_oauth_cli_enabled(custom_oauth) and isinstance(custom_oauth, dict):
+        return get_custom_client_token(
+            workspace,
+            custom_oauth["client_id"],
+            custom_oauth["redirect_url"],
+            scopes=custom_oauth["scopes"],
+            profile=custom_oauth.get("profile"),
+        )
+    return get_databricks_token(workspace, state.get("profile"))
+
+
+def _model_picker_catalog() -> AnthropicModelCatalog | None:
+    """Read model-picker rows using the managed-settings then ucode-settings waterfall.
+
+    A managed picker is authoritative for smart routing: its rows are the models the
+    administrator exposed, so there is no need to query the gateway catalog first.
+    """
+    try:
+        from ucode.agents.claude import (
+            CLAUDE_SETTINGS_PATH,
+            CLAUDE_USER_SETTINGS_PATH,
+            _managed_settings_path,
+        )
+
+        # Hierarchy: managed settings, CLI-supplied settings (ucode-settings.json), local user
+        # settings, based on the modelPicker scope documented at https://code.claude.com/docs/en/settings-reference#modelpicker.
+        paths = [_managed_settings_path(), CLAUDE_SETTINGS_PATH, CLAUDE_USER_SETTINGS_PATH]
+    except (ImportError, OSError):
+        return None
+    for path in paths:
+        if path is None or not path.is_file():
+            continue
+        settings = read_json_safe(path)
+        picker_settings = settings.get("modelPicker") if isinstance(settings, dict) else None
+        picker = picker_settings.get("options") if isinstance(picker_settings, dict) else None
+        if not isinstance(picker, list):
+            continue
+        model_ids: list[str] = []
+        seen: set[str] = set()
+        for row in picker:
+            if not isinstance(row, dict) or not isinstance(row.get("model"), str):
+                continue
+            model_id = row["model"].strip()
+            if not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
+            model_ids.append(model_id)
+        if model_ids:
+            return AnthropicModelCatalog(model_ids, {})
+    return None
+
+
+def smart_routing_enabled(env: MutableMapping[str, str] | None = None) -> bool:
+    source = os.environ if env is None else env
+    return any(source.get(var) == "1" for var in _SMART_ROUTING_ENV_VARS)
+
+
+def first_prompt_routing_enabled(env: MutableMapping[str, str] | None = None) -> bool:
+    """Whether the first prompt is routed. Subagent-only wins over the full V2 flag."""
+    source = os.environ if env is None else env
+    return (
+        source.get(ENABLE_SMART_ROUTING_ENV_VAR) == "1"
+        and source.get(ENABLE_SUBAGENT_ROUTING_ENV_VAR) != "1"
+    )
+
+
+def enable_smart_routing(
+    env: MutableMapping[str, str] | None = None,
+) -> dict[str, str | None]:
+    """Set the full smart-routing env var and return the prior value of every routing var."""
+    target = os.environ if env is None else env
+    previous = {var: target.get(var) for var in _SMART_ROUTING_ENV_VARS}
+    target[ENABLE_SMART_ROUTING_ENV_VAR] = "1"
+    return previous
+
+
+def restore_smart_routing_env(
+    previous: dict[str, str | None], env: MutableMapping[str, str] | None = None
+) -> None:
+    """Restore the env state captured when smart routing was enabled or disabled."""
+    target = os.environ if env is None else env
+    for var, value in previous.items():
+        if value is None:
+            target.pop(var, None)
+        else:
+            target[var] = value
+
+
+def disable_smart_routing(
+    env: MutableMapping[str, str] | None = None,
+) -> dict[str, str | None]:
+    """Temporarily remove the smart-routing env vars and return their prior values."""
+    target = os.environ if env is None else env
+    return {var: target.pop(var, None) for var in _SMART_ROUTING_ENV_VARS}
 
 
 def _loopback_websocket_url(port: int) -> str:
@@ -106,6 +210,16 @@ def _canonical_claude_models(model_ids: list[str]) -> list[str]:
             if isinstance(model, str) and model
         )
     )
+
+
+def _unwrapped_claude_model_id(model: str) -> str:
+    """Strip the Anthropic gateway wrapper, preserving the embedded model id."""
+    return routing.unwrap_anthropic_gateway_model(model)
+
+
+def _claude_router_model_id(model: str) -> str:
+    """Unwrap an Anthropic gateway id, then apply standard model normalization."""
+    return routing.normalize_model(_unwrapped_claude_model_id(model))
 
 
 def _claude_model_overrides(model_ids: list[str]) -> dict[str, str]:
@@ -183,15 +297,17 @@ def _request_claude_routing_decision(
 ) -> tuple[routing.RoutingDecision | None, str | None]:
     available: dict[str, str] = {}
     for model in _canonical_claude_models(model_ids):
-        available.setdefault(routing.normalize_model(model), model)
+        available.setdefault(_claude_router_model_id(model), model)
     if not available:
         return None, "Anthropic models endpoint returned no Claude models"
+    route_options = [(model, "claude") for model in available]
     return routing.select_route(
         workspace,
         token,
         prompt,
-        [(model, "claude") for model in available],
-        lambda selected: available.get(routing.normalize_model(selected)),
+        route_options,
+        lambda selected: available.get(_claude_router_model_id(selected)),
+        router_name=routing.configured_router_name(),
         timeout=CLAUDE_ROUTE_SELECTION_TIMEOUT_S,
     )
 
@@ -246,9 +362,10 @@ def route_claude_pre_tool_use(
             route.decision,
             route.routed_model,
         )
-    routing_message = routing.format_subagent_message(
+    routing_message = claude_routing.SUBAGENT_NOTICE_CONFIG.message(
+        route.decision,
         route.routed_model,
-        route.decision.rationale,
+        route.tool_input,
     )
     updated_input = {
         **{key: value for key, value in route.tool_input.items() if key != "model"},
@@ -328,15 +445,25 @@ def launch_claude(
     workspace = state.get("workspace")
     if not workspace:
         raise RuntimeError(
-            "Smart routing v2 needs a configured workspace; run `ucode configure claude` first."
+            "Smart routing needs a configured workspace; run `ucode configure claude` first."
         )
-    token = get_databricks_token(workspace, state.get("profile"))
+    token = _launch_token(state, workspace)
     os.environ[OAUTH_TOKEN_ENV_VAR] = token
-    os.environ[GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
-    model_ids, discovery_error = list_anthropic_models(workspace, token)
-    if not model_ids:
-        raise RuntimeError(discovery_error or "Anthropic models endpoint returned no Claude models")
+    # if modelPicker is defined, then skip model discovery.
+    picker_catalog = _model_picker_catalog()
+    if picker_catalog is None:
+        os.environ[GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
+        os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
+        catalog = list_anthropic_model_catalog(workspace, token)
+    else:
+        catalog = picker_catalog
+    if not catalog.model_ids:
+        raise RuntimeError(
+            catalog.error_msg or "Anthropic models endpoint returned no Claude models"
+        )
+    model_ids = catalog.model_ids
 
+    route_first_prompt = first_prompt_routing_enabled()
     run_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     socket_path = APP_DIR / f"claude-v2-{run_id}.sock"
     settings_path = APP_DIR / f"claude-v2-{run_id}.json"
@@ -348,8 +475,12 @@ def launch_claude(
     env = settings.setdefault("env", {})
     if not isinstance(env, dict):
         raise RuntimeError("Claude settings 'env' must be an object for smart routing.")
-    env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
-    env[FIRST_PROMPT_SOCKET_ENV] = str(socket_path)
+    env.pop("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", None)
+    if route_first_prompt:
+        env[ENABLE_SMART_ROUTING_ENV_VAR] = "1"
+        env[FIRST_PROMPT_SOCKET_ENV] = str(socket_path)
+    else:
+        env[ENABLE_SUBAGENT_ROUTING_ENV_VAR] = "1"
     model_overrides = settings.setdefault("modelOverrides", {})
     if not isinstance(model_overrides, dict):
         raise RuntimeError("Claude settings 'modelOverrides' must be an object for smart routing.")
@@ -359,22 +490,36 @@ def launch_claude(
         "claude_models": {str(index): model for index, model in enumerate(model_ids)},
     }
     sync_smart_routing_hooks(settings, routing_state, enabled=True)
-    sync_first_prompt_hook(settings, hook_executable)
+    if route_first_prompt:
+        sync_first_prompt_hook(settings, hook_executable)
     write_json_file(settings_path, settings)
     model_args = launch_model_args(remaining, launch_model)
     routed_agent_args = _with_routed_claude_agents(remaining, model_ids)
     argv = [binary, "--settings", str(settings_path), *model_args, *routed_agent_args]
 
+    if not route_first_prompt:
+        # Subagent-only routing needs no PTY: the PreToolUse hooks ride in the
+        # per-launch settings, so spawn Claude directly and clean up after it.
+        proc = subprocess.Popen(argv)
+        try:
+            returncode = proc.wait()
+        except KeyboardInterrupt:
+            proc.send_signal(signal.SIGINT)
+            returncode = proc.wait()
+        finally:
+            settings_path.unlink(missing_ok=True)
+        sys.exit(returncode)
+
     model_setting = _ClaudeModelSettingGuard(user_settings_path)
 
-    def route_prompt(prompt: str) -> tuple[str, str]:
+    def route_prompt(prompt: str) -> claude_pty.FirstPromptRoute:
         decision = _route_claude_prompt(state, token, prompt, model_ids)
-        return model_name(decision.model), decision.rationale
+        return claude_pty.FirstPromptRoute(
+            model=model_name(_unwrapped_claude_model_id(decision.model)),
+            display_model=catalog.model_id_to_display_name.get(decision.model, decision.model),
+            rationale=decision.rationale,
+        )
 
-    print_note(
-        "Smart routing v2: the first submitted prompt will select Claude Code's "
-        f"model; log: {CLAUDE_PTY_LOG}."
-    )
     try:
         returncode = claude_pty.run_claude_pty(
             argv,
@@ -390,37 +535,6 @@ def launch_claude(
         settings_path.unlink(missing_ok=True)
         socket_path.unlink(missing_ok=True)
     sys.exit(returncode)
-
-
-def _toml_value(value: str | int | float | bool | list[object] | dict[str, object]) -> str:
-    if isinstance(value, dict):
-        item = tomlkit.inline_table()
-        item.update(value)
-        return item.as_string()
-    if isinstance(value, list) and any(isinstance(entry, dict) for entry in value):
-        wrapper = tomlkit.inline_table()
-        wrapper["value"] = value
-        rendered = wrapper.as_string()
-        return rendered.removeprefix("{value = ").removesuffix("}")
-    return tomlkit.item(value).as_string()
-
-
-def _codex_config_args(overlay: dict) -> list[str]:
-    args: list[str] = []
-    for key, value in overlay.items():
-        # This is Codex's AI Gateway transport definition, not Unity Catalog
-        # Model Provider Service support; smart routing still cannot use --provider.
-        if key in {"hooks", "model_providers"} and isinstance(value, dict):
-            for provider_name, provider_config in value.items():
-                args.extend(
-                    [
-                        "--config",
-                        f"{key}.{provider_name}={_toml_value(provider_config)}",
-                    ]
-                )
-        else:
-            args.extend(["--config", f"{key}={_toml_value(value)}"])
-    return args
 
 
 # TODO: Replace with /codex/v1/models once /codex/v1/models can send GPT models as well.
@@ -458,31 +572,41 @@ def launch_codex(
     workspace = state.get("workspace")
     if not workspace:
         raise RuntimeError(
-            "Smart routing v2 needs a configured workspace; run `ucode configure codex` first."
+            "Smart routing needs a configured workspace; run `ucode configure codex` first."
         )
     if not start_model:
         raise RuntimeError(
-            "Smart routing v2 could not determine a starting Codex model for this workspace."
+            "Smart routing could not determine a starting Codex model for this workspace."
         )
 
-    profile = state.get("profile")
-    os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, profile)
-    available_models = _cached_routing_models(state)
+    os.environ[OAUTH_TOKEN_ENV_VAR] = _launch_token(state, workspace)
+    catalog_models = custom_catalog_models()
+    available_models = catalog_models or _cached_routing_models(state)
     if not available_models:
-        print_note(
-            "Smart routing model metadata is unavailable; starting Codex on gpt-5.6-luna "
-            "without automatic model switching. Run `ucode configure codex` to enable routing."
+        print_warning(
+            "Smart routing model metadata is unavailable; automatic model switching is unavailable. "
+            "Run `ucode configure codex` to enable routing."
         )
+    custom_oauth = state.get("custom_oauth")
     overlay = render_overlay(
         workspace,
         start_model,
         state.get("profile"),
         use_pat=bool(state.get("use_pat")),
+        custom_oauth=(custom_oauth if custom_oauth_cli_enabled(custom_oauth) else None),
+        managed_http_headers=state.get("codex_http_headers"),
     )
+    catalog_path = custom_catalog_path()
+    if catalog_path is not None:
+        overlay["model_catalog_json"] = str(catalog_path)
     overlay["hooks"] = {
         "PreToolUse": _v2_pre_tool_use_hooks(state, available_models),
     }
-    config_args = _codex_config_args(overlay)
+    config_args = codex_config_args(overlay)
+    if not first_prompt_routing_enabled():
+        # Subagent-only routing needs neither the app-server nor the interposer:
+        # the hooks ride in the CLI config, so launch the TUI directly.
+        exec_or_spawn([binary, *config_args, *tool_args])
     app_port = _free_port()
     app_server_url = _loopback_websocket_url(app_port)
 
@@ -499,14 +623,14 @@ def launch_codex(
     try:
         if not _wait_for_app_server(app_port, timeout=APP_SERVER_READY_TIMEOUT_SECONDS):
             raise RuntimeError(
-                "Codex app-server did not become ready for smart routing v2; check workspace auth."
+                "Codex app-server did not become ready for smart routing; check workspace auth."
             )
         tui_port, stop_interposer = codex_interposer.start_interposer_thread(
             LOOPBACK_HOST,
             app_server_url,
             available_models=available_models,
             workspace=workspace,
-            token_provider=lambda: get_databricks_token(workspace, profile),
+            token_provider=lambda: _launch_token(state, workspace),
             switch_message_fn=format_routing_notice,
             log_path=CODEX_INTERPOSER_LOG,
         )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from contextlib import contextmanager
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -11,6 +12,7 @@ import ucode.agents as agents_mod
 from ucode.agents import (
     DEFAULT_TOOL,
     TOOL_SPECS,
+    LaunchOptions,
     check_gateway_endpoint,
     configure_selected_tools,
     default_model_for_tool,
@@ -19,10 +21,10 @@ from ucode.agents import (
     install_databricks_ai_tools_for_agents,
     install_tool_binary,
     normalize_tool,
-    provider_permission_error,
     resolve_launch_model,
 )
 from ucode.agents.args import has_explicit_model_arg
+from ucode.managed_config import ManagedConfigResult
 
 
 class TestModelArgumentParsing:
@@ -47,27 +49,6 @@ class TestModelArgumentParsing:
         assert has_explicit_model_arg(["--model", "model-a", "--", "--model", "model-b"])
 
 
-class TestProviderPermissionError:
-    _CONN_ERR = (
-        "User does not have USE CONNECTION on SCHEMA_CONNECTION "
-        "'299433db-cb91-4b08-9761-edab72a27836'."
-    )
-
-    def test_rewrites_when_provider_configured(self):
-        state = {"provider_services": {"codex": "main.aarushi.aarushi-test-openai"}}
-        out = provider_permission_error("codex", state, self._CONN_ERR)
-        assert "main.aarushi.aarushi-test-openai" in out
-        assert "EXECUTE" in out
-        assert "SCHEMA_CONNECTION" not in out
-
-    def test_passthrough_without_provider(self):
-        assert provider_permission_error("codex", {}, self._CONN_ERR) == self._CONN_ERR
-
-    def test_passthrough_for_unrelated_error(self):
-        state = {"provider_services": {"codex": "main.a.b"}}
-        assert provider_permission_error("codex", state, "boom") == "boom"
-
-
 class TestToolSpecs:
     def test_all_tools_present(self):
         assert set(TOOL_SPECS) == {"codex", "claude", "gemini", "opencode", "copilot", "pi"}
@@ -82,13 +63,32 @@ class TestToolSpecs:
         assert DEFAULT_TOOL == "codex"
 
 
+def test_launch_dispatches_invocation_options(monkeypatch):
+    calls = []
+    options = LaunchOptions(launch_smart_routing=True)
+    monkeypatch.setattr(
+        agents_mod.codex,
+        "launch",
+        lambda state, tool_args, *, options: calls.append((state, tool_args, options)),
+    )
+
+    agents_mod.launch("codex", {"workspace": "ws"}, ["prompt"], options=options)
+
+    assert calls == [({"workspace": "ws"}, ["prompt"], options)]
+
+
 class TestInstallAiToolsForAgents:
-    def _capture(self, monkeypatch):
+    def _capture(self, monkeypatch, *, managed=None):
         captured = {}
         monkeypatch.setattr(
             agents_mod,
             "install_ai_tools",
             lambda agents, profile: captured.update(agents=agents, profile=profile),
+        )
+        monkeypatch.setattr(
+            agents_mod,
+            "refresh_managed_config",
+            lambda state, **_k: ManagedConfigResult(managed, False),
         )
         return captured
 
@@ -96,14 +96,21 @@ class TestInstallAiToolsForAgents:
         captured = self._capture(monkeypatch)
         # Gemini and Pi aren't supported by `databricks aitools`, so they drop.
         install_databricks_ai_tools_for_agents(
-            ["claude", "codex", "gemini", "pi"], {"profile": "prof"}
+            ["claude", "codex", "gemini", "pi"],
+            {"profile": "prof", "databricks_ai_tools_enabled": True},
         )
         assert captured == {"agents": ["claude-code", "codex"], "profile": "prof"}
 
-    def test_installed_by_default(self, monkeypatch):
-        # Opt-out: absent flag means install.
+    def test_skipped_by_default(self, monkeypatch):
         captured = self._capture(monkeypatch)
         install_databricks_ai_tools_for_agents(["claude"], {"profile": "p"})
+        assert captured == {}  # install_ai_tools never called
+
+    def test_installed_when_enabled(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        install_databricks_ai_tools_for_agents(
+            ["claude"], {"profile": "p", "databricks_ai_tools_enabled": True}
+        )
         assert captured == {"agents": ["claude-code"], "profile": "p"}
 
     def test_skipped_when_disabled(self, monkeypatch):
@@ -113,6 +120,40 @@ class TestInstallAiToolsForAgents:
             ["claude"], {"profile": "p", "databricks_ai_tools_enabled": False}
         )
         assert captured == {}  # install_ai_tools never called
+
+    def test_skipped_under_managed_config(self, monkeypatch):
+        # An admin's managed config governs the workspace; skip even when enabled.
+        captured = self._capture(monkeypatch, managed={"enabled_agents": {"claude": {}}})
+        install_databricks_ai_tools_for_agents(
+            ["claude"], {"profile": "p", "databricks_ai_tools_enabled": True}
+        )
+        assert captured == {}  # install_ai_tools never called
+
+    def test_skipped_under_empty_managed_config(self, monkeypatch):
+        # A published-but-empty config still means the admin defined one; a present
+        # manifest (even {}) skips, while a truly absent config (None) does not.
+        captured = self._capture(monkeypatch, managed={})
+        install_databricks_ai_tools_for_agents(
+            ["claude"], {"profile": "p", "databricks_ai_tools_enabled": True}
+        )
+        assert captured == {}  # install_ai_tools never called
+
+    def test_forwards_force_refresh_to_managed_read(self, monkeypatch):
+        # The gate forwards force_refresh so `ug configure --agent` (no prior refresh) reads fresh,
+        # while the main configure path (already refreshed) reuses its read instead of re-fetching.
+        seen: list[bool] = []
+        monkeypatch.setattr(agents_mod, "install_ai_tools", lambda agents, profile: None)
+        monkeypatch.setattr(
+            agents_mod,
+            "refresh_managed_config",
+            lambda state, *, force_refresh=False: (
+                seen.append(force_refresh) or ManagedConfigResult(None, False)
+            ),
+        )
+        state = {"profile": "p", "databricks_ai_tools_enabled": True}
+        install_databricks_ai_tools_for_agents(["claude"], state)
+        install_databricks_ai_tools_for_agents(["claude"], state, force_refresh=True)
+        assert seen == [False, True]
 
 
 class TestConfigureWiresAiToolsInstall:
@@ -129,6 +170,11 @@ class TestConfigureWiresAiToolsInstall:
             "install_ai_tools",
             lambda agents, profile: captured.update(agents=agents, profile=profile),
         )
+        monkeypatch.setattr(
+            agents_mod,
+            "refresh_managed_config",
+            lambda state, **_k: ManagedConfigResult(None, False),
+        )
         return captured
 
     def test_configure_single_tool_does_not_install(self, monkeypatch):
@@ -138,10 +184,34 @@ class TestConfigureWiresAiToolsInstall:
         agents_mod.configure_single_tool("codex", {"codex_models": ["m"], "profile": "myprof"})
         assert captured == {}
 
+    def test_managed_parent_skips_global_availability_and_writes_header(self, monkeypatch):
+        state = {"workspace": "https://x.databricks.com"}
+        monkeypatch.setattr(
+            agents_mod,
+            "check_gateway_endpoint",
+            lambda *_a: pytest.fail("managed parent must not require global model availability"),
+        )
+        configure = MagicMock(return_value=state)
+        monkeypatch.setattr(agents_mod, "configure_tool", configure)
+        monkeypatch.setattr(agents_mod, "save_state", lambda _state: None)
+
+        assert (
+            agents_mod.configure_single_tool("claude", state, parent_schema="main.default") is state
+        )
+
+        configure.assert_called_once_with("claude", state, parent_schema="main.default")
+
     def test_configure_selected_tools_triggers_install(self, monkeypatch):
         captured = self._stub_configure(monkeypatch)
-        agents_mod.configure_selected_tools({"profile": "myprof"}, ["codex"])
+        agents_mod.configure_selected_tools(
+            {"profile": "myprof", "databricks_ai_tools_enabled": True}, ["codex"]
+        )
         assert captured == {"agents": ["codex"], "profile": "myprof"}
+
+    def test_configure_selected_tools_skips_install_by_default(self, monkeypatch):
+        captured = self._stub_configure(monkeypatch)
+        agents_mod.configure_selected_tools({"profile": "myprof"}, ["codex"])
+        assert captured == {}
 
     def test_configure_selected_tools_can_defer_install(self, monkeypatch):
         captured = self._stub_configure(monkeypatch)
@@ -348,7 +418,8 @@ class TestResolveProviderModels:
         )
         assert (models, error, relayed) == (None, None, False)
 
-    def test_relayed_anthropic_flagged(self, monkeypatch):
+    def test_relayed_allow_all_pins_nothing(self, monkeypatch):
+        # allow_all relay declares no Claude targets: nothing pinned, still flagged relayed.
         self._patch(
             monkeypatch, {"provider_type": "anthropic", "targets": [], "relayed": True}, None
         )
@@ -357,6 +428,24 @@ class TestResolveProviderModels:
         )
         assert error is None
         assert models is None
+        assert relayed is True
+
+    def test_relayed_anthropic_with_targets_pins_family(self, monkeypatch):
+        # A curated relay maps its declared targets by family so --model can resolve against them.
+        self._patch(
+            monkeypatch,
+            {
+                "provider_type": "anthropic",
+                "targets": ["claude-opus-4-8", "claude-haiku-4-5"],
+                "relayed": True,
+            },
+            None,
+        )
+        models, error, relayed = agents_mod.resolve_provider_models(
+            "claude", self._STATE, "main.a.relayed_ent"
+        )
+        assert error is None
+        assert models == {"opus": "claude-opus-4-8", "haiku": "claude-haiku-4-5"}
         assert relayed is True
 
     def test_bedrock_returns_pinned_models(self, monkeypatch):
@@ -375,6 +464,24 @@ class TestResolveProviderModels:
             "opus": "global.anthropic.claude-opus-4-8",
         }
 
+    def test_bedrock_ignores_gpt_targets(self, monkeypatch):
+        service = {
+            "provider_type": "amazon_bedrock",
+            "targets": [
+                "global.anthropic.claude-opus-4-8",
+                "openai.gpt-oss-120b-1:0",
+            ],
+        }
+        self._patch(monkeypatch, service, None)
+
+        models, error, relayed = agents_mod.resolve_provider_models(
+            "claude", self._STATE, "main.b.mixed"
+        )
+
+        assert error is None
+        assert models == {"opus": "global.anthropic.claude-opus-4-8"}
+        assert relayed is False
+
     def test_invalid_provider_returns_error(self, monkeypatch):
         self._patch(monkeypatch, None, "boom")
         models, error, relayed = agents_mod.resolve_provider_models(
@@ -384,8 +491,129 @@ class TestResolveProviderModels:
         assert error == "boom"
         assert relayed is False
 
+    @pytest.mark.parametrize("tool", ["gemini", "codex"])
+    def test_non_claude_pins_no_family_map(self, monkeypatch, tool):
+        # Only claude pins a per-family map; codex ignores it and gemini resolves its own
+        # target, so a non-claude service must not be run through Claude-family logic.
+        self._patch(
+            monkeypatch,
+            {"provider_type": "gemini_enterprise", "targets": ["gemini-3.5-flash"]},
+            None,
+        )
+        models, error, relayed = agents_mod.resolve_provider_models(tool, self._STATE, "c.s.svc")
+        assert (models, error, relayed) == (None, None, False)
+
+
+class TestConfigureOneGeminiProvider:
+    _STATE = {"workspace": "https://ws.databricks.com", "profile": None}
+
+    def test_gemini_provider_resolves_target_before_configure(self, monkeypatch):
+        # Regression: configuring gemini through a provider must resolve a target model rather
+        # than passing model=None into configure_tool (whose gemini branch requires one).
+        monkeypatch.setattr(
+            agents_mod,
+            "resolve_gemini_provider_model",
+            lambda state, provider, model, **kw: ("gemini-3.5-flash", None),
+        )
+        captured = {}
+
+        def _fake_configure_tool(tool, state, model=None, **kwargs):
+            captured["tool"] = tool
+            captured["model"] = model
+            captured["provider"] = kwargs.get("provider")
+            return state
+
+        monkeypatch.setattr(agents_mod, "configure_tool", _fake_configure_tool)
+        agents_mod._configure_one("gemini", self._STATE, "c.s.g")
+        assert captured == {"tool": "gemini", "model": "gemini-3.5-flash", "provider": "c.s.g"}
+
+    def test_gemini_provider_resolution_error_raises(self, monkeypatch):
+        monkeypatch.setattr(
+            agents_mod,
+            "resolve_gemini_provider_model",
+            lambda state, provider, model, **kw: (None, "pick a model"),
+        )
+        with pytest.raises(RuntimeError, match="pick a model"):
+            agents_mod._configure_one("gemini", self._STATE, "c.s.g")
+
+
+class TestResolveGeminiProviderModel:
+    _STATE = {"workspace": "https://ws.databricks.com", "profile": None}
+
+    def _patch(self, monkeypatch, service, error=None, persisted=None):
+        monkeypatch.setattr(agents_mod, "get_databricks_token", lambda w, p: "token")
+        monkeypatch.setattr(
+            agents_mod, "resolve_provider_service", lambda t, n, w, tok: (service, error)
+        )
+        # Hermetic: never read the developer's real ~/.gemini/ucode.env.
+        monkeypatch.setattr(agents_mod.gemini, "persisted_provider_model", lambda: persisted)
+
+    def test_sole_target_used_by_default(self, monkeypatch):
+        self._patch(monkeypatch, {"name": "c.s.g", "targets": ["gemini-3.5-flash"]})
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", None)
+        assert (model, error) == ("gemini-3.5-flash", None)
+
+    def test_explicit_model_not_a_target_errors(self, monkeypatch):
+        self._patch(monkeypatch, {"name": "c.s.g", "targets": ["gemini-3.5-flash"]})
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", "gpt-5")
+        assert model is None
+        assert "is not a target" in error
+
+    def test_persisted_target_reused_for_multi_target(self, monkeypatch):
+        # A bare relaunch (no --model) of a multi-target service reuses the pinned model.
+        self._patch(
+            monkeypatch,
+            {"name": "c.s.g", "targets": ["gemini-3.5-flash", "gemini-3.5-pro"]},
+            persisted="gemini-3.5-pro",
+        )
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", None)
+        assert (model, error) == ("gemini-3.5-pro", None)
+
+    def test_multi_target_without_choice_errors(self, monkeypatch):
+        # Multiple targets, nothing pinned, no --model → ask the user to choose.
+        self._patch(
+            monkeypatch,
+            {"name": "c.s.g", "targets": ["gemini-3.5-flash", "gemini-3.5-pro"]},
+            persisted=None,
+        )
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", None)
+        assert model is None
+        assert "exposes several models" in error
+
+    def test_stale_persisted_ignored_falls_back_to_sole(self, monkeypatch):
+        # A pinned model that is no longer a target (e.g. after switching services) is ignored.
+        self._patch(
+            monkeypatch,
+            {"name": "c.s.g", "targets": ["gemini-3.5-flash"]},
+            persisted="gemini-3.5-pro",
+        )
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", None)
+        assert (model, error) == ("gemini-3.5-flash", None)
+
+    def test_prefetched_service_skips_lookup(self, monkeypatch):
+        # Passing a service dict must not trigger a token fetch or control-plane lookup.
+        def _boom(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("should not fetch when service is provided")
+
+        monkeypatch.setattr(agents_mod, "get_databricks_token", _boom)
+        monkeypatch.setattr(agents_mod, "resolve_provider_service", _boom)
+        monkeypatch.setattr(agents_mod.gemini, "persisted_provider_model", lambda: None)
+        model, error = agents_mod.resolve_gemini_provider_model(
+            self._STATE, "c.s.g", None, service={"name": "c.s.g", "targets": ["gemini-3.5-flash"]}
+        )
+        assert (model, error) == ("gemini-3.5-flash", None)
+
 
 class TestInstallToolBinary:
+    @staticmethod
+    def _seed_codex_catalog_reference(catalog_ref: str | None = None):
+        codex = agents_mod.codex
+        shared_path = codex.CODEX_CONFIG_PATH.parent / "config.toml"
+        shared_path.parent.mkdir(parents=True, exist_ok=True)
+        reference = catalog_ref or str(codex.CODEX_MODEL_CATALOG_PATH)
+        shared_path.write_text(f'model_catalog_json = "{reference}"\n', encoding="utf-8")
+        return shared_path
+
     def test_non_strict_returns_false_when_npm_missing(self, monkeypatch):
         monkeypatch.setattr("ucode.agents.shutil.which", lambda _: None)
 
@@ -421,38 +649,176 @@ class TestInstallToolBinary:
             "ucode.agents.prompt_yes_no",
             lambda prompt: (_ for _ in ()).throw(AssertionError("should not prompt")),
         )
+        monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: None)
 
-        assert install_tool_binary("opencode", strict=False, update_existing=True) is True
+        assert install_tool_binary("opencode", strict=False) is True
         assert calls == []
         assert "Updating OpenCode..." not in capsys.readouterr().out
 
-    def test_required_update_runs_even_when_optional_prompt_disabled(self, monkeypatch):
-        """A required (minimum-version) update is forced regardless of the
-        prompt_optional_updates preference."""
-        calls: list[list[str]] = []
+    @pytest.mark.parametrize(
+        ("tool", "command"),
+        [
+            ("claude", ["claude", "upgrade"]),
+            ("codex", ["codex", "update"]),
+        ],
+    )
+    def test_required_update_prompts_and_rechecks(self, monkeypatch, tool, command):
+        calls = []
+        prompts = []
+        monkeypatch.setattr("ucode.agents.shutil.which", lambda binary: f"/usr/bin/{binary}")
+        monkeypatch.setattr("ucode.agents._too_new_downgrade", lambda _: None)
+        monkeypatch.setattr(
+            "ucode.agents.subprocess.run",
+            lambda args, **kwargs: calls.append(args) or subprocess.CompletedProcess(args, 0),
+        )
+        monkeypatch.setattr(
+            "ucode.agents.prompt_yes_no_default",
+            lambda prompt, *, default: prompts.append((prompt, default)) or True,
+        )
+        errors = iter(["must upgrade", None])
+        monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: next(errors))
 
-        def fake_which(binary: str) -> str | None:
-            return f"/usr/bin/{binary}"
+        assert install_tool_binary(tool) is True
+        assert calls == [command]
+        assert prompts == [(f"Upgrade {TOOL_SPECS[tool]['display']} if available?", True)]
+
+    @pytest.mark.parametrize(
+        "catalog_ref",
+        [None, "/user/isaac-app-model-catalog.json"],
+        ids=["ug-catalog", "custom-catalog"],
+    )
+    def test_codex_update_detaches_only_ug_catalog_before_mutation(self, monkeypatch, catalog_ref):
+        shared_path = self._seed_codex_catalog_reference(catalog_ref)
+        calls = []
+
+        monkeypatch.setattr("ucode.agents.shutil.which", lambda binary: f"/usr/bin/{binary}")
+        monkeypatch.setattr("ucode.agents._too_new_downgrade", lambda _: None)
+        monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: None)
 
         def fake_run(args, **kwargs):
             calls.append(args)
+            contents = shared_path.read_text(encoding="utf-8")
+            if catalog_ref is None:
+                assert "model_catalog_json" not in contents
+            else:
+                assert f'model_catalog_json = "{catalog_ref}"' in contents
             return subprocess.CompletedProcess(args, 0)
 
-        monkeypatch.setattr("ucode.agents.shutil.which", fake_which)
         monkeypatch.setattr("ucode.agents.subprocess.run", fake_run)
-        monkeypatch.setattr("ucode.agents._required_update_message", lambda _: "must upgrade")
-        monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: None)
 
-        assert (
-            install_tool_binary(
-                "opencode",
-                strict=True,
-                update_existing=True,
-                prompt_optional_updates=False,
-            )
-            is True
+        assert agents_mod._update_installed_tool_binary("codex") is True
+        assert calls == [["codex", "update"]]
+
+    @pytest.mark.parametrize("installed", [False, True], ids=["install", "update"])
+    def test_codex_install_or_update_failure_leaves_catalog_detached(self, monkeypatch, installed):
+        shared_path = self._seed_codex_catalog_reference()
+
+        monkeypatch.setattr(
+            "ucode.agents.shutil.which",
+            lambda binary: f"/usr/bin/{binary}" if installed or binary == "npm" else None,
         )
-        assert calls and calls[0][:3] == ["npm", "install", "-g"]
+        monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: "must upgrade")
+        monkeypatch.setattr("ucode.agents._too_new_downgrade", lambda _: None)
+
+        def fail_run(args, **kwargs):
+            assert "model_catalog_json" not in shared_path.read_text(encoding="utf-8")
+            raise subprocess.CalledProcessError(1, args)
+
+        monkeypatch.setattr("ucode.agents.subprocess.run", fail_run)
+
+        if installed:
+            assert agents_mod._update_installed_tool_binary("codex") is False
+        else:
+            assert install_tool_binary("codex", strict=False) is False
+        assert "model_catalog_json" not in shared_path.read_text(encoding="utf-8")
+
+    def test_catalog_detach_failure_blocks_codex_binary_mutation(self, monkeypatch):
+        calls = []
+
+        monkeypatch.setattr("ucode.agents.shutil.which", lambda binary: f"/usr/bin/{binary}")
+        monkeypatch.setattr(
+            agents_mod.codex,
+            "detach_app_model_catalog",
+            lambda: (_ for _ in ()).throw(RuntimeError("cannot detach catalog")),
+        )
+        monkeypatch.setattr(
+            "ucode.agents.subprocess.run", lambda args, **kwargs: calls.append(args)
+        )
+
+        with pytest.raises(RuntimeError, match="cannot detach catalog"):
+            agents_mod._update_installed_tool_binary("codex")
+        assert calls == []
+
+    def test_claude_update_does_not_detach_codex_catalog(self, monkeypatch):
+        shared_path = self._seed_codex_catalog_reference()
+        calls = []
+
+        monkeypatch.setattr("ucode.agents.shutil.which", lambda binary: f"/usr/bin/{binary}")
+        monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: None)
+        monkeypatch.setattr(
+            "ucode.agents.subprocess.run",
+            lambda args, **kwargs: calls.append(args) or subprocess.CompletedProcess(args, 0),
+        )
+
+        assert agents_mod._update_installed_tool_binary("claude") is True
+        assert calls == [["claude", "upgrade"]]
+        assert "model_catalog_json" in shared_path.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("tool", ["claude", "codex"])
+    def test_required_update_declined_blocks_launch(self, monkeypatch, tool):
+        monkeypatch.setattr("ucode.agents.shutil.which", lambda binary: f"/usr/bin/{binary}")
+        monkeypatch.setattr("ucode.agents._too_new_downgrade", lambda _: None)
+        monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: "must upgrade")
+        monkeypatch.setattr("ucode.agents.prompt_yes_no_default", lambda prompt, *, default: False)
+        monkeypatch.setattr(
+            "ucode.agents._update_installed_tool_binary",
+            lambda _: pytest.fail("declined upgrade must not run"),
+        )
+
+        with pytest.raises(RuntimeError, match="must upgrade"):
+            install_tool_binary(tool)
+
+    def test_required_update_runs_without_prompt_for_npm_tools(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr("ucode.agents.shutil.which", lambda binary: f"/usr/bin/{binary}")
+        monkeypatch.setattr("ucode.agents._too_new_downgrade", lambda _: None)
+        monkeypatch.setattr(
+            "ucode.agents.subprocess.run",
+            lambda args, **kwargs: calls.append(args) or subprocess.CompletedProcess(args, 0),
+        )
+        monkeypatch.setattr(
+            "ucode.agents.prompt_yes_no_default",
+            lambda *a, **k: pytest.fail("npm-tool upgrades must not prompt"),
+        )
+        errors = iter(["must upgrade", None])
+        monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: next(errors))
+
+        assert install_tool_binary("opencode") is True
+        assert calls == [["npm", "install", "-g", "opencode-ai@1"]]
+
+    @pytest.mark.parametrize("update_succeeds", [False, True])
+    def test_required_update_must_clear_version_blocker(self, monkeypatch, update_succeeds):
+        monkeypatch.setattr("ucode.agents.shutil.which", lambda binary: f"/usr/bin/{binary}")
+        monkeypatch.setattr("ucode.agents._too_new_downgrade", lambda _: None)
+        monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: "still too old")
+        monkeypatch.setattr("ucode.agents.prompt_yes_no_default", lambda prompt, *, default: True)
+        monkeypatch.setattr("ucode.agents._update_installed_tool_binary", lambda _: update_succeeds)
+
+        with pytest.raises(RuntimeError, match="still too old"):
+            install_tool_binary("claude")
+
+    @pytest.mark.parametrize("tool", list(TOOL_SPECS))
+    def test_compatible_tool_does_not_check_update_or_prompt(self, monkeypatch, tool):
+        monkeypatch.setattr("ucode.agents.shutil.which", lambda binary: f"/usr/bin/{binary}")
+        monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: None)
+        monkeypatch.setattr("ucode.agents._too_new_downgrade", lambda _: None)
+        monkeypatch.setattr(
+            "ucode.agents.subprocess.run",
+            lambda *a, **k: pytest.fail("compatible agents must not check or install updates"),
+        )
+        monkeypatch.setattr("ucode.agents.prompt_yes_no", lambda _: pytest.fail("must not prompt"))
+
+        assert install_tool_binary(tool) is True
 
     def test_too_new_tool_warns_and_downgrades_on_confirm(self, monkeypatch, capsys):
         """An installed build past its supported ceiling is offered as a
@@ -474,7 +840,7 @@ class TestInstallToolBinary:
             "ucode.agents.prompt_yes_no", lambda prompt: prompt_calls.append(prompt) or True
         )
 
-        assert install_tool_binary("gemini", strict=False, update_existing=True) is True
+        assert install_tool_binary("gemini", strict=False) is True
         assert prompt_calls == ["Downgrade Gemini CLI from 0.45.0 to 0.44.1?"]
         assert calls == [["npm", "install", "-g", "@google/gemini-cli@0.44.1"]]
         out = capsys.readouterr().out
@@ -495,38 +861,7 @@ class TestInstallToolBinary:
         monkeypatch.setattr("ucode.agents.gemini.too_new_downgrade", lambda: ("0.45.0", "0.44.1"))
         monkeypatch.setattr("ucode.agents.prompt_yes_no", lambda prompt: False)
 
-        assert install_tool_binary("gemini", strict=False, update_existing=True) is True
-        assert calls == []
-        assert "newer than the latest version known to work" in capsys.readouterr().out
-
-    def test_too_new_tool_warns_without_prompt_when_updates_disabled(self, monkeypatch, capsys):
-        """With prompts suppressed we still warn, but never downgrade."""
-        calls: list[list[str]] = []
-
-        def fake_which(binary: str) -> str | None:
-            return f"/usr/bin/{binary}"
-
-        def fake_run(args, **kwargs):
-            calls.append(args)
-            return subprocess.CompletedProcess(args, 0)
-
-        monkeypatch.setattr("ucode.agents.shutil.which", fake_which)
-        monkeypatch.setattr("ucode.agents.subprocess.run", fake_run)
-        monkeypatch.setattr("ucode.agents.gemini.too_new_downgrade", lambda: ("0.45.0", "0.44.1"))
-        monkeypatch.setattr(
-            "ucode.agents.prompt_yes_no",
-            lambda prompt: (_ for _ in ()).throw(AssertionError("should not prompt")),
-        )
-
-        assert (
-            install_tool_binary(
-                "gemini",
-                strict=False,
-                update_existing=True,
-                prompt_optional_updates=False,
-            )
-            is True
-        )
+        assert install_tool_binary("gemini", strict=False) is True
         assert calls == []
         assert "newer than the latest version known to work" in capsys.readouterr().out
 
@@ -535,6 +870,25 @@ class TestInstallToolBinary:
 
         with pytest.raises(RuntimeError, match="OpenCode is not installed"):
             ensure_tool_binary_available("opencode")
+
+
+@pytest.mark.parametrize("tool", ["claude", "opencode", "copilot", "pi"])
+def test_fable_only_workspace_has_a_default(tool):
+    state = {
+        "claude_models": {"fable": "system.ai.claude-fable-5"},
+        "opencode_models": {"anthropic": ["system.ai.claude-fable-5"]},
+    }
+    assert check_gateway_endpoint(state, tool)
+    assert default_model_for_tool(tool, state) == "system.ai.claude-fable-5"
+
+
+@pytest.mark.parametrize("tool", ["copilot", "pi"])
+def test_fable_does_not_displace_existing_default(tool):
+    state = {
+        "claude_models": {"fable": "system.ai.claude-fable-5"},
+        "codex_models": ["existing-gpt"],
+    }
+    assert default_model_for_tool(tool, state) == "existing-gpt"
 
 
 class TestConfigureSelectedTools:
@@ -547,7 +901,9 @@ class TestConfigureSelectedTools:
             yield
 
         monkeypatch.setattr(agents_mod, "managed_write_batch", capture_batch)
-        monkeypatch.setattr(agents_mod, "_configure_one", lambda tool, state, provider: state)
+        monkeypatch.setattr(
+            agents_mod, "_configure_one", lambda tool, state, provider, **kwargs: state
+        )
         monkeypatch.setattr(agents_mod, "save_state", lambda state: None)
         monkeypatch.setattr(agents_mod, "install_databricks_ai_tools_for_agents", lambda *_: None)
 
@@ -589,81 +945,65 @@ class TestConfigureSelectedTools:
         result = configure_selected_tools(state, [])
         assert result["available_tools"] == ["codex"]
 
+    def test_one_tool_failing_warns_and_configures_the_rest(self, monkeypatch):
+        warnings: list[str] = []
+        installed: list[list[str]] = []
 
-class TestValidateAllToolsVerbosity:
-    def _run(self, monkeypatch, capsys):
-        from contextlib import nullcontext
+        def configure_one(tool, state, provider, **kwargs):
+            if tool == "codex":
+                raise RuntimeError("boom")
+            return state
 
-        monkeypatch.setattr(agents_mod, "validate_tool", lambda tool: (True, ""))
+        monkeypatch.setattr(agents_mod, "_configure_one", configure_one)
         monkeypatch.setattr(agents_mod, "save_state", lambda s: None)
-        monkeypatch.setattr(agents_mod, "spinner", lambda *_a, **_kw: nullcontext())
-        agents_mod.validate_all_tools({"available_tools": ["codex"], "managed_configs": {}})
-        return capsys.readouterr().out
+        monkeypatch.setattr(agents_mod, "print_warning", warnings.append)
+        monkeypatch.setattr(
+            agents_mod,
+            "install_databricks_ai_tools_for_agents",
+            lambda tools, _: installed.append(tools),
+        )
 
-    def test_normal_verbosity_renders_panels(self, monkeypatch, capsys):
-        import ucode.ui as ui_mod
+        result = configure_selected_tools({"workspace": "w"}, ["codex", "claude"])
 
-        monkeypatch.setattr(ui_mod, "_verbosity", "normal")
-        out = self._run(monkeypatch, capsys)
-        assert "Testing each tool with a quick message" in out
-        assert "Ready" in out
-        assert "Codex is working" in out
+        # The broken agent is skipped, the healthy one still configures.
+        assert result["available_tools"] == ["claude"]
+        assert result["last_configured_tools"] == ["claude"]
+        assert installed == [["claude"]]
+        assert warnings == ["Could not configure Codex: boom. Continuing."]
 
-    def test_low_verbosity_omits_panels(self, monkeypatch, capsys):
-        import ucode.ui as ui_mod
+    def test_all_tools_failing_does_not_raise(self, monkeypatch):
+        monkeypatch.setattr(
+            agents_mod,
+            "_configure_one",
+            lambda tool, state, provider, **kwargs: (_ for _ in ()).throw(RuntimeError("nope")),
+        )
+        monkeypatch.setattr(agents_mod, "save_state", lambda s: None)
+        monkeypatch.setattr(agents_mod, "print_warning", lambda _: None)
+        monkeypatch.setattr(agents_mod, "install_databricks_ai_tools_for_agents", lambda *_: None)
 
-        monkeypatch.setattr(ui_mod, "_verbosity", "low")
-        out = self._run(monkeypatch, capsys)
-        assert "Validating..." in out
-        assert "Testing each tool with a quick message" not in out
-        assert "Ready" not in out
-        # Per-tool success line is still printed.
-        assert "Codex is working" in out
+        state = {"workspace": "w", "available_tools": ["gemini"]}
+        result = configure_selected_tools(state, ["codex", "claude"])
+
+        # Nothing new configured; a previously-available tool is untouched.
+        assert result["available_tools"] == ["gemini"]
 
 
-class TestValidateTool:
-    def test_runs_validate_command_with_stdin_devnull(self, monkeypatch):
-        # Regression guard: the validation smoke test must never inherit the
-        # caller's stdin, or it hangs to the timeout when ucode is launched
-        # from a non-interactive parent whose stdin is an open pipe.
-        captured: dict = {}
+class TestConfiguredPaths:
+    def test_claude_reports_its_settings_file_home_abbreviated(self):
+        from ucode.agents import configured_paths
+        from ucode.agents.claude import CLAUDE_SETTINGS_PATH
 
-        def fake_run(cmd, **kwargs):
-            captured["cmd"] = cmd
-            captured["kwargs"] = kwargs
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        paths = configured_paths("claude", {})
+        assert paths == [
+            str(CLAUDE_SETTINGS_PATH).replace(str(CLAUDE_SETTINGS_PATH.home()), "~", 1)
+        ]
+        assert paths[0].startswith("~/")
 
-        monkeypatch.setattr("ucode.agents.subprocess.run", fake_run)
-        monkeypatch.setattr(agents_mod, "load_state", lambda: {})
+    def test_appends_os_managed_file_recorded_in_state(self):
+        from ucode.agents import configured_paths
+        from ucode.agents.codex import CODEX_CONFIG_PATH
 
-        ok, err = agents_mod.validate_tool("codex")
-
-        assert ok is True
-        assert err == ""
-        assert captured["kwargs"].get("stdin") is subprocess.DEVNULL
-
-    def test_reports_timed_out_on_timeout(self, monkeypatch):
-        def fake_run(cmd, **kwargs):
-            raise subprocess.TimeoutExpired(cmd, 60)
-
-        monkeypatch.setattr("ucode.agents.subprocess.run", fake_run)
-        monkeypatch.setattr(agents_mod, "load_state", lambda: {})
-
-        ok, err = agents_mod.validate_tool("codex")
-
-        assert ok is False
-        assert err == "timed out"
-
-    def test_relayed_claude_skips_live_probe(self, monkeypatch):
-        # Relayed configs have no proxy/login at validation time; probing them
-        # with a live message would hang, so validation must trust the config.
-        def fail_run(cmd, **kwargs):
-            raise AssertionError("relayed validation must not run a subprocess")
-
-        monkeypatch.setattr("ucode.agents.subprocess.run", fail_run)
-        monkeypatch.setattr(agents_mod, "load_state", lambda: {"claude_relayed": True})
-
-        ok, err = agents_mod.validate_tool("claude")
-
-        assert ok is True
-        assert err == ""
+        state = {"managed_file_fingerprints": {"codex": {"path": "/etc/codex/managed_config.toml"}}}
+        paths = configured_paths("codex", state)
+        assert str(CODEX_CONFIG_PATH).replace(str(CODEX_CONFIG_PATH.home()), "~", 1) in paths
+        assert "/etc/codex/managed_config.toml" in paths

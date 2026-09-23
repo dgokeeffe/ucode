@@ -24,7 +24,7 @@ class TestOpencodeSpec:
         assert opencode.SPEC["binary"] == "opencode"
 
     def test_package(self):
-        assert opencode.SPEC["package"] == "opencode-ai"
+        assert opencode.SPEC["package"] == "opencode-ai@1"
 
     def test_display(self):
         assert opencode.SPEC["display"] == "OpenCode"
@@ -33,6 +33,50 @@ class TestOpencodeSpec:
         assert opencode.SPEC["config_path"] == (
             opencode.OPENCODE_XDG_CONFIG_HOME / "opencode" / "opencode.json"
         )
+
+    def test_requires_version_with_custom_provider_fetch(self, monkeypatch):
+        monkeypatch.setattr(opencode, "agent_version", lambda _binary: "1.0.219")
+
+        message = opencode.minimum_version_error()
+
+        assert message is not None
+        assert "requires OpenCode 1.0.220 or newer" in message
+        assert "npm install -g opencode-ai@1" in message
+
+    def test_supported_version_needs_no_required_update(self, monkeypatch):
+        monkeypatch.setattr(opencode, "agent_version", lambda _binary: "1.0.220")
+
+        assert opencode.minimum_version_error() is None
+
+
+class TestAuthPlugin:
+    def test_calls_cross_platform_auth_token_helper_only_when_refreshing(self, monkeypatch):
+        monkeypatch.setattr("ucode.databricks.shutil.which", lambda command: f"/opt/{command}")
+
+        plugin = opencode.render_auth_plugin({"workspace": WS, "profile": "my profile"})
+
+        assert (
+            'const AUTH_COMMAND = ["/opt/ug", "auth-token", "--host", '
+            f'"{WS}", "--profile", "my profile", "--force-refresh"]'
+        ) in plugin
+        assert "run(AUTH_COMMAND[0], AUTH_COMMAND.slice(1)" in plugin
+        assert '"chat.headers"' not in plugin
+
+    def test_installs_cached_refreshing_fetch_on_databricks_providers(self):
+        plugin = opencode.render_auth_plugin({"workspace": WS})
+
+        assert "config: async (config)" in plugin
+        assert "options.fetch = databricksFetch" in plugin
+        assert "expiresAt <= Date.now() + REFRESH_SKEW_MS" in plugin
+        assert 'headers.set("Authorization", "Bearer " + token)' in plugin
+        assert "if (response.status !== 401) return response" in plugin
+        assert "return fetch(input, requestWithToken(input, init, accessToken))" in plugin
+
+    def test_refresh_is_single_flighted(self):
+        plugin = opencode.render_auth_plugin({"workspace": WS})
+
+        assert "if (!refreshPromise)" in plugin
+        assert "mintToken().finally(() => { refreshPromise = undefined })" in plugin
 
 
 class TestRenderOverlay:
@@ -237,7 +281,7 @@ class TestRenderOverlay:
     def test_user_agent_header_anthropic(self, monkeypatch):
         # UA must live at the per-model level — OpenCode clobbers
         # provider-level `headers["User-Agent"]` in session/llm.ts.
-        monkeypatch.setattr(opencode, "ucode_version", lambda: "0.1.0")
+        monkeypatch.setattr(opencode, "ug_version", lambda: "0.1.0")
         monkeypatch.setattr(opencode, "agent_version", lambda binary: "0.74.0")
         models = {"anthropic": ["claude-sonnet"]}
         overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
@@ -247,7 +291,7 @@ class TestRenderOverlay:
         assert model_headers["User-Agent"] == "ucode/0.1.0 opencode/0.74.0"
 
     def test_user_agent_header_gemini(self, monkeypatch):
-        monkeypatch.setattr(opencode, "ucode_version", lambda: "0.1.0")
+        monkeypatch.setattr(opencode, "ug_version", lambda: "0.1.0")
         monkeypatch.setattr(opencode, "agent_version", lambda binary: "0.74.0")
         models = {"gemini": ["gemini-2"]}
         overlay, _ = opencode.render_overlay("gemini-2", "tok", _base_urls(), models)
@@ -626,6 +670,10 @@ class TestWriteToolConfigStaleProviderCleanup:
         assert "databricks-oss" not in providers
         # Unmanaged provider entries survive.
         assert providers.get("other-provider") == {"keep": True}
+        # OpenCode 1.0.0 discovers `plugin/`; plural `plugins/` came later.
+        plugin = config_file.parent / "plugin" / opencode.OPENCODE_AUTH_PLUGIN_PATH.name
+        assert plugin.exists()
+        assert "options.fetch = databricksFetch" in plugin.read_text()
 
     def test_config_written_with_correct_model(self, tmp_path, monkeypatch):
         import ucode.agents.opencode as oc_mod
