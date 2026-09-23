@@ -282,7 +282,66 @@ def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
             "xhigh": "xhigh",
             "max": None,
         }
+    elif normalized_id == "gpt-6-astra":
+        # Astra is reasoning-only. Its supported effort values are
+        # low/medium/high/xhigh/max; suppress Pi's off/minimal choices rather
+        # than sending values the gateway does not support.
+        entry["reasoning"] = True
+        entry["input"] = ["text", "image"]
+        entry["thinkingLevelMap"] = {
+            "off": None,
+            "minimal": None,
+            "xhigh": "xhigh",
+            "max": "max",
+        }
+    elif normalized_id.startswith(("gpt-6-sol", "gpt-6-luna")):
+        # GPT-6 Sol and Luna support the full none/low/medium/high/xhigh/max
+        # effort range (unlike Astra, which has no `none`). Pi's `minimal` is
+        # not an API value, so it stays suppressed.
+        entry["reasoning"] = True
+        entry["input"] = ["text", "image"]
+        entry["thinkingLevelMap"] = {
+            "off": "none",
+            "minimal": None,
+            "xhigh": "xhigh",
+            "max": "max",
+        }
+    elif normalized_id.startswith("gpt-5-6-") or (
+        normalized_id.startswith("gpt-5-5") and not normalized_id.startswith("gpt-5-5-pro")
+    ):
+        # GPT-5.5 and GPT-5.6 support none/low/medium/high/xhigh; GPT-5.6
+        # additionally supports max. Pi's minimal level is not an API value.
+        entry["reasoning"] = True
+        entry["input"] = ["text", "image"]
+        entry["thinkingLevelMap"] = {
+            "off": "none",
+            "minimal": None,
+            "xhigh": "xhigh",
+        }
+        if normalized_id.startswith("gpt-5-6-"):
+            entry["thinkingLevelMap"]["max"] = "max"
+    elif normalized_id.startswith(("gpt-5-4-pro", "gpt-5-5-pro")):
+        # Pro variants support medium/high/xhigh only.
+        entry["reasoning"] = True
+        entry["input"] = ["text", "image"]
+        entry["thinkingLevelMap"] = {
+            "off": None,
+            "minimal": None,
+            "low": None,
+            "xhigh": "xhigh",
+        }
+    elif normalized_id.startswith(("gpt-5-4",)):
+        # GPT-5.4 standard/mini/nano support none/low/medium/high/xhigh.
+        entry["reasoning"] = True
+        entry["input"] = ["text", "image"]
+        entry["thinkingLevelMap"] = {
+            "off": "none",
+            "minimal": None,
+            "xhigh": "xhigh",
+        }
     elif "gpt-5" in normalized_id:
+        # Older GPT-5 variants reject the Responses API's `none` value. Keep
+        # Pi's established minimal/low/medium/high choices for these models.
         entry["reasoning"] = True
         entry["input"] = ["text", "image"]
         entry["thinkingLevelMap"] = {"off": None}

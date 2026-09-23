@@ -98,6 +98,39 @@ class TestRenderOverlayProviders:
         assert entry["reasoning"] is True
         assert entry["input"] == ["text", "image"]
 
+    def test_gpt6_astra_exposes_supported_thinking_levels(self):
+        overlay, _ = _overlay("system.ai.gpt-6-astra", codex_models=["system.ai.gpt-6-astra"])
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+
+        assert entry["reasoning"] is True
+        assert entry["input"] == ["text", "image"]
+        assert entry["thinkingLevelMap"] == {
+            "off": None,
+            "minimal": None,
+            "xhigh": "xhigh",
+            "max": "max",
+        }
+
+    @pytest.mark.parametrize("family", ["sol", "luna"])
+    def test_gpt6_sol_and_luna_expose_full_effort_range(self, family):
+        # Regression: these matched no branch at all, so Pi received a 128k
+        # window, no `reasoning`, and no image input. Sol/Luna support the full
+        # none..max range, unlike Astra which has no `none`.
+        model_id = f"system.ai.gpt-6-{family}"
+        overlay, _ = _overlay(model_id, codex_models=[model_id])
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+
+        assert entry["contextWindow"] == 1_050_000
+        assert entry["maxTokens"] == 128_000
+        assert entry["reasoning"] is True
+        assert entry["input"] == ["text", "image"]
+        assert entry["thinkingLevelMap"] == {
+            "off": "none",
+            "minimal": None,
+            "xhigh": "xhigh",
+            "max": "max",
+        }
+
     def test_gpt_entries_pin_off_thinking_level_to_none(self):
         # `reasoning: True` without an off-state makes Pi send
         # `reasoning: {effort: "none"}`, which gpt-5 / -mini / -nano / -5-5-pro
@@ -109,14 +142,51 @@ class TestRenderOverlayProviders:
                 "system.ai.gpt-5-mini",
                 "system.ai.gpt-5-nano",
                 "system.ai.gpt-5-5-pro",
-                "system.ai.gpt-5-6-luna",
             ],
         )
         entries = overlay["providers"]["databricks-openai"]["models"]
         assert entries, "expected gpt entries"
         for entry in entries:
             assert entry["reasoning"] is True
-            assert entry["thinkingLevelMap"] == {"off": None}, entry["id"]
+            if entry["id"] == "system.ai.gpt-5-5-pro":
+                assert entry["thinkingLevelMap"] == {
+                    "off": None,
+                    "minimal": None,
+                    "low": None,
+                    "xhigh": "xhigh",
+                }
+            else:
+                assert entry["thinkingLevelMap"] == {"off": None}, entry["id"]
+
+    def test_newer_gpt_models_use_their_responses_effort_values(self):
+        overlay, _ = _overlay(
+            "system.ai.gpt-5-6-luna",
+            codex_models=[
+                "system.ai.gpt-5-4",
+                "system.ai.gpt-5-5",
+                "system.ai.gpt-5-6-luna",
+            ],
+        )
+        entries = {
+            entry["id"]: entry for entry in overlay["providers"]["databricks-openai"]["models"]
+        }
+
+        assert entries["system.ai.gpt-5-4"]["thinkingLevelMap"] == {
+            "off": "none",
+            "minimal": None,
+            "xhigh": "xhigh",
+        }
+        assert entries["system.ai.gpt-5-5"]["thinkingLevelMap"] == {
+            "off": "none",
+            "minimal": None,
+            "xhigh": "xhigh",
+        }
+        assert entries["system.ai.gpt-5-6-luna"]["thinkingLevelMap"] == {
+            "off": "none",
+            "minimal": None,
+            "xhigh": "xhigh",
+            "max": "max",
+        }
 
     def test_non_gpt_codex_entry_has_no_thinking_level_map(self):
         # Only the gpt-5 family declares `reasoning`, so only it needs the

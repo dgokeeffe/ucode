@@ -388,6 +388,9 @@ def render_overlay(
                 "baseURL": opencode_base_urls["oss"],
                 "apiKey": token,
                 "headers": auth_headers,
+                # OpenCode otherwise adds `prompt_cache_key`, which the MLflow
+                # chat-completions gateway rejects as an unknown field.
+                "setCacheKey": False,
             },
             "models": {m: _oss_model_overlay(m, ua_header, specs_by_id.get(m)) for m in oss_models},
         }

@@ -271,10 +271,11 @@ class TestBuildOtelTracesEndpoint:
 
 
 class TestBuildOpencodeBaseUrls:
-    def test_returns_anthropic_gemini_and_oss(self):
+    def test_returns_anthropic_gemini_openai_and_oss(self):
         urls = build_opencode_base_urls(WS)
         assert urls["anthropic"] == f"{WS}/ai-gateway/anthropic/v1"
         assert urls["gemini"] == f"{WS}/ai-gateway/gemini/v1beta"
+        assert urls["openai"] == f"{WS}/ai-gateway/openai/v1"
         assert urls["oss"] == f"{WS}/ai-gateway/mlflow/v1"
 
     def test_returns_native_openai_gateway(self):
@@ -496,6 +497,36 @@ class TestModelTokenLimits:
 
 
 class TestGptModelTokenLimits:
+    def test_gpt6_astra_uses_documented_limits(self):
+        assert db_mod.gpt_model_token_limits("system.ai.gpt-6-astra") == {
+            "context": 1_050_000,
+            "output": 128_000,
+        }
+
+    @pytest.mark.parametrize("family", ["sol", "luna"])
+    def test_gpt6_sol_and_luna_serve_1m_context_across_id_forms(self, family):
+        # Regression: these matched no family entry and silently inherited the
+        # conservative 128k fallback, so Pi advertised a 128k window for a
+        # documented 1.05M-context model.
+        for model_id in (
+            f"gpt-6-{family}",
+            f"system.ai.gpt-6-{family}",
+            f"databricks-gpt-6-{family}",
+            f"databricks-openai/gpt-6-{family}",
+        ):
+            assert db_mod.gpt_model_token_limits(model_id) == {
+                "context": 1_050_000,
+                "output": 128_000,
+            }
+
+    def test_unknown_gpt6_variant_inherits_the_family_window(self):
+        # The bare `gpt-6` floor keeps a newly shipped variant off the 128k
+        # fallback until it gets its own entry.
+        assert db_mod.gpt_model_token_limits("system.ai.gpt-6-nova") == {
+            "context": 1_050_000,
+            "output": 128_000,
+        }
+
     def test_gpt56_sol_serves_1m_context_across_id_forms(self):
         for model_id in (
             "gpt-5.6-sol",
@@ -528,7 +559,7 @@ class TestGptModelTokenLimits:
 
     @pytest.mark.parametrize(
         "model_id",
-        ["gpt-5.40", "gpt-4.10", "gpt-6-turbo"],
+        ["gpt-5.40", "gpt-4.10", "gpt-7-turbo"],
     )
     def test_unknown_specific_gpt_uses_family_or_conservative_fallback(self, model_id):
         expected = (
