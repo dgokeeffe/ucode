@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -133,7 +134,56 @@ def _expected_ua(agent_name: str, binary: str) -> str:
 def _assert_ua(req: _CapturedRequest, expected: str) -> None:
     # http.server lowercases header lookup keys; check both common spellings.
     ua = req.headers.get("User-Agent") or req.headers.get("user-agent")
-    assert ua == expected, f"User-Agent mismatch.\n  got:      {ua!r}\n  expected: {expected!r}"
+    # Agent SDKs append their own product tokens (e.g. OpenCode's AI SDK adds
+    # `ai-sdk/provider-utils/x.y.z runtime/bun/a.b.c`). RFC 9110 allows that, so
+    # assert our token leads the header rather than requiring an exact match.
+    assert ua is not None, "no User-Agent header reached the gateway"
+    assert ua.startswith(expected), (
+        f"User-Agent mismatch.\n  got:             {ua!r}\n  expected prefix: {expected!r}"
+    )
+
+
+def _skip_if_managed_base_url_overrides_env() -> None:
+    """Skip when an OS-managed Claude settings file pins ``ANTHROPIC_BASE_URL``.
+
+    Managed settings are Claude Code's highest-precedence tier — above the
+    ``--settings`` file and above process environment — so on a machine with a
+    managed deployment (root-owned
+    ``/Library/Application Support/ClaudeCode/managed-settings.json``) the agent
+    talks to the pinned workspace gateway and no request can ever reach a local
+    capture server. That is correct product behavior, so assert nothing here
+    rather than reporting a failure the test cannot influence.
+    """
+    from ucode.agents.claude import _managed_settings_path
+
+    path = _managed_settings_path()
+    if path is None or not path.is_file():
+        return
+    try:
+        managed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    env = managed.get("env")
+    pinned = env.get("ANTHROPIC_BASE_URL") if isinstance(env, dict) else None
+    if isinstance(pinned, str) and pinned.strip():
+        pytest.skip(
+            "OS-managed Claude settings pin ANTHROPIC_BASE_URL to "
+            f"{pinned!r}, which outranks the --settings file and process env, "
+            "so the agent cannot be pointed at the local capture server."
+        )
+
+
+def _settings_without_key_helper(overlay: dict) -> dict:
+    """Drop ``apiKeyHelper`` so Claude uses the bearer the test supplies.
+
+    The helper shells out to a real ``ug auth-token --host <capture server>``.
+    Against the fake gateway that call has no cached credential, so it spends
+    ~34s in the Databricks CLI and fails; Claude then retries it instead of
+    ever issuing the request under test. These tests assert on outbound
+    headers, not credential acquisition, so the bearer comes from
+    ``ANTHROPIC_AUTH_TOKEN`` in the environment instead.
+    """
+    return {key: value for key, value in overlay.items() if key != "apiKeyHelper"}
 
 
 def _header(req: _CapturedRequest, name: str) -> str | None:
@@ -143,26 +193,73 @@ def _header(req: _CapturedRequest, name: str) -> str | None:
     return None
 
 
+class _AgentRun:
+    """The outcome of spawning an agent until its first gateway request."""
+
+    def __init__(self, returncode: int | None, stdout: bytes, stderr: bytes) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 def _run_until_first_request(
-    cmd: list[str], env: dict[str, str], timeout: int = 20
-) -> subprocess.CompletedProcess | None:
-    """Spawn the agent. We only need it to fire its first HTTP request; some
-    agents retry on 401 indefinitely. Swallow timeouts — the capture server
-    has what we need by then. Returns the CompletedProcess (or None on
-    timeout) so callers can surface stderr on failure."""
+    cmd: list[str],
+    env: dict[str, str],
+    timeout: int = 180,
+    *,
+    server: _CaptureServer | None = None,
+    path_prefix: str | None = None,
+) -> _AgentRun:
+    """Spawn the agent and stop as soon as its first gateway request lands.
+
+    These agents do not exit after issuing their request — they sit in a session
+    loop waiting on the (fake) gateway's streamed reply. Waiting for process exit
+    therefore always burned the full timeout and then reported "timed out before
+    any request", even though the request had already arrived. Poll the capture
+    server instead, then terminate the agent.
+
+    The timeout is generous because a cold start is slow: OpenCode keeps a
+    per-directory session database under ``~/.local/share/opencode`` and indexes
+    the workspace before its first model call, which measured ~60s from a clean
+    state. The poll exits as soon as the request arrives, so a warm run stays
+    fast and only a genuine failure pays the full wait.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+    )
     try:
-        return subprocess.run(
-            cmd,
-            env=env,
-            capture_output=True,
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
-        )
-    except subprocess.TimeoutExpired:
-        return None
+        if server is not None and path_prefix is not None:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if server.first_request_with_path_prefix(path_prefix) is not None:
+                    break
+                if proc.poll() is not None:
+                    # Exited on its own (e.g. a config error): stop waiting and
+                    # let the caller surface stdout/stderr.
+                    break
+                time.sleep(0.05)
+        else:
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        stdout, stderr = proc.communicate()
+    return _AgentRun(proc.returncode, stdout or b"", stderr or b"")
 
 
-def _no_request_msg(server: _CaptureServer, result: subprocess.CompletedProcess | None) -> str:
+def _no_request_msg(server: _CaptureServer, result: _AgentRun | None) -> str:
     if result is None:
         return "Agent timed out before any request reached the capture server."
     stderr = (result.stderr or b"").decode(errors="replace")[:600]
@@ -187,6 +284,7 @@ class TestClaudeUserAgent:
         from ucode.agents import claude
 
         _require_binary("claude")
+        _skip_if_managed_base_url_overrides_env()
         config_dir = tmp_path / "claude_config"
         config_dir.mkdir()
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
@@ -197,15 +295,28 @@ class TestClaudeUserAgent:
         # render_overlay just builds the env block; we write it ourselves to
         # avoid the apiKeyHelper / save_state plumbing.
         overlay, _ = claude.render_overlay(capture_server.base_url, "test-model")
-        claude.CLAUDE_SETTINGS_PATH.write_text(json.dumps(overlay), encoding="utf-8")
+        claude.CLAUDE_SETTINGS_PATH.write_text(
+            json.dumps(_settings_without_key_helper(overlay)), encoding="utf-8"
+        )
         env = {
             **os.environ,
             "CLAUDE_CONFIG_DIR": str(config_dir),
-            "ANTHROPIC_API_KEY": "test-key-not-real",
+            # ANTHROPIC_AUTH_TOKEN, not ANTHROPIC_API_KEY: Claude Code ignores the
+            # latter when a subscription credential is in the OS keychain and
+            # answers via api.anthropic.com, so the request never reaches the
+            # capture server and the assertion fails on a developer machine that
+            # is logged in. The bearer form is also what the real launch path
+            # supplies through `apiKeyHelper`.
+            "ANTHROPIC_AUTH_TOKEN": "test-token-not-real",
             **overlay["env"],
         }
 
-        result = _run_until_first_request(claude.validate_cmd("claude"), env)
+        result = _run_until_first_request(
+            claude.validate_cmd("claude"),
+            env,
+            server=capture_server,
+            path_prefix="/ai-gateway/anthropic",
+        )
 
         req = capture_server.first_request_with_path_prefix("/ai-gateway/anthropic")
         assert req is not None, _no_request_msg(capture_server, result)
@@ -216,6 +327,7 @@ class TestClaudeUserAgent:
         from ucode.agents import claude
 
         _require_binary("claude")
+        _skip_if_managed_base_url_overrides_env()
         config_dir = tmp_path / "claude_config"
         config_dir.mkdir()
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
@@ -227,15 +339,24 @@ class TestClaudeUserAgent:
             "test-model",
             managed_http_headers={"x-databricks-workspace": "eng-ml-inference"},
         )
-        claude.CLAUDE_SETTINGS_PATH.write_text(json.dumps(overlay), encoding="utf-8")
+        claude.CLAUDE_SETTINGS_PATH.write_text(
+            json.dumps(_settings_without_key_helper(overlay)), encoding="utf-8"
+        )
         env = {
             **os.environ,
             "CLAUDE_CONFIG_DIR": str(config_dir),
-            "ANTHROPIC_API_KEY": "test-key-not-real",
+            # See the sibling test: ANTHROPIC_API_KEY loses to a keychain
+            # subscription credential, which bypasses ANTHROPIC_BASE_URL.
+            "ANTHROPIC_AUTH_TOKEN": "test-token-not-real",
             **overlay["env"],
         }
 
-        result = _run_until_first_request(claude.validate_cmd("claude"), env)
+        result = _run_until_first_request(
+            claude.validate_cmd("claude"),
+            env,
+            server=capture_server,
+            path_prefix="/ai-gateway/anthropic",
+        )
 
         req = capture_server.first_request_with_path_prefix("/ai-gateway/anthropic")
         assert req is not None, _no_request_msg(capture_server, result)
@@ -267,7 +388,12 @@ class TestCodexUserAgent:
             "CODEX_HOME": str(config_dir),
             "OPENAI_API_KEY": "test-key-not-real",
         }
-        result = _run_until_first_request(codex.validate_cmd("codex"), env)
+        result = _run_until_first_request(
+            codex.validate_cmd("codex"),
+            env,
+            server=capture_server,
+            path_prefix="/ai-gateway/codex",
+        )
 
         req = capture_server.first_request_with_path_prefix("/ai-gateway/codex")
         assert req is not None, _no_request_msg(capture_server, result)
@@ -300,7 +426,12 @@ class TestCodexUserAgent:
             "CODEX_HOME": str(config_dir),
             "OPENAI_API_KEY": "test-key-not-real",
         }
-        result = _run_until_first_request(codex.validate_cmd("codex"), env)
+        result = _run_until_first_request(
+            codex.validate_cmd("codex"),
+            env,
+            server=capture_server,
+            path_prefix="/ai-gateway/codex",
+        )
 
         req = capture_server.first_request_with_path_prefix("/ai-gateway/codex")
         assert req is not None, _no_request_msg(capture_server, result)
@@ -344,7 +475,12 @@ class TestOpencodeUserAgent:
             opencode.write_tool_config(state, "test-claude-model", token="test-token")
 
         env = {**os.environ, "OAUTH_TOKEN": "test-token", "XDG_CONFIG_HOME": str(xdg)}
-        result = _run_until_first_request(opencode.validate_cmd("opencode"), env)
+        result = _run_until_first_request(
+            opencode.validate_cmd("opencode"),
+            env,
+            server=capture_server,
+            path_prefix="/ai-gateway/anthropic",
+        )
 
         req = capture_server.first_request_with_path_prefix("/ai-gateway/anthropic")
         assert req is not None, _no_request_msg(capture_server, result)
@@ -377,7 +513,12 @@ class TestGeminiUserAgent:
         monkeypatch.chdir(tmp_path)
 
         env = gemini.build_runtime_env(capture_server.base_url, "test-model", "test-token")
-        result = _run_until_first_request(gemini.validate_cmd("gemini"), env)
+        result = _run_until_first_request(
+            gemini.validate_cmd("gemini"),
+            env,
+            server=capture_server,
+            path_prefix="/ai-gateway/gemini",
+        )
 
         req = capture_server.first_request_with_path_prefix("/ai-gateway/gemini")
         assert req is not None, _no_request_msg(capture_server, result)
@@ -426,7 +567,12 @@ class TestPiUserAgent:
         # bearer short-circuit gives that command something to print without a
         # real workspace behind the capture server.
         env["DATABRICKS_BEARER"] = "test-token"
-        result = _run_until_first_request(pi.validate_cmd("pi"), env)
+        result = _run_until_first_request(
+            pi.validate_cmd("pi"),
+            env,
+            server=capture_server,
+            path_prefix="/ai-gateway/anthropic",
+        )
 
         req = capture_server.first_request_with_path_prefix("/ai-gateway/anthropic")
         assert req is not None, _no_request_msg(capture_server, result)
