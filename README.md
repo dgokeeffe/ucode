@@ -1,396 +1,217 @@
-# Unity AI Gateway Coding CLI (ucode)
+# Unity Gateway (`ug`)
 
-`ucode` is a lightweight launcher for running Codex, Claude Code, Gemini CLI, OpenCode, GitHub Copilot CLI, and Pi through Databricks.
+Unity Gateway runs coding agents through Databricks AI Gateway. It configures
+Codex, Claude Code, Gemini CLI, OpenCode, GitHub Copilot CLI, and Pi, and can
+register Databricks MCP servers for Cursor Agent.
+
+The command is `ug`. Existing `ucode` commands remain supported, and the Python
+package is still named `ucode` for compatibility.
 
 ## Requirements
 
-- Python 3.12+ — install with `uv` ([uv.astral.sh](https://docs.astral.sh/uv/getting-started/installation/))
-- `npm` if tool CLIs need to be installed automatically
+- Python 3.12+
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
+- `npm`, when an agent CLI needs automatic installation
 
-## Installation
-
-```bash
-uv tool install git+https://github.com/databricks/ucode
-```
-
-Check your version with `ucode --version`. Between releases this looks like
-`0.1.0+14.g93986a8` — the trailing `g<hash>` is the exact commit the build came
-from, so include it when reporting a bug.
-
----
-
-## Usage
-
-Just run the tool you want:
+## Install
 
 ```bash
-ucode codex      # OpenAI Codex
-ucode claude     # Claude Code
-ucode gemini     # Gemini CLI
-ucode opencode   # OpenCode
-ucode copilot    # GitHub Copilot CLI
-ucode pi         # Pi
-ucode cursor     # Cursor Agent (MCP only — see below)
+uv tool install git+https://github.com/databricks/unity-gateway
+ug --version
 ```
 
-On first launch, `ucode` will prompt for your Databricks workspace URL, authenticate, and configure that tool automatically. Subsequent Claude and Codex launches use the generated local settings directly. Use `ucode claude --refresh` or `ucode codex --refresh` when you want to re-check Databricks and update the model/configuration.
+### Migrating from ucode
 
-Pass flags directly to the underlying tool:
+Reinstall under the new distribution name:
 
 ```bash
-ucode claude -r          # resume last session
-ucode codex --full-auto
+uv tool uninstall ucode
+uv tool install git+https://github.com/databricks/unity-gateway
+ug --version
+ucode --version
 ```
 
-All agents route through Databricks AI Gateway using your workspace credentials — no API keys required.
+Future upgrades can use `ug upgrade` or `uv tool upgrade unity-gateway`.
 
-Smart routing is opt-in for Codex and Claude Code. Enabling it for a launch asks the AI Gateway
-router to select models for that session and its subagents. Codex may require one-time review of
-the launch-scoped hooks through `/hooks`.
+## Launch Agents
+
+Run the tool you want:
 
 ```bash
-ucode codex --enable-smart-routing
-ucode claude --enable-smart-routing
+ug codex
+ug claude
+ug gemini
+ug opencode
+ug copilot
+ug pi
+ug cursor   # Cursor Agent, MCP-only
 ```
 
-The flag applies only to that launch; later launches use normal model selection unless the flag is
-passed again.
+On first launch of a model-backed agent, `ug` prompts for a Databricks
+workspace, authenticates, and writes local agent config. Later launches reuse
+the saved workspace and credentials.
 
-To configure all tools at once:
+Without a managed workspace config, `ug claude` automatically discovers gateway
+models for Claude Code's `/model` picker. Discovery defaults to `system.ai` when
+no provider or model location is selected. Use `--provider` or `--model-location`
+to select another model source; managed workspace configs control their own sources.
+
+`ug codex` validates discovered models with the installed Codex binary and publishes
+them to `~/.ucode/codex-model-catalog.json`, referenced by shared `~/.codex/config.toml`
+for Codex App. Managed static lists use the same path during `ug configure`. The
+latest refresh supplies the app's catalog; custom catalogs (including Isaac's) and
+custom providers are preserved. The app's gateway provider and authentication must
+already be configured. Validation covers the local Codex binary.
+
+Codex loads the catalog at app-server startup. When ug reports a catalog change,
+finish active tasks, restart the app server on the **connected host**, then reconnect.
+Use `codex app-server daemon restart` for a standalone managed daemon; otherwise
+restart the process or application that owns the server. Reconnecting or reopening
+the desktop app can reuse a remote server with the old list.
+
+ug removes its shared reference on discovery/validation failure, reconfiguration,
+revert, or before installing/updating Codex. After an update, run `ug codex` to refresh
+discovery or `ug configure` for a managed static list, then restart the app server.
+
+## Configure
 
 ```bash
-ucode configure
+ug configure
+ug configure --agents claude,codex
+ug configure --workspace https://first.databricks.com
+ug configure --profile DEFAULT --agents claude,codex
 ```
 
-To configure specific tools without the picker, pass a comma-separated list:
+Available coding agents are `codex`, `claude`, `gemini`, `opencode`,
+`copilot`, and `pi`. `cursor` can be included in `--agents` for MCP-only setup;
+Cursor models still run through your Cursor account.
+
+`UG_WORKSPACE` can provide the default workspace. An explicit `--workspace` or
+`--profile` takes precedence.
+
+## MCP Servers
+
+Register Databricks MCP servers for configured MCP-capable agents. Cursor Agent
+is MCP-only and is included when `cursor-agent` is installed:
+
+Use `ug mcp add` to add servers without removing existing registrations:
 
 ```bash
-ucode configure --agents claude,codex
+ug mcp add --location system.ai
+ug mcp add --names system.ai.slack,system.ai.github
+ug mcp add --agents claude,codex --location system.ai
 ```
 
-Available agent names are `codex`, `claude`, `gemini`, `opencode`, `copilot`, and `pi`. `cursor` is also accepted (MCP-only — it registers Databricks MCP servers but configures no models).
-
-Naming agents explicitly is treated as a request for all of them: if any one isn't available on the workspace, the run fails without configuring the others. Add `--skip-unavailable` to configure the available subset instead and skip the rest with a warning:
+Remove configured servers:
 
 ```bash
-ucode configure --agents claude,codex,pi --skip-unavailable
+ug mcp remove
+ug mcp remove --agents codex
 ```
 
-This is useful in CI against a mix of workspaces — on a workspace whose AI Gateway exposes no OpenAI models, the command above still configures `claude` and `pi`, and reports Codex as skipped. It exits non-zero only when none of the requested agents are available.
-
-To configure without the workspace picker, pass a comma-separated list of workspaces:
+List configured servers and their connection status:
 
 ```bash
-ucode configure --workspaces https://first.databricks.com,https://second.databricks.com
+ug mcp list
+ug mcp list --agents claude,codex
 ```
 
-When multiple workspaces are provided, `ucode` logs into and saves state for each workspace. Launch commands such as `ucode codex` use the first workspace in the list.
+Every Databricks MCP server is registered as a local stdio server that runs
+`ug mcp-proxy`; the proxy refreshes Databricks OAuth tokens from your CLI
+profile. V2 AI Gateway servers can be added with typed selectors such as
+`vector-search:main.docs`, `uc-functions:main.tools`, `external:<name>`,
+`genie-space:<space-id>`, or `app:<name>`.
 
-Alternatively, pass existing Databricks CLI profiles (from `~/.databrickscfg`) instead of workspace URLs — each profile's host supplies the workspace URL:
+## Skills
+
+Unity Catalog Skills can be registered as MCP tools or downloaded into local
+agent skill directories.
 
 ```bash
-ucode configure --profiles DEFAULT --agents claude,codex
+# Set up the Databricks skills MCP so your agents can create and manage skills through ug.
+ug skills
+
+# List configured skills and how each was configured.
+ug skills list
+
+# Download every skill in a schema into your local agent skill directories.
+ug skills add --location main.default
+
+# Download specific skills by fully-qualified name (may span schemas).
+ug skills add --names main.default.my-skill,ml.prod.other-skill
+
+# Add a schema to the MCP connection scope, exposing its skills as MCP tools.
+ug skills add --location main.default --via mcp
+
+# Interactively pick downloaded skills to delete.
+ug skills remove
+
+# Delete a specific downloaded skill by fully-qualified name.
+ug skills remove --names main.default.my-skill
+
+# Drop a schema from the MCP connection scope.
+ug skills remove --location main.default --via mcp
 ```
 
-Auth behaves the same as `--workspaces`: an OAuth `databricks auth login` is forced by default.
-
-For CI or headless environments where the profile holds a personal access token (`auth_type = pat` in `~/.databrickscfg`), add `--use-pat`. It must be combined with `--profiles` — ucode never picks up a PAT implicitly — and runs no interactive login: the profile's token is used for the whole setup (and by launched agents afterwards), with workspace access verified against the AI Gateway. `--skip-validate` additionally skips the post-configure test message sent through each agent, so configure only writes config files with the freshly discovered models. Together these make setup fully non-interactive:
-
-```bash
-ucode configure --profiles DEFAULT --agents claude,codex --use-pat --skip-validate --skip-upgrade
-```
-
-### MCP servers (optional)
-
-```bash
-ucode configure mcp
-```
-
-Add Databricks MCP servers to installed MCP-capable tools: Codex, Claude Code, Gemini CLI, OpenCode, GitHub Copilot CLI, and Cursor Agent.
-Options are shown in this order:
-
-- Discovered external MCP connections
-- Databricks SQL
-- Managed Databricks MCPs (Vector Search, UC Functions, etc.)
-- Custom MCP server URL
-
-Discovered external MCP connections are listed directly.
-
-Every Databricks MCP server is registered as a local **stdio** server that runs `ucode mcp-proxy`
-— a small bridge (shipped with `ucode`) between the coding tool and the Databricks
-streamable-HTTP MCP endpoint. The proxy mints a fresh OAuth token from your Databricks CLI profile
-on every request, so MCP auth is handled uniformly for every client and never expires mid-session.
-The coding tool starts and stops the proxy as a child process; there's nothing extra to run.
-
-**Cursor** is MCP-only: `cursor-agent` runs models on your own Cursor account, so `ucode`
-configures no models for it — it only registers Databricks MCP servers in `~/.cursor/mcp.json`
-(via the same proxy). Include it with `ucode configure --agents cursor` or pick it in
-`ucode configure mcp`, then launch with `ucode cursor`.
-
-To set up an agent and its MCP server(s) in one command, pass `--mcp` with fully-qualified
-service name(s) to `ucode configure`:
-
-```bash
-ucode configure --agents claude --mcp system.ai.slack
-```
-
-`--mcp` also works without `--agents` for MCP-only clients (it configures just the workspace,
-then registers the servers); pass a comma-separated list to register several at once.
-
-#### Add servers without replacing existing ones
-
-`ucode configure mcp` **replaces** the registered MCP servers with your selection — anything
-outside a `--location`/`--services` scope (or left unchecked in the picker) is removed. To
-**add** servers while leaving everything already configured in place, use `ucode mcp add`:
-
-```bash
-# Register a whole schema's services, keeping any servers already configured.
-ucode mcp add --location system.ai
-
-# Register just a subset (same name rules as `configure mcp --services`).
-ucode mcp add --services system.ai.slack,system.ai.github
-
-# No arguments launches the same interactive picker, but never removes servers.
-ucode mcp add
-```
-
-`ucode mcp add` takes the same `--location` and `--services` options as `ucode configure mcp`;
-the only difference is that it never removes servers outside the selection. In the interactive
-picker, servers you already have configured are shown as `(already configured)` and can't be
-toggled off — you only pick new ones to add.
-
-Pass `--agents` to target specific coding agents. Any named agent that isn't set up yet is
-configured first (workspace + models), so this doubles as one-command setup:
-
-```bash
-# Set up Claude Code (if needed) and register the server for it, in one command.
-ucode mcp add --agents claude --services system.ai.slack
-
-# Target several agents at once.
-ucode mcp add --agents claude,codex --location system.ai
-```
-
-Without `--agents`, the server is registered for every already-configured agent.
-
-#### Remove configured servers
-
-To unregister servers you've already configured, use `ucode mcp remove`:
-
-```bash
-ucode mcp remove
-
-# Remove only from specific agents. A server registered on several agents is
-# unregistered from the named ones and kept on the rest.
-ucode mcp remove --agents codex
-```
-
-It shows the servers you currently have configured — each with the coding tools it's registered
-on — and removes the ones you select from those tools. It needs no Databricks login.
-
-### Skills (optional)
-
-Configure Unity Catalog Skills for your coding tools with `ucode configure skills`:
-
-```bash
-# Utility tools only: register the schema-less skills MCP connection, no download.
-ucode configure skills
-
-# Download mode: fetch every skill in the schema to disk (and register the connection).
-ucode configure skills --location main.default --path /abs/project/dir
-
-# Download a named subset of the schema's skills instead of all of them.
-ucode configure skills --location main.default --skill my-skill
-
-# MCP mode: expose the schema's skills as MCP tools instead of downloading.
-ucode configure skills --location main.default,ml.prod --mcp
-```
-
-- **Bare command** (no `--location`) registers the schema-less skills MCP connection — the
-  cross-schema utility tools only — and downloads nothing. `--mcp` with no `--location` does the
-  same.
-- **Download mode** (with `--location`, no `--mcp`) writes each skill flat as `<leaf>/SKILL.md`
-  (plus its bundled files) into both `.claude/skills/` and `.agents/skills/`. `--path` (an existing
-  absolute directory) is optional; when omitted, skills are written under your home directory. Any
-  pre-existing skill dir prompts before it's overwritten. It then registers a schema-less skills
-  MCP connection, leaving any prior `--mcp` scope untouched. `--skill <name>[,<name>…]` narrows the
-  download to the named skills (by leaf name) from the schema instead of all of them; requested
-  names not found in the schema warn and are skipped. `--skill` requires a single `--location`, is
-  download-only, and is rejected with `--mcp`.
-- **MCP mode** (`--location … --mcp`) sets the connection's location set to exactly `<list>`
-  (override-only) and rebuilds its `?schema=` URL; no files are downloaded and `--path` is rejected.
-
-Each run prints the registered server, its URL, the configured agents, and its tools, and reminds
-you to run `ucode <agent>` (existing agent sessions need a restart before the MCP tools load).
-
-### Managed config for a workspace (admins)
-
-Author the coding config your developers pick up automatically, instead of asking each of them to
-run `ucode configure` by hand. Restricted to workspace admins. `ucode setup help` prints the whole
-sequence; the short version is one command for the agents and models, then a command per optional
-section, then publish:
-
-```bash
-ucode setup                 # agents and models (start here)
-ucode setup mcps            # managed MCP servers
-ucode setup skills          # managed skills
-ucode setup spend-tiers     # spend-based routing
-ucode publish                 # publish it to the workspace
-```
-
-`ucode setup` walks through the agents to enable and which one bare `ucode` launches, then per agent:
-Databricks-hosted models or an external Model Provider Service and the models to expose. Interactive
-Claude Code and Codex configuration installs gateway-critical values in the OS-managed settings
-scope so enterprise settings cannot silently override ucode. Non-interactive and CI runs use local
-files without invoking `sudo`, and stop with an actionable error if an existing managed value
-conflicts. Claude subscription relay is local-only because its loopback proxy exists only for that
-session.
-Claude Code is asked one model per family (opus/sonnet/haiku/fable), since it selects models by family
-alias; any family can be skipped.
-
-The optional sections each edit their own part of the same config, so you can add an MCP server or
-change a spend tier later without walking the whole flow. `ucode setup skills --location
-main.default,other.schema` skips the prompt. `ucode setup spend-tiers` sets a tiered spend policy
-that switches the default agent and model as the workspace burns through a budget. Each section
-command also offers to publish right away, so you can apply changes incrementally; answering the
-section prompts also runs the matching `ucode configure` step, which does configure this machine.
-
-Everything is written to `~/.ucode/managed-state.json` — the one local managed-config file — which
-`ucode publish` publishes. Re-running `ucode setup` keeps the MCP servers, skills, tracing table, and
-tiered spend policy already authored, rather than clearing them; to drop one, edit the file and reload
-it with `ucode setup --from-file`.
-
-```bash
-# Review the manifest and the exact payload `ucode publish` would publish.
-ucode setup show
-
-# Skip the prompts and load a hand-written config instead (validated before saving).
-ucode setup --from-file ./managed-config.json
-```
-
-Once the manifest looks right, publish it:
-
-```bash
-# Validate, show a diff against what's live, and ask before publishing.
-ucode publish
-
-# Publish without the confirmation prompt (for CI).
-ucode publish --yes
-
-# Publish a config file exported with `ucode export` instead of the locally authored one.
-ucode publish -f ./managed-config.json
-ucode publish --file ./managed-config.json --yes
-```
-
-`publish` updates the workspace's existing config in place rather than replacing it, so a failed
-publish leaves the current config intact. It shows a diff of exactly what changes against the
-published config before asking to confirm, and does nothing when the two already match. It is a
-whole-manifest write — every field ucode authors is sent — but because `ucode setup` carries the
-other sections forward, a re-run no longer silently drops them. Developers pick the new config up on
-their next ucode run.
-
-With `-f`/`--file`, `publish` reads a config file produced by `ucode export` and publishes it through
-the same validation, diff, and confirmation flow. The file's `workspace` must match the configured
-workspace (it can never redirect publication elsewhere) and its `spec_version` must be a supported
-integer; server-owned fields (resource name, workspace ids, timestamps, user ids) and unknown fields
-are rejected rather than silently dropped.
-
-### Exporting the config
-
-Any user (not only admins) can print the workspace's managed config as portable JSON with `ucode
-export`. The output leads with the source `workspace` URL and a `spec_version` (the export format
-version), followed by the canonical external config; credentials and server-assigned fields (the
-resource name, timestamps, user ids) are excluded. Without `--file` the JSON is written to stdout;
-with `--file`/`-f` the same bytes are written to a file (atomically, and the destination's parent
-directory must already exist) while stdout stays empty. The exported file is exactly what `ucode
-publish -f <file>` consumes.
-
-```bash
-# Print the managed config as JSON.
-ucode export
-
-# Write it to a file; stdout stays empty.
-ucode export --file ./managed-config.json
-```
-
-The output looks like:
-
-```json
-{
-  "workspace": "https://<workspace-host>",
-  "spec_version": 1,
-  "default_agent": "CODING_AGENT_CLAUDE_CODE",
-  "enabled_agents": [ ... ]
-}
-```
-
----
-
-## Other Commands
+## Commands
 
 | Command | Description |
 |---------|-------------|
-| `ucode status` | Show current workspace, base URLs, managed config files, and selected models |
-| `ucode export` | Print the workspace's managed config as portable JSON (`--file <file>` / `-f` to write a file) |
-| `ucode doctor` | Diagnose local issues (uv, npm, Databricks CLI, workspace, credentials, agent CLIs, tracing) and offer to fix any problems found |
-| `ucode usage` | Show AI Gateway usage summary, plus your budget spend against its alert threshold when the workspace reports one |
-| `ucode usage --warehouse-id <id>` | Query a specific SQL warehouse instead of discovering one |
-| `ucode revert` | Clear saved state and restore backed-up config files |
-| `ucode configure --dry-run` | Preview config files without writing them |
-| `ucode configure --agents claude,codex` | Configure specific agents without the interactive picker |
-| `ucode configure --workspaces https://first.databricks.com,https://second.databricks.com` | Configure workspaces without the interactive picker |
-| `ucode configure --profiles DEFAULT` | Configure using existing Databricks CLI profiles (hosts come from `~/.databrickscfg`) |
-| `ucode configure --profiles DEFAULT --use-pat` | Authenticate with the profile's personal access token — no browser login |
-| `ucode codex --enable-smart-routing` | Enable AI Gateway routing for Codex sessions and subagents |
-| `ucode codex --refresh` | Re-check Databricks, refresh models/configuration, and launch Codex |
-| `ucode claude --enable-smart-routing` | Enable AI Gateway routing for Claude Code sessions and subagents |
-| `ucode claude --refresh` | Re-check Databricks, refresh models/configuration, and launch Claude Code |
-| `ucode configure --skip-validate` | Write configs without sending a test message through each agent |
-| `ucode configure --agents claude,codex,pi --skip-unavailable` | Configure the requested agents that are available; skip the rest with a warning |
-| `ucode configure --agents claude --mcp system.ai.slack` | Configure an agent and register its Databricks MCP server(s) in one command |
-| `ucode mcp add --location system.ai` | Register a schema's MCP servers, keeping any already configured (additive; never removes) |
-| `ucode mcp add --services system.ai.slack` | Register specific MCP server(s) without removing existing ones |
-| `ucode mcp add --agents claude --services system.ai.slack` | Set up the agent(s) if needed and register the server for them |
-| `ucode mcp remove` | Interactively unregister configured MCP servers from your coding tools |
-| `ucode mcp remove --agents codex` | Unregister selected servers from specific agents only |
-| `ucode configure skills` | Register the skills MCP connection (utility tools only); no skills download |
-| `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
-| `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
-| `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
-| `ucode setup` | Author the managed config's agents and models (workspace admins only) |
-| `ucode setup mcps` | Add or change the managed config's MCP servers |
-| `ucode setup skills [--location a.b,c.d]` | Add or change the managed config's skills |
-| `ucode setup spend-tiers` | Set the managed config's tiered spend routing policy |
-| `ucode setup help` | Walk through the whole setup sequence, marking what's already configured |
-| `ucode setup show` | Print the authored config and the payload `ucode publish` would publish |
-| `ucode setup --from-file <file>` | Load a hand-written managed config instead of running the prompts |
-| `ucode publish` | Publish the authored managed config to the workspace, after a diff and confirmation (admins only) |
-| `ucode publish -f <file>` | Publish a config file exported with `ucode export` instead of the locally authored one |
-| `ucode publish --yes` | Publish without the confirmation prompt |
+| `ug status` | Show workspace, generated files, models, and skill MCP scope |
+| `ug configure` | Configure workspace, models, agent files, and optional Databricks AI tools |
+| `ug configure --dry-run` | Preview config changes without writing files |
+| `ug mcp add` | Add MCP servers without removing existing registrations |
+| `ug mcp remove` | Unregister configured MCP servers |
+| `ug mcp list` | List configured MCP servers and connection status |
+| `ug skills` | Set up the Databricks skills MCP so agents can create and manage skills |
+| `ug skills list` | List configured skills and how each was configured |
+| `ug skills add` | Add skill MCP scopes or download skills |
+| `ug skills remove` | Remove skill MCP scopes or downloaded skills |
+| `ug export` | Print or write portable managed config JSON |
+| `ug doctor` | Diagnose local setup and offer fixes |
+| `ug usage` | Show AI Gateway spend and budget |
+| `ug revert` | Clear saved state and restore backed-up config files |
+| `ug upgrade` | Upgrade Unity Gateway |
 
-Databricks AI Tools are installed only by `ucode configure`, never by `ucode <agent>` launches.
-Use `--enable-databricks-ai-tools` or `--disable-databricks-ai-tools` with `ucode configure` to
-control the installation.
+Databricks AI Tools are installed only by `ug configure`, never by agent launch
+commands. Use `--enable-databricks-ai-tools` or `--disable-databricks-ai-tools`
+with `ug configure` to control installation.
 
-## Managed Local Files
+## Managed Files
 
-`ucode` manages these files:
+`ug` backs up files before overwriting them. `ug revert` restores backups.
 
-| File | Tool |
-|------|------|
-| `~/.codex/ucode.config.toml` (or legacy `~/.codex/config.toml`) | Codex |
-| `~/.claude/ucode-settings.json` | Claude Code settings generated by ucode |
-| `/etc/claude-code/managed-settings.json` (Linux) or `/Library/Application Support/ClaudeCode/managed-settings.json` (macOS) | Claude Code OS-managed settings |
-| `/etc/codex/managed_config.toml` | Codex OS-managed settings |
-| `~/.gemini/.env` | Gemini CLI |
-| `~/.config/opencode/opencode.json` | OpenCode |
-| `~/.copilot/.env` | GitHub Copilot CLI |
-| `~/.pi/agent/models.json` | Pi |
-| `~/.cursor/mcp.json` | Cursor Agent (MCP servers only) |
-| `~/.ucode/managed-state.json` | The managed config — authored by `ucode setup` (admins) and refreshed from the workspace on launch |
-| `~/.ucode/managed-backups/` | Baseline backups for OS-managed files changed by ucode |
+| Tool | Managed files |
+|------|---------------|
+| Codex | `~/.codex/ucode.config.toml`, shared catalog reference in `~/.codex/config.toml`, `~/.ucode/codex-model-catalog.json`, `/etc/codex/managed_config.toml` (Linux and macOS) |
+| Claude Code | `~/.claude/ucode-settings.json`, `~/.claude.json`, `/etc/claude-code/managed-settings.json` (Linux), `/Library/Application Support/ClaudeCode/managed-settings.json` (macOS) |
+| Gemini CLI | `~/.gemini/ucode.env`, `~/.ucode/.gemini-home/.gemini/settings.json` |
+| OpenCode | `~/.ucode/opencode-xdg/opencode/opencode.json`, `~/.ucode/opencode-xdg/opencode/plugin/ucode-auth.js` |
+| GitHub Copilot CLI | `~/.copilot/ucode.env`, `~/.copilot/ucode-mcp-config.json` |
+| Pi | `~/.ucode/pi-home/.pi/agent/models.json`, `~/.ucode/pi-home/.pi/agent/settings.json` |
+| Cursor Agent | `~/.cursor/mcp.json` |
+| Unity Gateway | `~/.ucode/managed-state.json`, `~/.ucode/managed-backups/` |
 
-Existing files are backed up before being overwritten. `ucode revert` restores backups.
+## Development
 
+```bash
+git clone https://github.com/databricks/unity-gateway
+cd unity-gateway
+uv sync
+uv run pytest
+uv run ruff check .
+```
+
+For integration tests against installed `ug` and agent versions, see
+[tests/integration/README.md](tests/integration/README.md). The existing e2e
+tests remain available separately:
+
+```bash
+UCODE_TEST_WORKSPACE=<db_workspace_url> uv run pytest tests/test_e2e.py -v
+```
+
+To add a new agent, implement `src/ucode/agents/<name>.py`, register it in
+`src/ucode/agents/__init__.py`, and add focused tests.
 
 ## Documentation
 
@@ -399,46 +220,10 @@ Existing files are backed up before being overwritten. `ucode revert` restores b
 - [Databricks CLI authentication](https://docs.databricks.com/aws/en/dev-tools/cli/authentication)
 - [Monitor AI Gateway usage](https://docs.databricks.com/aws/en/ai-gateway/configure-ai-gateway-endpoints#track-usage-of-an-endpoint)
 
-## Contributing
-
-Contributions are welcome.
-
-### Getting started
-
-```bash
-git clone https://github.com/databricks/ucode
-cd ucode
-uv sync
-```
-
-### Development workflow
-
-1. Create a feature branch off `main`.
-2. Make your changes — keep them scoped to the requested behavior.
-3. Run the test suite before pushing:
-
-   ```bash
-   uv run pytest          # unit tests
-   uv run ruff check .    # lint
-   ```
-
-4. For end-to-end testing against a real workspace:
-
-   ```bash
-   UCODE_TEST_WORKSPACE=<db_workspace_url> uv run pytest tests/test_e2e.py -v
-   ```
-
-5. Open a pull request against `main`.
-
-### Adding a new agent
-
-- Add `src/ucode/agents/<name>.py` with at least `write_tool_config`, `launch`, `default_model`, and `validate_cmd`.
-- Register it in `src/ucode/agents/__init__.py`.
-- Add focused tests under `tests/`.
-
 ## Security
 
-Please report security vulnerabilities to security@databricks.com rather than opening a public issue.
+Please report security vulnerabilities to security@databricks.com rather than
+opening a public issue.
 
 ## License
 

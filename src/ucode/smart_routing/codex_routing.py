@@ -1,7 +1,7 @@
 """Databricks AI Gateway routing helpers for Codex sessions and subagents.
 
 Codex-specific configuration on top of the shared :mod:`ucode.smart_routing.routing`
-core: the workspace-backed ``task_v1`` route options, the ``spawn_agent`` tool
+core: the workspace-backed route options, the ``spawn_agent`` tool
 detector, the Codex model-id translation, and the artifact paths.
 """
 
@@ -28,10 +28,27 @@ SPAWN_AGENT_TOOL_SUFFIX = "spawn_agent"
 CANARY_PATH = APP_DIR / "codex-smart-routing-canary.json"
 AUDIT_PATH = APP_DIR / "codex-smart-routing-audit.jsonl"
 DECISIONS_PATH = APP_DIR / "codex-smart-routing-decisions.jsonl"
+SUBAGENT_NOTICE_CONFIG = routing.SubagentNoticeConfig(
+    name_field="task_name",
+    prompt_field="message",
+    leading_newline=True,
+)
 
 _GPT_RE = re.compile(r"gpt-(\d+)(?:[.-](\d+))?(?:[.-](\d+))?(-.+|[a-z].*)?")
 
 _normalize_model = routing.normalize_model
+
+
+# TODO: Remove once server-side smart routing is more robust to duplicate model names.
+def _normalize_route_model(model: str) -> str:
+    """Canonicalize equivalent Codex GPT spellings to one router option."""
+    normalized = _normalize_model(model)
+    match = _GPT_RE.fullmatch(normalized)
+    if match is None:
+        return normalized
+    major, minor, patch, suffix = match.groups()
+    version = "-".join(part for part in (major, minor, patch) if part is not None)
+    return f"gpt-{version}{suffix or ''}"
 
 
 def request_routing_decision(
@@ -43,18 +60,19 @@ def request_routing_decision(
     timeout: float = REQUEST_TIMEOUT_S,
     log: Callable[[str], None] | None = None,
 ) -> tuple[RoutingDecision | None, str | None]:
-    """Ask the workspace ``task_v1`` router for a servable Codex model."""
-    available = {_normalize_model(model): model for model in available_models}
+    """Ask the router for a servable Codex model."""
+    available = {_normalize_route_model(model): model for model in available_models}
     route_options = [(model, "codex") for model in available]
     if not route_options:
         return None, "no cached model services are available"
+    router_name = routing.configured_router_name()
     if log is not None:
         payload = {
             "route_options": [
                 {"model": model, "harness": harness} for model, harness in route_options
             ],
             "task": {"prompt": task},
-            "route_selector": {"router_name": ROUTER_NAME},
+            "route_selector": {"router_name": router_name},
         }
         url = workspace.rstrip("/") + ROUTING_PATH
         log(f"[ROUTE] request POST {url}: {json.dumps(payload, separators=(',', ':'))}")
@@ -63,15 +81,16 @@ def request_routing_decision(
         token,
         task,
         route_options,
-        lambda raw_model: available.get(_normalize_model(raw_model)),
+        lambda raw_model: available.get(_normalize_route_model(raw_model)),
+        router_name=router_name,
         timeout=timeout,
     )
 
 
 def resolve_routed_model(raw_model: str, available_models: list[str]) -> str | None:
-    """Map a ``task_v1`` arm to a model the configured workspace can serve."""
-    normalized = {_normalize_model(model): model for model in available_models}
-    return normalized.get(_normalize_model(raw_model))
+    """Map a router arm to a model the configured workspace can serve."""
+    normalized = {_normalize_route_model(model): model for model in available_models}
+    return normalized.get(_normalize_route_model(raw_model))
 
 
 def route_pre_tool_use(
@@ -98,6 +117,7 @@ def route_pre_tool_use(
         ),
         default_task_label="Codex subagent task",
         model_id_mapper=codex_model_id,
+        notice_config=SUBAGENT_NOTICE_CONFIG,
         record_decision=record,
     )
 

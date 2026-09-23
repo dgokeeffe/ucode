@@ -1,7 +1,7 @@
 """Databricks AI Gateway routing helpers for Claude Code sessions and subagents.
 
 Claude-specific configuration on top of the shared
-:mod:`ucode.smart_routing.routing` core. The ``task_v1`` router infers a
+:mod:`ucode.smart_routing.routing` core. The ``task_v2`` router infers a
 "Claude Code" (``cc``) scenario when it is offered only Claude arms, and that
 scenario REQUIRES its full menu — both ``claude-opus-4-8`` and
 ``claude-sonnet-5`` — or it returns BAD_REQUEST. So both arms are always offered.
@@ -21,7 +21,7 @@ from ucode.smart_routing.routing import RoutingDecision
 
 ROUTER_NAME = routing.ROUTER_NAME
 REQUEST_TIMEOUT_S = routing.REQUEST_TIMEOUT_S
-# Frozen task_v1 "cc" scenario menu (ai-gateway CanonicalModelNames): the router
+# Frozen task_v2 "cc" scenario menu (ai-gateway CanonicalModelNames): the router
 # rejects the request unless BOTH are offered as route_options.
 CLAUDE_ROUTE_ARMS = ("claude-opus-4-8", "claude-sonnet-5")
 # Claude Code's subagent-spawn tool (renamed Task -> Agent); match both.
@@ -29,6 +29,12 @@ SPAWN_AGENT_TOOL_NAMES = ("agent", "task")
 CANARY_PATH = APP_DIR / "claude-smart-routing-canary.json"
 AUDIT_PATH = APP_DIR / "claude-smart-routing-audit.jsonl"
 DECISIONS_PATH = APP_DIR / "claude-smart-routing-decisions.jsonl"
+SUBAGENT_NOTICE_CONFIG = routing.SubagentNoticeConfig(
+    name_field="subagent_type",
+    prompt_field="prompt",
+    display_model_mapper=routing.unwrap_anthropic_gateway_model,
+    leading_newline=True,
+)
 
 _normalize_model = routing.normalize_model
 
@@ -80,7 +86,7 @@ def request_routing_decision(
     *,
     timeout: float = REQUEST_TIMEOUT_S,
 ) -> tuple[RoutingDecision | None, str | None]:
-    """Ask the workspace ``task_v1`` router for a servable Claude model.
+    """Ask the router for a servable Claude model.
 
     Offers the full ``cc`` menu; resolves the router's pick back to the
     workspace's routable id (e.g. ``system.ai.claude-opus-4-8``).
@@ -96,6 +102,7 @@ def request_routing_decision(
         task,
         [(arm, "claude") for arm in CLAUDE_ROUTE_ARMS],
         lambda raw_model: available.get(_normalize_model(raw_model)),
+        router_name=routing.configured_router_name(),
         timeout=timeout,
     )
 
@@ -124,6 +131,7 @@ def route_pre_tool_use(
         ),
         default_task_label="Claude Code subagent task",
         model_id_mapper=_claude_model_id,
+        notice_config=SUBAGENT_NOTICE_CONFIG,
         record_decision=record,
     )
 
