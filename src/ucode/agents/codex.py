@@ -597,6 +597,7 @@ def _reconcile_managed_config(state: dict, compose: Callable[[dict], dict]) -> N
             tool="codex",
             display="Codex",
             owned_paths=MANAGED_KEYS,
+            parser=_parse_managed_config,
         )
     except ManagedFileWriteUnavailable:
         conflicts = managed_file_conflicts(managed_before, desired_doc, MANAGED_KEYS)
@@ -627,6 +628,58 @@ def managed_mcp_uses_managed_file() -> bool:
 def managed_mcp_entry(argv: list[str]) -> dict:
     """A ``[mcp_servers.<name>]`` stdio entry from the ``ug mcp-proxy`` argv (same as user scope)."""
     return {"command": argv[0], "args": list(argv[1:])}
+
+
+def user_mcp_config_path() -> Path:
+    """The file ``codex mcp add`` writes user-scope MCP servers to: ``$CODEX_HOME/config.toml`` when
+    that env var is set (the ``codex`` CLI honors it), else the default ``~/.codex/config.toml``. A
+    direct write must resolve the same path the CLI would, or it writes to a file Codex never reads."""
+    codex_home = os.environ.get("CODEX_HOME")
+    return Path(codex_home) / "config.toml" if codex_home else LEGACY_CODEX_CONFIG_PATH
+
+
+def _read_user_config_for_rewrite(path: Path) -> tomlkit.TOMLDocument | None:
+    """Read ``path`` for a full rewrite: an empty document when absent, the parsed document when
+    present and valid, and ``None`` when present but unparseable — so a caller never overwrites a
+    config it could not read."""
+    if not path.exists():
+        return tomlkit.document()
+    try:
+        return tomlkit.parse(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ParseError):
+        return None
+
+
+def write_user_mcp_servers(add: dict[str, dict], remove: set[str]) -> set[str]:
+    """Apply ``add``/``remove`` to Codex's user-scope ``[mcp_servers]`` (``~/.codex/config.toml``,
+    or under ``$CODEX_HOME``) in a single read-modify-write, instead of one ``codex mcp`` subprocess
+    per server. Other tables and the developer's own servers are preserved. Returns the subset of
+    ``remove`` names that were actually present (so callers can report only real removals).
+
+    If the file exists but can't be parsed, defer to the per-server ``codex`` CLI rather than
+    overwrite it."""
+    from ucode.mcp import add_codex_mcp_server, remove_codex_mcp_server
+
+    path = user_mcp_config_path()
+    doc = _read_user_config_for_rewrite(path)
+    if doc is None:
+        removed = {name for name in remove if remove_codex_mcp_server(name)}
+        for name, entry in add.items():
+            add_codex_mcp_server(name, [entry["command"], *entry.get("args", [])])
+        return removed
+
+    table = doc.get(MANAGED_MCP_CONFIG_KEY)
+    if not isinstance(table, dict):
+        table = tomlkit.table()
+        doc[MANAGED_MCP_CONFIG_KEY] = table
+    removed = {name for name in remove if name in table}
+    for name in remove:
+        if name in table:
+            del table[name]
+    for name, entry in add.items():
+        table[name] = entry
+    write_toml_file(path, doc)
+    return removed
 
 
 def reconcile_managed_mcp(state: dict, servers: dict[str, dict]) -> bool:
@@ -675,6 +728,7 @@ def reconcile_managed_mcp(state: dict, servers: dict[str, dict]) -> bool:
             tool="codex",
             display="Codex",
             owned_paths=[[MANAGED_MCP_CONFIG_KEY]],
+            parser=_parse_managed_config,
         )
     except ManagedFileWriteUnavailable:
         return False

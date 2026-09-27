@@ -1677,6 +1677,63 @@ class TestCodexManagedConfig:
         assert doc["approval_policy"] == "on-request"
         assert "model" not in doc
 
+    def _sudo_counting_env(self, tmp_path, monkeypatch):
+        """Real reconcile flow (semantic no-op check included) with sudo writes counted."""
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        managed_path = tmp_path / "etc-codex" / "managed_config.toml"
+        sudo_writes: list[str] = []
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "codex-ucode-config.backup.toml")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.134.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+        monkeypatch.setattr(codex, "managed_writes_allowed", lambda: True)
+        monkeypatch.setattr(codex, "codex_managed_config_path", lambda: managed_path)
+        monkeypatch.setattr(managed_files, "managed_files_supported", lambda: True)
+        monkeypatch.setattr(managed_files, "managed_writes_allowed", lambda: True)
+        monkeypatch.setattr(managed_files, "MANAGED_BACKUP_DIR", tmp_path / "managed-backups")
+        monkeypatch.setattr(
+            managed_files, "MANAGED_BACKUP_MANIFEST_PATH", tmp_path / "managed-backups" / "m.json"
+        )
+
+        def _write(target, text):
+            sudo_writes.append(text)
+            Path(target).parent.mkdir(parents=True, exist_ok=True)
+            Path(target).write_text(text, encoding="utf-8")
+
+        monkeypatch.setattr(managed_files, "_sudo_replace", _write)
+        return managed_path, sudo_writes
+
+    def test_reapply_unchanged_config_invokes_no_sudo(self, tmp_path, monkeypatch):
+        # Codex parity: repeated launches with an unchanged config reach a fixed point with no
+        # further privileged writes.
+        managed_path, sudo_writes = self._sudo_counting_env(tmp_path, monkeypatch)
+        state = {"workspace": WS, "codex_models": ["gpt-5"]}
+        codex.write_tool_config(state)
+        baseline = len(sudo_writes)
+        assert baseline >= 1
+        first_bytes = managed_path.read_bytes()
+        codex.write_tool_config(state)
+        codex.write_tool_config(state)
+        assert len(sudo_writes) == baseline  # semantic no-op: no additional privileged writes
+        assert managed_path.read_bytes() == first_bytes
+
+    def test_admin_unrelated_edit_invokes_no_sudo(self, tmp_path, monkeypatch):
+        # An admin's unrelated top-level key is preserved and does not force a ug rewrite.
+        managed_path, sudo_writes = self._sudo_counting_env(tmp_path, monkeypatch)
+        state = {"workspace": WS, "codex_models": ["gpt-5"]}
+        codex.write_tool_config(state)
+        baseline = len(sudo_writes)
+        # Prepend an unrelated top-level key (valid TOML: bare keys precede table headers).
+        managed_path.write_text(
+            'approval_policy = "on-request"\n' + managed_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        before = managed_path.read_bytes()
+        codex.write_tool_config(state)
+        assert len(sudo_writes) == baseline  # unrelated edit did not force a rewrite
+        assert managed_path.read_bytes() == before
+        assert read_toml_safe(managed_path)["approval_policy"] == "on-request"
+
     def test_provider_settings_stay_launch_scoped(self, tmp_path, monkeypatch):
         config_path, managed_path = self._patch(tmp_path, monkeypatch)
         managed_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1854,7 +1911,7 @@ class TestCodexReconcileManagedMcp:
         monkeypatch.setattr(codex, "read_managed_file", lambda path: existing_text)
         monkeypatch.setattr(codex, "mark_managed_file_verified", lambda *a, **k: None)
 
-        def fake_reconcile(path, desired_text, *, tool, display, owned_paths):
+        def fake_reconcile(path, desired_text, *, tool, display, owned_paths, parser=None):
             captured.update(text=desired_text, tool=tool, owned_paths=owned_paths)
 
         monkeypatch.setattr(codex, "reconcile_managed_file", fake_reconcile)
@@ -1979,3 +2036,88 @@ class TestOtelTokenProvider:
         assert provider(True) == "custom-token"
         assert get_custom_token.call_args.kwargs["force_refresh"] is True
         get_default_token.assert_not_called()
+
+
+class TestWriteUserMcpServers:
+    """Batched user-scope `[mcp_servers]` writes for the workspace-managed reconcile path."""
+
+    def test_adds_and_preserves_other_tables(self, tmp_path, monkeypatch):
+        path = tmp_path / "config.toml"
+        path.write_text('model = "gpt-5"\n\n[mcp_servers.mine]\ncommand = "x"\nargs = []\n')
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", path)
+
+        entry = codex.managed_mcp_entry(["ug", "mcp-proxy", "https://ws/svc"])
+        codex.write_user_mcp_servers({"system-ai-github": entry}, set())
+
+        doc = read_toml_safe(path)
+        assert doc["model"] == "gpt-5"  # untouched
+        assert dict(doc["mcp_servers"]["mine"]) == {
+            "command": "x",
+            "args": [],
+        }  # developer's own kept
+        assert dict(doc["mcp_servers"]["system-ai-github"]) == {
+            "command": "ug",
+            "args": ["mcp-proxy", "https://ws/svc"],
+        }
+
+    def test_removes_named_entries_only(self, tmp_path, monkeypatch):
+        path = tmp_path / "config.toml"
+        path.write_text('[mcp_servers.gone]\ncommand = "a"\n\n[mcp_servers.mine]\ncommand = "b"\n')
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", path)
+
+        codex.write_user_mcp_servers({}, {"gone"})
+
+        table = read_toml_safe(path)["mcp_servers"]
+        assert "gone" not in table
+        assert "mine" in table
+
+    def test_writes_to_a_missing_file(self, tmp_path, monkeypatch):
+        path = tmp_path / "config.toml"
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", path)
+
+        codex.write_user_mcp_servers({"a": {"command": "ug", "args": ["x"]}}, set())
+
+        assert dict(read_toml_safe(path)["mcp_servers"]["a"]) == {"command": "ug", "args": ["x"]}
+
+    def test_unparseable_file_falls_back_to_cli_and_does_not_clobber(self, tmp_path, monkeypatch):
+        path = tmp_path / "config.toml"
+        path.write_text("this is = = not valid toml [[[")
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", path)
+        added: list[tuple[str, list]] = []
+        removed: list[str] = []
+        import ucode.mcp as mcp_mod
+
+        monkeypatch.setattr(
+            mcp_mod, "add_codex_mcp_server", lambda n, argv: added.append((n, argv))
+        )
+        monkeypatch.setattr(mcp_mod, "remove_codex_mcp_server", lambda n: removed.append(n) or True)
+
+        codex.write_user_mcp_servers(
+            {"svc": {"command": "ug", "args": ["mcp-proxy", "u"]}}, {"old"}
+        )
+
+        assert path.read_text() == "this is = = not valid toml [[["  # never overwritten
+        assert added == [("svc", ["ug", "mcp-proxy", "u"])]
+        assert removed == ["old"]
+
+    @pytest.fixture(autouse=True)
+    def _clear_codex_home_env(self, monkeypatch):
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+
+    def test_honors_codex_home_env(self, tmp_path, monkeypatch):
+        # Regression: `codex mcp add` writes config.toml under $CODEX_HOME when set, so a direct
+        # write must too.
+        codex_home = tmp_path / "codexhome"
+        codex_home.mkdir()
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        default_path = tmp_path / "default-config.toml"
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", default_path)
+
+        codex.write_user_mcp_servers({"svc": {"command": "ug", "args": ["x"]}}, set())
+
+        written = codex_home / "config.toml"
+        assert dict(read_toml_safe(written)["mcp_servers"]["svc"]) == {
+            "command": "ug",
+            "args": ["x"],
+        }
+        assert not default_path.exists()

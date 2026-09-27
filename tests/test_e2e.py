@@ -424,6 +424,8 @@ E2E_MODEL_SKIP_HARNESSES: dict[str, frozenset[str]] = {
     "grok": frozenset({"codex", "copilot", "pi"}),
     # These Gemini endpoints hang OpenCode well past its E2E timeout.
     "databricks-gemini-3-1-flash-lite": frozenset({"opencode"}),
+    # Image-only Gemini endpoints reject function calling, which Pi's launch smoke requires.
+    "flash-lite-image": frozenset({"pi"}),
     # These endpoints do not support Copilot's MLflow chat route.
     "-codex": frozenset({"copilot"}),
     "gpt-5-5": frozenset({"copilot"}),
@@ -1241,7 +1243,8 @@ class TestPiLaunch:
             if not _model_is_skipped(model, "pi"):
                 out.append(("codex", model))
         for model in e2e_state.get("gemini_models") or []:
-            out.append(("gemini", model))
+            if not _model_is_skipped(model, "pi"):
+                out.append(("gemini", model))
         for model in e2e_state.get("oss_models") or []:
             out.append(("oss", model))
         return out
@@ -1254,9 +1257,15 @@ class TestPiLaunch:
                 "databricks-gpt-6-luna",
                 "databricks-gpt-6-sol",
                 "databricks-gpt-5-4",
-            ]
+            ],
+            "gemini_models": ["databricks-gemini-flash-lite-image", "gemini-3"],
         }
-        assert self._all_models(state) == [("codex", "databricks-gpt-5-4")]
+        assert self._all_models(state) == [
+            ("codex", "databricks-gpt-6-luna"),
+            ("codex", "databricks-gpt-6-sol"),
+            ("codex", "databricks-gpt-5-4"),
+            ("gemini", "gemini-3"),
+        ]
 
     def test_all_models_includes_oss_provider(self):
         models = self._all_models(
