@@ -356,8 +356,8 @@ class TestDefaultModelForTool:
         }
         assert default_model_for_tool("pi", state) == "system.ai.glm-5-2"
 
-    def test_pi_returns_none_when_no_models(self):
-        assert default_model_for_tool("pi", {}) is None
+    def test_pi_uses_gateway_default_when_no_models(self):
+        assert default_model_for_tool("pi", {}) == "system.ai.gpt-6-luna"
 
 
 class TestResolveLaunchModel:

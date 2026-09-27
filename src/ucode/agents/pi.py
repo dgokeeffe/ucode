@@ -643,7 +643,7 @@ def default_model(state: dict) -> str | None:
     oss_models = state.get("oss_models") or []
     if oss_models:
         return oss_models[0]
-    return DEFAULT_MODEL
+    return next(iter(claude_models.values()), DEFAULT_MODEL)
 
 
 def _configure_launch(state: dict) -> str:
