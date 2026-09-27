@@ -620,10 +620,11 @@ class TestPiDefaultModel:
         }
         assert pi.default_model(state) == "system.ai.glm-5-2"
 
-    def test_returns_none_when_empty(self):
-        assert pi.default_model({}) is None
+    def test_uses_gateway_default_when_empty(self):
+        assert pi.default_model({}) == "system.ai.gpt-6-luna"
         assert (
-            pi.default_model({"claude_models": {}, "codex_models": [], "gemini_models": []}) is None
+            pi.default_model({"claude_models": {}, "codex_models": [], "gemini_models": []})
+            == "system.ai.gpt-6-luna"
         )
 
 
