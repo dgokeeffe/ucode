@@ -1,0 +1,338 @@
+handoff_artifact: verification/pi-pr-breakup-20260902.yaml
+contract:
+  intended_outcomes:
+    - "PR A is a Pi-led native routing, Grok/shared classification, config-directory, backup-migration, and capability fix based on current origin/main."
+    - "PR B adds the Pi MLflow OSS provider, SSE repair, lifecycle hardening, and the E-dependent Pi capability/supplemental parity it consumes."
+    - "PR C isolates Claude discovery hardening."
+    - "PR D isolates OpenCode native Responses routing, including managed GPT-to-openai bucketing."
+    - "PR E isolates capability-driven discovery, gateway-only fallbacks, OpenCode OSS capability consumption, and the setCacheKey live regression fix."
+    - "The combined accepted source behaviour matches dev for shipped functionality, excluding documented diagnostics and internal evidence."
+    - "The final local stack is A 8fc337e -> C c8e7114 -> E 763fa3e, with B 5ac7937 and D 210312e each based on E; integration is B -> 434bc3b."
+  acceptance_checks:
+    - "Every branch has an explicit base/dependency and contains no uv.lock, miniwiki, verification, prompt-cache, or .gitignore drift unless a dependency change is intentional."
+    - "Focused tests, lint, formatting, type checks, git diff checks, and branch-specific malformed/boundary tests pass."
+    - "Current origin/main baselines are compared with each changed lane; live ai-dev-tools checks are serial and use the named profile explicitly."
+    - "The former OpenCode live regression has a deterministic cause, fix, and passing-after evidence."
+    - "No branch is pushed and no PR, deployment, merge, or publication is performed without separate human authorisation."
+  non_goals:
+    - "Prompt-cache diagnostic scripts and their tests."
+    - "Internal miniwiki and historical verification artefacts in upstream PR diffs."
+    - "Unrelated refactors, dependency updates, Vibe changes, or live workspace mutation."
+  reserved_human_decisions:
+    - "Pushing branches or opening upstream PRs."
+    - "Merging, releasing, deploying, or changing managed workspace configuration."
+    - "Whether PR E's future-proofing value justifies its larger review surface."
+impact_map:
+  files:
+    pi: [src/ucode/agents/pi.py, src/ucode/databricks.py, src/ucode/agents/_mlflow_proxy.py, src/ucode/agents/__init__.py, src/ucode/managed_resolve.py]
+    claude: [src/ucode/agents/claude.py, src/ucode/databricks.py]
+    opencode: [src/ucode/agents/opencode.py, src/ucode/databricks.py]
+    discovery: [src/ucode/databricks.py, src/ucode/cli.py]
+    tests: [tests/test_agent_pi.py, tests/test_mlflow_proxy.py, tests/test_agent_claude.py, tests/test_agent_opencode.py, tests/test_databricks.py, tests/test_cli.py, tests/test_state.py, tests/test_managed_resolve.py]
+  interfaces:
+    - "Persisted state model lists and capability specs."
+    - "Pi models.json/settings.json generation and launch environment."
+    - "AI Gateway native Responses and MLflow chat-completions routes."
+    - "Managed model allowlists and default selection."
+  data_boundaries:
+    - "Bearer tokens remain local and must not enter commits or evidence."
+    - "Live tests may read ai-dev-tools model metadata and invoke gateway models but must not change workspace configuration."
+  dependency_changes: false
+  branch_dependencies:
+    pr_a: "origin/main -> pr/pi-core-grok"
+    pr_c: "pr/pi-core-grok -> pr/claude-discovery-hardening"
+    pr_e: "pr/claude-discovery-hardening -> pr/capability-discovery"
+    pr_b: "pr/capability-discovery -> pr/pi-oss-sse"
+    pr_d: "pr/capability-discovery -> pr/opencode-routing"
+  scope_boundaries:
+    pr_a: "Pi native Responses routing, shared GPT/Grok classification, config directory and collision-safe backup migration, supplemental Claude versions, and Claude thinking metadata."
+    pr_b: "Pi MLflow provider, discovered OSS metadata consumption, SSE repair, catchable termination lifecycle, managed allowlists, session affinity, codex spec consumption, and supplemental-cache parity dependent on E."
+    pr_c: "Malformed/partial UC pagination and Claude gateway fallback only."
+    pr_d: "OpenCode databricks-openai provider, managed GPT bucketing, and provider-specific native Responses E2E coverage; no OSS discovery/spec changes."
+    pr_e: "Shared capability-driven Responses/Gemini/OSS discovery, readiness filtering, context/spec persistence, gateway-only fallbacks, OpenCode OSS capability consumption, and setCacheKey false."
+deterministic_plan:
+  - "Fetch and record current origin/main; inspect intervening upstream changes."
+  - "Build each lane in an isolated worktree with one writer and explicit exclusions."
+  - "Run branch-focused unit tests, malformed-input and lifecycle tests, then ruff, format, ty, and git diff --check."
+  - "Run the bounded full suite for the combined integration and adjudicate failures against a current origin/main worktree."
+  - "Load Databricks core/model-serving guidance, then run authorised live ai-dev-tools checks serially with an explicit profile."
+  - "Obtain independent requirements, edge-case, security/data, and regression reviews; reproduce every finding before disposition."
+  - "Apply justified fixes, rerun affected checks, re-review, and record final adjudication."
+  - "Preserve pre-continuation branch tips under backup refs before amending/rebasing the local stack."
+  - "Keep the existing dirty PR E discovery edit until it is completed and committed; do not discard or overwrite it."
+command_results:
+  - check: "continuation recovery and worktree inventory"
+    command: "git status --short --branch; git worktree list --porcelain; branch/reflog inspection"
+    exit_code: 0
+    result: passed
+    output: "dev has only the two expected untracked continuity artefacts; A/B/C are committed in isolated worktrees; D is at origin/main; E has one preserved databricks.py edit. Direct Pi and interactive-zsh wrapper checks were already green in the recovered session evidence."
+    environment: "ucode dev checkout and isolated /private/tmp worktrees; 2026-09-02 Australia/Melbourne"
+    fixtures: "local git refs and worktrees"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "current upstream fetch"
+    command: "git fetch origin"
+    exit_code: 0
+    result: passed
+    output: "origin/main advanced from 1b0883b to e5b083d"
+    environment: "ucode checkout; 2026-09-02 Australia/Melbourne"
+    fixtures: "official origin remote"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "Beads task graph resume"
+    command: "bd prime"
+    exit_code: 0
+    result: passed
+    output: "Beads workflow guidance loaded after session recovery."
+    environment: "ucode dev checkout; bd installed"
+    fixtures: "existing repository task graph"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "Beads task graph inspection"
+    command: "bd list --status=in_progress --json"
+    exit_code: 1
+    result: unavailable
+    output: "Database schema v65 is 12 migrations newer than this bd binary (maximum v53)."
+    environment: "ucode dev checkout; local bd binary"
+    fixtures: "existing repository task graph"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "PR B focused unit suite"
+    command: "uv run pytest tests/test_agent_pi.py tests/test_agents_init.py tests/test_cli.py tests/test_databricks.py tests/test_agent_opencode.py tests/test_managed_resolve.py -q"
+    exit_code: 0
+    result: passed
+    output: "820 passed in 19.44s; the additional managed non-OSS proxy exclusion test passed in a subsequent 79-test Pi run."
+    environment: "pr/pi-oss-sse at d8105f6; Python 3.12; local uv environment"
+    fixtures: "unit-test mocks; no workspace calls"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "PR B loopback MLflow proxy suite"
+    command: "uv run pytest tests/test_mlflow_proxy.py -q"
+    exit_code: 0
+    result: passed
+    output: "17 passed in 9.82s"
+    environment: "pr/pi-oss-sse; loopback networking allowed outside the filesystem/network sandbox"
+    fixtures: "ephemeral loopback upstream and proxy servers"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "PR B lint"
+    command: "uv run ruff check ."
+    exit_code: 0
+    result: passed
+    output: "All checks passed."
+    environment: "pr/pi-oss-sse before local commit; source content identical to d8105f6 except the subsequently passing added test"
+    fixtures: "repository Ruff configuration"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "PR B changed-file format"
+    command: ".venv/bin/ruff format --check <13 changed files>"
+    exit_code: 0
+    result: passed
+    output: "13 files already formatted."
+    environment: "pr/pi-oss-sse"
+    fixtures: "changed production and test files only"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "PR B whole-repository format"
+    command: "uv run ruff format --check ."
+    exit_code: 1
+    result: failed
+    output: "Unchanged scripts/diagnose_auth.py would be reformatted; the same failure reproduces on PR A."
+    environment: "pr/pi-oss-sse and pr/pi-core-grok baseline"
+    fixtures: "whole repository"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "PR B type check"
+    command: "uv run ty check src"
+    exit_code: 0
+    result: passed
+    output: "All checks passed."
+    environment: "pr/pi-oss-sse"
+    fixtures: "src tree"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "PR B E2E collection without live workspace"
+    command: "uv run pytest tests/test_e2e.py -q"
+    exit_code: 0
+    result: passed
+    output: "30 skipped as expected without UCODE_TEST_WORKSPACE."
+    environment: "pr/pi-oss-sse; no workspace selected"
+    fixtures: "no live workspace"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "PR B diff integrity"
+    command: "git diff --check"
+    exit_code: 0
+    result: passed
+    output: "No whitespace errors; uv.lock and internal artefacts absent from commit d8105f6."
+    environment: "pr/pi-oss-sse"
+    fixtures: "diff against parent 6d0d280"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "PR C Claude discovery suite"
+    command: "uv run --frozen pytest tests/test_databricks.py -q"
+    exit_code: 0
+    result: passed
+    output: "270 passed in 5.96s"
+    environment: "pr/claude-discovery-hardening at 2061ecc; Python 3.12; locked uv environment"
+    fixtures: "mocked UC pagination and Anthropic gateway inventory"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "PR C static and diff gates"
+    command: "uv run --frozen ruff check .; uv run --frozen ruff format --check src/ucode/databricks.py tests/test_databricks.py; uv run --frozen ty check src; git diff --check"
+    exit_code: 0
+    result: passed
+    output: "Ruff, changed-file formatting, ty and whitespace checks passed."
+    environment: "pr/claude-discovery-hardening before commit 2061ecc"
+    fixtures: "two-file PR C surface"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "PR C E2E collection without live workspace"
+    command: "uv run --frozen pytest tests/test_e2e.py -q"
+    exit_code: 0
+    result: passed
+    output: "30 skipped as expected without UCODE_TEST_WORKSPACE."
+    environment: "pr/claude-discovery-hardening; no workspace selected"
+    fixtures: "no live workspace"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "current PR A focused and static gates"
+    command: "PYTHONPATH=src /private/tmp/ucode-integration/.venv/bin/pytest tests/test_agent_pi.py tests/test_config_io.py tests/test_cli.py --tb=short -q; ruff check/format; ty check src; git diff --check"
+    exit_code: 0
+    result: passed
+    output: "372 passed; lint, changed-file formatting, types, and whitespace passed."
+    environment: "pr/pi-core-grok at 8fc337e; Python 3.12"
+    fixtures: "unit-test temp files; includes legacy-private-backup collision reproduction"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "current PR E focused and static gates"
+    command: "PYTHONPATH=src /private/tmp/ucode-integration/.venv/bin/pytest tests/test_databricks.py tests/test_cli.py tests/test_agent_claude.py tests/test_agent_opencode.py --tb=short -q; ruff check/format; ty check src; git diff --check"
+    exit_code: 0
+    result: passed
+    output: "792 passed; lint, changed-file formatting, types, and whitespace passed."
+    environment: "pr/capability-discovery at 763fa3e; Python 3.12"
+    fixtures: "mocked model-service/foundation-model catalog, including explicit NOT_READY endpoints"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "current PR B focused Pi/proxy and static gates"
+    command: "env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY PYTHONPATH=src /private/tmp/ucode-integration/.venv/bin/pytest tests/test_agent_pi.py tests/test_mlflow_proxy.py --tb=short -q; ruff check/format; ty check src; git diff --check"
+    exit_code: 0
+    result: passed
+    output: "114 passed before dependency replay; final post-rebase Pi lane 99 passed; lint, formatting, types, and whitespace passed."
+    environment: "pr/pi-oss-sse at 5ac7937; Python 3.12; loopback tests outside network sandbox"
+    fixtures: "ephemeral loopback servers and mocked SIGTERM/SIGHUP delivery"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "current PR D focused and static gates"
+    command: "uv run --frozen pytest tests/test_managed_resolve.py tests/test_agent_opencode.py tests/test_cli.py tests/test_databricks.py -q; uv run --frozen ruff check; uv run --frozen ruff format --check; uv run --frozen ty check src; git diff --check HEAD^..HEAD"
+    exit_code: 0
+    result: passed
+    output: "731 passed on final D 210312e; lint, formatting, types, whitespace, and E ancestry passed."
+    environment: "pr/opencode-routing at 210312e; independent regression/security reviewer"
+    fixtures: "unit-test mocks; no workspace calls"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "final integration D/B reconciliation"
+    command: ".venv/bin/pytest tests/test_managed_resolve.py tests/test_agent_opencode.py tests/test_cli.py tests/test_databricks.py --tb=short -q"
+    exit_code: 0
+    result: passed
+    output: "735 passed; integration retains both B's Pi OSS servability and D's codex-to-openai bucketing."
+    environment: "integration/pi-opencode-20260902 at 434bc3b; Python 3.12"
+    fixtures: "unit-test mocks"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "final integration static gates"
+    command: ".venv/bin/ruff check .; .venv/bin/ruff format --check src tests; .venv/bin/ty check src; git diff --check origin/main...HEAD"
+    exit_code: 0
+    result: passed
+    output: "All Ruff checks passed; 94 files formatted; type check and whitespace passed."
+    environment: "integration/pi-opencode-20260902 at 434bc3b"
+    fixtures: "repository configuration"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "final integration full suite"
+    command: "env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u http_proxy -u https_proxy PYTHONPATH=src .venv/bin/pytest --tb=short"
+    exit_code: 1
+    result: failed
+    output: "2358 passed, 37 skipped, 3 failed in 175.80s. The three failures are two Claude smart-routing Unix-socket tests and the Claude user-agent localhost capture test."
+    environment: "integration/pi-opencode-20260902 at 434bc3b; localhost permitted; proxy variables removed"
+    fixtures: "full repository suite"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "origin/main exact failure baseline"
+    command: "env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY PYTHONPATH=src /private/tmp/ucode-integration/.venv/bin/pytest tests/test_claude_smart_routing_v2.py::TestFirstPromptHook::test_blocks_once_then_allows_replay tests/test_claude_smart_routing_v2.py::TestPtyFlow::test_direct_switch_restore_and_replay tests/test_e2e_user_agent.py::TestClaudeUserAgent::test_user_agent_arrives_at_gateway --tb=short -q"
+    exit_code: 1
+    result: failed
+    output: "The same 3 tests fail with the same assertions on origin/main e5b083d; no integration-added full-suite failure."
+    environment: "detached origin/main worktree; same Python environment and localhost permissions"
+    fixtures: "exact three integration failures"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "recovered serial ai-dev-tools live lane"
+    command: "Serial live auth/gateway/discovery and provider-specific agent invocations using a bearer minted with databricks auth token --profile ai-dev-tools; bearer and workspace URL not persisted"
+    exit_code: 0
+    result: passed
+    output: "7 auth/gateway/discovery checks passed; every native OpenCode Responses model passed; known Pi OSS coding models passed; setCacheKey false changed the former OpenCode prompt_cache_key failure to passing."
+    environment: "explicit ai-dev-tools profile; pre-final-rewrite source-equivalent integration"
+    fixtures: "read-only model discovery and inference; no workspace configuration mutation"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "local ucode reinstall"
+    command: "uv tool install --reinstall ."
+    exit_code: 0
+    result: passed
+    output: "Active local ucode changed from dev f57da3b to integration 434bc3b; ucode --version reports 0.1.0+69.g434bc3b."
+    environment: "local uv tool installation"
+    fixtures: "/private/tmp/ucode-integration"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+  - check: "Pi shell and stale-config recovery"
+    command: "zsh -n ~/.zshrc; zsh -ic 'type pi; pi --version'; installed ucode _restore_direct_oss_config(load_state(), None); jq loopback-provider count"
+    exit_code: 0
+    result: passed
+    output: "Pi resolves to /opt/homebrew/bin/pi 0.84.3; .zshrc parses; stale loopback provider count changed from 1 to 0 while preserving the existing local config."
+    environment: "local shell and installed ucode 434bc3b"
+    fixtures: "existing Pi generated config; no Databricks call"
+    artifact: "verification/pi-pr-breakup-20260902.yaml"
+reviewer_reports:
+  - role: "requirements and intent"
+    inspected: "five lane diffs, ancestry, integration diff, dev comparison, and handoff record"
+    result: "Found stale evidence and inaccurate lane ownership/scope wording; confirmed clean isolated worktrees, forbidden-path exclusions, and explicit dependencies."
+  - role: "edge cases"
+    inspected: "Pi config migration, managed OpenCode routing, gateway readiness, focused tests"
+    result: "Found three reproduced defects: legacy Pi backup collision, managed OpenCode GPT drop, and explicit NOT_READY OSS advertisement."
+  - role: "security/data and regression/integration"
+    inspected: "Pi/OpenCode/proxy/managed diffs, tests, ancestry and verification record"
+    result: "Found managed OpenCode GPT drop and SIGTERM/SIGHUP stale-loopback risk; no material new security/data exposure."
+finding_reproductions:
+  - finding: "Managed OpenCode GPT/Responses allowlists were silently discarded."
+    severity: medium
+    reproduction: "managed_state_overrides for an OpenCode-only system.ai.gpt-5 list returned {}; managed_unservable_models returned the valid GPT id."
+    disposition: "reproduced and fixed in D"
+  - finding: "Catchable terminal termination could leave Pi pointed at a dead loopback proxy."
+    severity: medium
+    reproduction: "Launch installed a loopback URL durably, while cleanup existed only in finally and default SIGTERM/SIGHUP terminated without unwinding it."
+    disposition: "reproduced by control-flow contradiction and fixed/tested in B"
+  - finding: "Legacy private-Pi backup names could overwrite a user's standard Pi config on revert."
+    severity: high
+    reproduction: "An existing legacy backup prevented backup_existing_file from saving the standard config; restore_file then restored the unrelated legacy content."
+    disposition: "reproduced and fixed/tested in A"
+  - finding: "Explicit NOT_READY OSS endpoints were advertised."
+    severity: medium
+    reproduction: "_oss_specs_from_foundation_models returned an MLflow chat spec whose endpoint state.ready was NOT_READY."
+    disposition: "reproduced and fixed/tested in E"
+  - finding: "Verification record was stale and lane ownership/scope contradicted the actual diffs."
+    severity: high
+    reproduction: "Recorded B/C hashes were superseded, closure sections were empty, setCacheKey false was in E rather than D, and B/A/E wording understated their surfaces."
+    disposition: "reproduced and corrected in this handoff"
+fixes_and_re_review:
+  - "A uses pi-agent-models/settings backup names and passes the legacy-collision upgrade/revert tests."
+  - "B forwards SIGTERM/SIGHUP to Pi, unwinds through direct-URL restoration, restores prior signal handlers, and passes 114 focused tests."
+  - "D maps codex family models to OpenCode's openai bucket; independent D re-review passed 731 tests and all static gates."
+  - "E applies one shared explicit-readiness predicate across capability/spec paths; 792 tests and static gates pass."
+  - "Integration reconciliation passes 735 focused tests; final static gates pass; final full-suite failures exactly match origin/main."
+adjudication:
+  adjudicator: "Codex root"
+  accepted_findings: ["Pi backup collision", "Pi catchable-signal cleanup", "OpenCode managed GPT bucketing", "explicit NOT_READY OSS filtering", "evidence/scope ownership"]
+  rejected_findings:
+    - "Mixed invalid/valid Pi allowlist first-entry selection is pre-existing on origin/main and outside this change."
+  baseline_failures:
+    - "Two Claude smart-routing local Unix-socket tests fail identically on origin/main."
+    - "Claude CLI no longer reaches the localhost user-agent capture harness and fails identically on origin/main."
+  external_effects: "No push, PR, merge, deployment, publication, access change, or Databricks workspace mutation."
+unavailable_checks:
+  - check: "Beads task graph lifecycle"
+    reason: "The installed bd binary cannot read the repository's newer schema; no task-graph pass or mutation is claimed."
+    owner: "human/tooling environment"
+  - check: "miniwiki skill workflow"
+    reason: "The repository requests /skill:miniwiki, but that skill is not exposed in this runtime; continuity uses the existing miniwiki and verification artefacts directly."
+    owner: "agent runtime"
+  - check: "fresh post-install Pi/OpenCode live inference"
+    reason: "The environment approval gate rejected a live Databricks model invocation because this turn lacks explicit user authorisation for a new live call. The earlier serial ai-dev-tools lane passed, but no fresh post-install live pass is claimed."
+    owner: "user authorisation"
+residual_risks:
+  - "Uncatchable SIGKILL or power loss can still interrupt Pi before cleanup; the next ucode Pi launch and the local recovery helper repair a stale loopback URL."
+  - "Some live backend/model combinations remain unsupported or return no printable output: stale 404s, Gemini image-tool incompatibility, Qwen role-template rejection, and several OSS response-shape gaps."
+  - "The old Goal-mode Pi session remains malformed; it cannot be resumed because the provider rejected an orphaned tool_result with no immediately preceding matching tool_use."
+  - "The main dev checkout remains separately mid-merge and was deliberately not modified."
+final_decision:
+  status: "human-escalation"
+  code_decision: "accept local corrected PR stack at A 8fc337e, C c8e7114, E 763fa3e, B 5ac7937, D 210312e, integration 434bc3b"
+  installation_decision: "accept local ucode reinstall and repaired Pi config"
+  pending_human_decision: "Authorise one fresh read-only/inference smoke for Pi and OpenCode using explicit profile ai-dev-tools, or accept the recovered live evidence without repeating it."
+  publishing_decision: "not authorised; no remote action taken"

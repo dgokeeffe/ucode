@@ -616,9 +616,11 @@ def _managed_model_families(
     return claude, codex, gemini, oss
 
 
+DEFAULT_MODEL = "system.ai.gpt-6-luna"
+
+
 def default_model(state: dict) -> str | None:
-    """Prefer a managed Pi default/allowlist, then Claude opus → sonnet → haiku;
-    fall back to codex, Gemini, then OSS.
+    """Prefer a managed Pi default/allowlist, then the Unity Gateway default.
 
     A managed config's ``pi_default_model`` and ``pi_models`` both win outright: the former is
     the admin's chosen session start, the latter their allowlist. Workspace-wide discovery falls back.
@@ -641,7 +643,7 @@ def default_model(state: dict) -> str | None:
     oss_models = state.get("oss_models") or []
     if oss_models:
         return oss_models[0]
-    return next(iter(claude_models.values()), None)
+    return DEFAULT_MODEL
 
 
 def _configure_launch(state: dict) -> str:
