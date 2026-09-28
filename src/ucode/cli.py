@@ -19,7 +19,7 @@ from rich.text import Text
 from typer import _click
 from typer.core import HAS_RICH, TyperCommand, TyperGroup, TyperOption
 
-from ucode import custom_oauth
+from ucode import custom_oauth, token_cache
 from ucode.agents import (
     TOOL_SPECS,
     LaunchOptions,
@@ -1927,6 +1927,34 @@ def mcp_proxy_cmd(
     serve(url, workspace, profile, use_pat=use_pat or bool(state.get("use_pat")))
 
 
+# Pi kills its `!command` apiKey after 10s (and discards stderr); leave room for
+# interpreter startup so a slow CLI fails with our error rather than pi's.
+AUTH_TOKEN_CLI_BUDGET_SECONDS = 7.0
+AUTH_TOKEN_ERROR_LOG_MAX_BYTES = 256 * 1024
+
+
+def _log_auth_token_failure(workspace: str, profile: str | None, message: str) -> None:
+    """Append a failure to ~/.ucode/auth-token-errors.log, best-effort.
+
+    Agents run `auth-token` headless and some (pi) throw its stderr away, so
+    without this the only trace of *why* a turn failed is a generic error."""
+    import time
+
+    from ucode import config_io
+
+    path = config_io.APP_DIR / "auth-token-errors.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > AUTH_TOKEN_ERROR_LOG_MAX_BYTES:
+            path.unlink()
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        line = " ".join(message.split())
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{stamp} host={workspace} profile={profile or '<none>'} {line}\n")
+    except OSError:
+        pass
+
+
 @app.command("auth-token", hidden=True)
 def auth_token_cmd(
     host: Annotated[
@@ -2021,8 +2049,25 @@ def auth_token_cmd(
                 force_refresh=force_refresh,
             )
         else:
-            token = get_databricks_token(workspace, profile, force_refresh=force_refresh)
+            # token_cache.read/write are no-ops when DATABRICKS_BEARER(_COMMAND)
+            # owns auth — including the bearer the --use-pat branch just exported —
+            # so only CLI-minted OAuth tokens are ever cached.
+            cached = None if force_refresh else token_cache.read(workspace, profile)
+            if cached:
+                token = cached
+            else:
+                # Headless helper: bound the CLI call, and skip the
+                # `auth login --no-browser` fallback — nobody sees its URL here.
+                token = get_databricks_token(
+                    workspace,
+                    profile,
+                    force_refresh=force_refresh,
+                    budget_seconds=AUTH_TOKEN_CLI_BUDGET_SECONDS,
+                    allow_reauth=False,
+                )
+                token_cache.write(workspace, profile, token)
     except RuntimeError as exc:
+        _log_auth_token_failure(workspace, profile, str(exc))
         print_err(str(exc))
         raise typer.Exit(1) from None
     # Write the bare token (with trailing newline) to stdout — nothing else may
@@ -2074,18 +2119,10 @@ def otel_headers_cmd(
 
 
 def _oauth_token_is_fresh(token: str, buffer_seconds: float = 120) -> bool:
-    import base64
-    import binascii
-    import json
     import time
 
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        expires_at = float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
-    except (IndexError, KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError):
-        return False
-    return time.time() < expires_at - buffer_seconds
+    expires_at = token_cache.token_expiry(token)
+    return expires_at is not None and time.time() < expires_at - buffer_seconds
 
 
 @app.command("codex-router-hook", hidden=True)

@@ -22,6 +22,7 @@ from typer.testing import CliRunner
 
 import ucode.cli as cli_mod
 import ucode.databricks as db_mod
+from ucode import token_cache
 from ucode.cli import app
 from ucode.databricks import GatewayProbe
 
@@ -53,8 +54,9 @@ def test_oss_discovery_diagnostic_names_all_consumers(monkeypatch):
     assert notes[0] == "OSS models (needed for: codex, opencode, pi): not found"
 
 
-def _jwt(expires_at: float) -> str:
-    payload = base64.urlsafe_b64encode(json.dumps({"exp": expires_at}).encode()).decode()
+def _jwt(expires_at: float, sub: str = "user") -> str:
+    claims = {"exp": expires_at, "sub": sub}
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode()
     return f"header.{payload.rstrip('=')}.signature"
 
 
@@ -202,8 +204,9 @@ class TestProjectScripts:
             "project"
         ]["scripts"]
 
-        assert scripts["ug"] == "ucode.cli:main"
-        assert scripts["ucode"] == "ucode.cli:main"
+        # _entry serves cached `auth-token` bearers before importing ucode.cli.
+        assert scripts["ug"] == "ucode._entry:main"
+        assert scripts["ucode"] == "ucode._entry:main"
 
 
 class TestUpgrade:
@@ -1763,6 +1766,9 @@ class TestMcpSubcommands:
         assert calls == [{"claude", "codex"}]
 
 
+_HELPER_KW = {"budget_seconds": cli_mod.AUTH_TOKEN_CLI_BUDGET_SECONDS, "allow_reauth": False}
+
+
 class TestAuthTokenCommand:
     """`ucode auth-token` is the cross-platform apiKeyHelper (#116)."""
 
@@ -1787,7 +1793,7 @@ class TestAuthTokenCommand:
         # Nothing but the bare token (plus trailing newline) may reach stdout,
         # or the consuming agent will treat the noise as part of the token.
         assert result.stdout == "tok-123\n"
-        fetch.assert_called_once_with("https://ws", None, force_refresh=False)
+        fetch.assert_called_once_with("https://ws", None, force_refresh=False, **_HELPER_KW)
 
     def test_host_and_profile_override_state(self):
         with (
@@ -1798,7 +1804,7 @@ class TestAuthTokenCommand:
                 app, ["auth-token", "--host", "https://override", "--profile", "prod"]
             )
         assert result.exit_code == 0
-        fetch.assert_called_once_with("https://override", "prod", force_refresh=False)
+        fetch.assert_called_once_with("https://override", "prod", force_refresh=False, **_HELPER_KW)
 
     def test_force_refresh_is_forwarded(self):
         with (
@@ -1807,7 +1813,21 @@ class TestAuthTokenCommand:
         ):
             result = runner.invoke(app, ["auth-token", "--force-refresh"])
         assert result.exit_code == 0
-        fetch.assert_called_once_with("https://ws", None, force_refresh=True)
+        fetch.assert_called_once_with("https://ws", None, force_refresh=True, **_HELPER_KW)
+
+    def test_failure_is_logged_for_headless_callers(self):
+        # pi discards the helper's stderr, so the cause must land on disk too.
+        from ucode import config_io
+
+        with (
+            patch("ucode.cli.load_state", return_value={}),
+            patch("ucode.cli.get_databricks_token", side_effect=RuntimeError("boom\nsecond line")),
+        ):
+            result = runner.invoke(app, ["auth-token", "--host", "https://ws", "--profile", "p"])
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        log = (config_io.APP_DIR / "auth-token-errors.log").read_text()
+        assert "host=https://ws profile=p boom second line" in log
 
     def test_errors_without_workspace(self):
         with patch("ucode.cli.load_state", return_value={}):
@@ -1866,6 +1886,60 @@ class TestAuthTokenCommand:
         # Never attempted OAuth, and nothing leaked to stdout.
         fetch.assert_not_called()
         assert result.stdout == ""
+
+    def test_serves_cached_oauth_token_without_cli(self):
+        token = _jwt(time.time() + 3600)
+        token_cache.write("https://ws", "prod", token)
+        with (
+            patch("ucode.cli.load_state", return_value={}),
+            patch("ucode.cli.get_databricks_token") as fetch,
+        ):
+            result = runner.invoke(app, ["auth-token", "--host", "https://ws", "--profile", "prod"])
+        assert result.exit_code == 0
+        assert result.stdout == token + "\n"
+        fetch.assert_not_called()
+
+    def test_caches_fetched_oauth_token(self):
+        token = _jwt(time.time() + 3600)
+        with (
+            patch("ucode.cli.load_state", return_value={}),
+            patch("ucode.cli.get_databricks_token", return_value=token),
+        ):
+            result = runner.invoke(app, ["auth-token", "--host", "https://ws"])
+        assert result.exit_code == 0
+        assert token_cache.read("https://ws", None) == token
+
+    def test_force_refresh_bypasses_and_replaces_cache(self):
+        stale, fresh = _jwt(time.time() + 3600, "old"), _jwt(time.time() + 3600, "new")
+        token_cache.write("https://ws", None, stale)
+        with (
+            patch("ucode.cli.load_state", return_value={}),
+            patch("ucode.cli.get_databricks_token", return_value=fresh) as fetch,
+        ):
+            result = runner.invoke(app, ["auth-token", "--host", "https://ws", "--force-refresh"])
+        assert result.stdout == fresh + "\n"
+        fetch.assert_called_once_with("https://ws", None, force_refresh=True, **_HELPER_KW)
+        assert token_cache.read("https://ws", None) == fresh
+
+    def test_use_pat_never_touches_cache(self, monkeypatch):
+        # A cached OAuth token must not be served in PAT mode, and the PAT must
+        # never be written to the cache.
+        monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
+        oauth_tok, pat = _jwt(time.time() + 3600, "oauth"), _jwt(time.time() + 3600, "pat")
+        token_cache.write("https://ws", "p", oauth_tok)
+        monkeypatch.setattr("ucode.databricks.resolve_pat_token", lambda p: pat)
+        with (
+            patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
+            patch(
+                "ucode.cli.get_databricks_token",
+                side_effect=lambda w, p, **_kwargs: os.environ.get("DATABRICKS_BEARER", ""),
+            ),
+        ):
+            result = runner.invoke(app, ["auth-token", "--use-pat", "--profile", "p"])
+        assert result.stdout == pat + "\n"
+        monkeypatch.delenv("DATABRICKS_BEARER")
+        # The pre-existing OAuth entry is untouched, not overwritten by the PAT.
+        assert token_cache.read("https://ws", "p") == oauth_tok
 
     def test_use_pat_honors_non_empty_bearer_env(self, monkeypatch):
         # A real pre-set bearer (CI escape hatch) wins over the profile PAT.

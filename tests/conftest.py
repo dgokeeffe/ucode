@@ -36,10 +36,12 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     import ucode.managed_config as managed_config_mod
     import ucode.managed_files as managed_files_mod
     import ucode.state as state_mod
+    import ucode.token_cache as token_cache_mod
     from ucode.agents import codex as codex_mod
 
     state_dir = tmp_path / ".ucode"
     state_dir.mkdir()
+    monkeypatch.setattr(token_cache_mod, "CACHE_DIR", state_dir / "token-cache")
     monkeypatch.setattr(state_mod, "STATE_PATH", state_dir / "state.json")
     monkeypatch.setattr(config_io_mod, "APP_DIR", state_dir)
     # MANAGED_CONFIG_PATH is bound from APP_DIR at import, so patching APP_DIR alone doesn't move it;
