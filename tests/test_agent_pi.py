@@ -280,7 +280,13 @@ class TestRenderOverlayProviders:
         provider = overlay["providers"]["databricks-mlflow"]
         assert provider["api"] == "openai-completions"
         assert provider["baseUrl"] == f"{WS}/ai-gateway/mlflow/v1"
-        assert provider["compat"] == {"supportsStore": False, "supportsStrictMode": False}
+        # supportsLongCacheRetention: the MLflow gateway 400s on the
+        # `prompt_cache_retention`/`prompt_cache_key` Pi sends for long retention.
+        assert provider["compat"] == {
+            "supportsStore": False,
+            "supportsStrictMode": False,
+            "supportsLongCacheRetention": False,
+        }
 
     def test_no_mlflow_provider_when_no_oss_models(self):
         overlay, _ = _overlay("gpt-5", codex_models=["gpt-5"])
@@ -632,6 +638,18 @@ class TestBuildRuntimeEnv:
     def test_sets_oauth_token(self):
         env = pi.build_runtime_env("tok")
         assert env["OAUTH_TOKEN"] == "tok"
+
+    def test_defaults_to_long_cache_retention(self, monkeypatch):
+        monkeypatch.delenv("PI_CACHE_RETENTION", raising=False)
+        assert pi.build_runtime_env("tok")["PI_CACHE_RETENTION"] == "long"
+
+    def test_blank_cache_retention_gets_the_default(self, monkeypatch):
+        monkeypatch.setenv("PI_CACHE_RETENTION", " ")
+        assert pi.build_runtime_env("tok")["PI_CACHE_RETENTION"] == "long"
+
+    def test_explicit_cache_retention_wins(self, monkeypatch):
+        monkeypatch.setenv("PI_CACHE_RETENTION", "short")
+        assert pi.build_runtime_env("tok")["PI_CACHE_RETENTION"] == "short"
 
     def test_sets_private_agent_dir_without_replacing_home(self, monkeypatch):
         monkeypatch.setenv("HOME", "/real-user-home")
