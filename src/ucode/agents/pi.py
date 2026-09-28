@@ -16,9 +16,11 @@ Per-provider `compat` flags work around fields the gateway translators reject:
   pi uses for every request. With this flag pi omits the per-tool field and
   sends the legacy `anthropic-beta: fine-grained-tool-streaming-...` header
   instead, which the gateway accepts.
-- mlflow: `supportsStore: false` and `supportsStrictMode: false` — the MLflow
-  chat-completions gateway rejects OpenAI's `store` field and
-  `tools[].function.strict`.
+- mlflow: `supportsStore: false`, `supportsStrictMode: false` and
+  `supportsLongCacheRetention: false` — the MLflow chat-completions gateway
+  rejects OpenAI's `store` field, `tools[].function.strict`, and the
+  `prompt_cache_retention` / `prompt_cache_key` fields Pi sends for long
+  cache retention (`json: unknown field`, HTTP 400).
 - openai: no `compat` flags needed, but the per-model `thinkingLevelMap`
   matters — see `_pi_gpt_model_entry`. Declaring `reasoning: true` without an
   off-state makes Pi send `reasoning: {effort: "none"}`, which `gpt-5`,
@@ -422,9 +424,15 @@ def render_overlay(
             "api": "openai-completions",
             "apiKey": api_key,
             "authHeader": True,
-            # MLflow chat-completions gateway rejects OpenAI's `store` field
-            # and per-tool `strict`. Pi omits both when these are false.
-            "compat": {"supportsStore": False, "supportsStrictMode": False},
+            # MLflow chat-completions gateway rejects OpenAI's `store` field,
+            # per-tool `strict`, and the `prompt_cache_retention` /
+            # `prompt_cache_key` pair Pi adds under long cache retention (which
+            # `build_runtime_env` turns on). Pi omits each when these are false.
+            "compat": {
+                "supportsStore": False,
+                "supportsStrictMode": False,
+                "supportsLongCacheRetention": False,
+            },
             "headers": ua_headers,
             "models": [_pi_oss_model_entry(m, specs_by_id.get(m)) for m in oss_models],
         }
@@ -657,10 +665,22 @@ def _configure_launch(state: dict) -> str:
     return token
 
 
+# Pi's default ("short") sends no retention hint, leaving OpenAI on its
+# in-memory prompt cache (~5-10 min idle) and Anthropic on the 5m TTL. "long"
+# requests `prompt_cache_retention: "24h"` (Responses) and `cache_control.ttl:
+# "1h"` (Anthropic); both verified accepted by AI Gateway. MLflow opts out via
+# `supportsLongCacheRetention: false` in its provider compat.
+PI_CACHE_RETENTION_DEFAULT = "long"
+
+
 def build_runtime_env(token: str) -> dict[str, str]:
     env = os.environ.copy()
     env["OAUTH_TOKEN"] = token
     env["PI_CODING_AGENT_DIR"] = str(PI_CONFIG_DIR)
+    # An explicit PI_CACHE_RETENTION (e.g. `short` to avoid Anthropic's 2x
+    # 1h cache-write price) wins.
+    if not env.get("PI_CACHE_RETENTION", "").strip():
+        env["PI_CACHE_RETENTION"] = PI_CACHE_RETENTION_DEFAULT
     return env
 
 
