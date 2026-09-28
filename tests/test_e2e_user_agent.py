@@ -224,6 +224,11 @@ def _run_until_first_request(
     state. The poll exits as soon as the request arrives, so a warm run stays
     fast and only a genuine failure pays the full wait.
     """
+    # Any `ug auth-token` the agent spawns runs outside pytest's isolation: give
+    # it the bearer short-circuit so it never drives the developer's real
+    # Databricks CLI or writes ~/.ucode (token cache, auth-token-errors.log).
+    # These tests assert on headers, not credentials; callers can still override.
+    env = {"DATABRICKS_BEARER": "test-token", **env}
     proc = subprocess.Popen(
         cmd,
         env=env,

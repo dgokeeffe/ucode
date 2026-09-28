@@ -30,6 +30,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import quote, urlencode, urlparse
 
+from ucode import token_cache
 from ucode.config_io import APP_DIR
 from ucode.constants import (
     MODEL_PROVIDER_SERVICE_HEADER,
@@ -628,7 +629,7 @@ def run(
     capture_output: bool = False,
     text: Literal[True],
     env: dict[str, str] | None = None,
-    timeout: int | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -640,7 +641,7 @@ def run(
     capture_output: bool = False,
     text: Literal[False] = False,
     env: dict[str, str] | None = None,
-    timeout: int | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[bytes]: ...
 
 
@@ -651,7 +652,7 @@ def run(
     capture_output: bool = False,
     text: bool = False,
     env: dict[str, str] | None = None,
-    timeout: int | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         args,
@@ -1096,6 +1097,9 @@ def run_databricks_login(workspace: str, profile: str | None = None) -> None:
         raise RuntimeError("`databricks auth login` failed.") from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("`databricks auth login` timed out.") from exc
+    # A fresh login may change the identity behind the profile; drop any bearer
+    # `ug auth-token` cached for the previous session.
+    token_cache.clear()
     print_success("Databricks authentication complete")
 
 
@@ -1162,7 +1166,16 @@ def get_databricks_token(
     profile: str | None = None,
     *,
     force_refresh: bool = False,
+    budget_seconds: float | None = None,
+    allow_reauth: bool = True,
 ) -> str:
+    """Mint a Databricks bearer for ``workspace`` via the CLI.
+
+    ``budget_seconds`` caps the total wall-clock spent in `databricks auth token`
+    (across cache-lock retries) for callers that run under a hard deadline —
+    pi kills its apiKey command after 10s. ``allow_reauth=False`` skips the
+    `auth login --no-browser` fallback, which needs a human to open the printed
+    URL and so can only burn time when no one is watching the output."""
     # ``DATABRICKS_BEARER`` is the CI escape hatch: when set, skip the
     # `databricks auth token` subprocess entirely and return the pre-fetched
     # bearer directly. Used by the e2e job, where the protected runner has
@@ -1207,8 +1220,19 @@ def get_databricks_token(
         + f" profile={profile or '<none>'}",
     )
 
+    deadline = None if budget_seconds is None else time.monotonic() + budget_seconds
+    last_error = ""
+
+    def _remaining() -> float:
+        return 15.0 if deadline is None else min(15.0, deadline - time.monotonic())
+
     def _fetch() -> tuple[str, str]:
         """Return (access_token, stderr). token is '' on any failure."""
+        nonlocal last_error
+        timeout = _remaining()
+        if timeout <= 0:
+            last_error = f"`databricks auth token` exceeded the {budget_seconds:g}s budget"
+            return "", last_error
         try:
             result = run(
                 cmd,
@@ -1216,14 +1240,21 @@ def get_databricks_token(
                 capture_output=True,
                 text=True,
                 env=env,
-                timeout=15,
+                timeout=timeout,
             )
             _debug("auth token", _format_subprocess_result(result))
             if result.returncode == 0:
                 return json.loads(result.stdout or "{}").get("access_token", ""), ""
-            return "", result.stderr or ""
-        except (subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+            stderr = result.stderr or ""
+            last_error = stderr.strip().splitlines()[-1][:300] if stderr.strip() else ""
+            return "", stderr
+        except subprocess.TimeoutExpired as exc:
             _debug("auth token", f"exception: {type(exc).__name__}: {exc}")
+            last_error = f"`databricks auth token` timed out after {timeout:.1f}s"
+            return "", str(exc)
+        except json.JSONDecodeError as exc:
+            _debug("auth token", f"exception: {type(exc).__name__}: {exc}")
+            last_error = "`databricks auth token` returned invalid JSON"
             return "", str(exc)
 
     def _fetch_with_lock_retry() -> str:
@@ -1246,7 +1277,7 @@ def get_databricks_token(
         return ""
 
     token = _fetch_with_lock_retry()
-    if not token:
+    if not token and allow_reauth:
         # Session may have expired — attempt non-interactive re-auth and retry once.
         _debug("auth token", "empty on first fetch; attempting auth login --no-browser")
         try:
@@ -1271,7 +1302,9 @@ def get_databricks_token(
         token = _fetch_with_lock_retry()
 
     if not token:
-        profile_name = profile or find_profile_name_for_host(workspace)
+        # ``profile`` was already resolved from the host above; re-running the
+        # (slow, uncached) `databricks auth profiles` lookup can't change it.
+        profile_name = profile
         stale_profile_hint = ""
         if profile_name:
             stale_profile_hint = (
@@ -1279,8 +1312,9 @@ def get_databricks_token(
                 f"  databricks auth logout --profile {profile_name}\n"
                 f"  databricks auth login --host {workspace} --profile {profile_name}"
             )
+        cause = f" ({last_error})" if last_error else ""
         raise RuntimeError(
-            f"Databricks CLI returned no access token for {workspace}. "
+            f"Databricks CLI returned no access token for {workspace}{cause}. "
             "Run `databricks auth login` to re-authenticate."
             f"{stale_profile_hint}"
         )

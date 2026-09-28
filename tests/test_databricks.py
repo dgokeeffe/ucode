@@ -2965,6 +2965,42 @@ class TestGetDatabricksToken:
         with pytest.raises(RuntimeError, match="no access token"):
             get_databricks_token(WS)
 
+    def test_allow_reauth_false_skips_login_fallback(self, tmp_path, monkeypatch):
+        # The headless `auth-token` helper must not run `auth login --no-browser`:
+        # nobody sees its URL, so it only burns time under the agent's deadline.
+        argv_log = tmp_path / "argv"
+        env = self._fake_databricks(
+            tmp_path,
+            f'echo "$*" >> {argv_log}\necho "Error: refresh token is invalid" >&2\nexit 1',
+        )
+        monkeypatch.setattr("os.environ", env)
+        with pytest.raises(RuntimeError, match=r"no access token.*refresh token is invalid"):
+            get_databricks_token(WS, profile="p", allow_reauth=False)
+        calls = argv_log.read_text().splitlines()
+        assert calls and not any("auth login" in c for c in calls)
+
+    def test_budget_bounds_a_hung_cli(self, tmp_path, monkeypatch):
+        env = self._fake_databricks(tmp_path, "sleep 5")
+        monkeypatch.setattr("os.environ", env)
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="timed out after"):
+            get_databricks_token(WS, profile="p", budget_seconds=0.5, allow_reauth=False)
+        assert time.monotonic() - started < 3
+
+    def test_budget_spans_lock_retries(self, tmp_path, monkeypatch):
+        # Each lock-contention retry draws from the same budget, not a fresh 15s.
+        env = self._fake_databricks(
+            tmp_path,
+            "sleep 0.4\n"
+            'echo "Error: forced token refresh: cache update: exit status 45" >&2\n'
+            "exit 1",
+        )
+        monkeypatch.setattr("os.environ", env)
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="no access token"):
+            get_databricks_token(WS, profile="p", budget_seconds=0.6, allow_reauth=False)
+        assert time.monotonic() - started < 2
+
     def test_passes_profile_flag_when_provided(self, tmp_path, monkeypatch):
         # Fake CLI that records its argv to a file so we can assert the
         # --profile flag is forwarded to `databricks auth token`.
