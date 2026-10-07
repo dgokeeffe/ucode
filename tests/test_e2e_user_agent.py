@@ -576,9 +576,11 @@ class TestPiUserAgent:
             pi.validate_cmd("pi"),
             env,
             server=capture_server,
-            path_prefix="/ai-gateway/anthropic",
+            # Configuration may discover /models first; assert on Pi's inference request.
+            path_prefix="/ai-gateway/anthropic/v1/messages",
         )
 
-        req = capture_server.first_request_with_path_prefix("/ai-gateway/anthropic")
+        req = capture_server.first_request_with_path_prefix("/ai-gateway/anthropic/v1/messages")
         assert req is not None, _no_request_msg(capture_server, result)
+        assert req.method == "POST"
         _assert_ua(req, _expected_ua("pi", "pi"))
