@@ -89,6 +89,7 @@ class TestReadWrite:
         import ucode.databricks as db_mod
 
         token_cache.write(WS, "prod", _jwt(time.time() + 3600))
+        monkeypatch.setattr(db_mod, "databricks_cli_path", lambda: "databricks")
         monkeypatch.setattr(db_mod, "run", lambda *a, **k: None)
         db_mod.run_databricks_login(WS, "prod")
         assert token_cache.read(WS, "prod") is None

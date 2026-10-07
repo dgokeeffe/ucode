@@ -13,11 +13,22 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from ucode.smart_routing import claude_pty
+
+
+@pytest.fixture
+def socket_path():
+    # macOS pytest tmp_path names can exceed AF_UNIX's roughly 104-byte limit.
+    with tempfile.TemporaryDirectory(prefix="ug-pty-") as directory:
+        yield Path(directory) / "first.sock"
+
 
 # ---------------------------------------------------------------------------
 # Helpers shared across tests
@@ -73,11 +84,10 @@ def read_until(suffix):
 
 
 class TestPasteAndEnterSeparate:
-    def test_paste_and_enter_have_a_measurable_gap(self, tmp_path, monkeypatch):
+    def test_paste_and_enter_have_a_measurable_gap(self, tmp_path, monkeypatch, socket_path):
         monkeypatch.setattr(claude_pty, "READY_QUIET_S", 0.05)
         monkeypatch.setattr(claude_pty, "PASTE_SUBMIT_DELAY_S", 0.12)
 
-        socket_path = tmp_path / "first.sock"
         capture = tmp_path / "capture.json"
         fake_claude = tmp_path / "fc.py"
         _write_fake_claude(
@@ -128,14 +138,13 @@ capture_path.write_text(json.dumps({
 
 
 class TestEnterRetry:
-    def test_enter_is_retried_when_no_submission_signal(self, tmp_path, monkeypatch):
+    def test_enter_is_retried_when_no_submission_signal(self, tmp_path, monkeypatch, socket_path):
         """Without a post-claim hook call the loop resends CR up to MAX_SUBMIT_ATTEMPTS."""
         monkeypatch.setattr(claude_pty, "READY_QUIET_S", 0.05)
         monkeypatch.setattr(claude_pty, "PASTE_SUBMIT_DELAY_S", 0.05)
         monkeypatch.setattr(claude_pty, "SUBMIT_VERIFY_S", 0.15)
         monkeypatch.setattr(claude_pty, "MAX_SUBMIT_ATTEMPTS", 3)
 
-        socket_path = tmp_path / "first.sock"
         capture = tmp_path / "capture.json"
         fake_claude = tmp_path / "fc.py"
         _write_fake_claude(
@@ -179,14 +188,13 @@ capture_path.write_text(json.dumps({"cr_count": cr_count}))
         data = json.loads(capture.read_text())
         assert data["cr_count"] == 3, "expected the initial Enter plus two retries"
 
-    def test_enter_stops_retrying_on_submission_signal(self, tmp_path, monkeypatch):
+    def test_enter_stops_retrying_on_submission_signal(self, tmp_path, monkeypatch, socket_path):
         """A post-claim hook call fires submitted_event and stops further CR retries."""
         monkeypatch.setattr(claude_pty, "READY_QUIET_S", 0.05)
         monkeypatch.setattr(claude_pty, "PASTE_SUBMIT_DELAY_S", 0.05)
         monkeypatch.setattr(claude_pty, "SUBMIT_VERIFY_S", 0.4)  # long window so retries are slow
         monkeypatch.setattr(claude_pty, "MAX_SUBMIT_ATTEMPTS", 5)
 
-        socket_path = tmp_path / "first.sock"
         capture = tmp_path / "capture.json"
         fake_claude = tmp_path / "fc.py"
         _write_fake_claude(
@@ -246,13 +254,14 @@ capture_path.write_text(json.dumps({
 
 
 class TestSwitchTimeoutFailOpen:
-    def test_switch_timeout_sends_esc_then_pastes_and_submits(self, tmp_path, monkeypatch):
+    def test_switch_timeout_sends_esc_then_pastes_and_submits(
+        self, tmp_path, monkeypatch, socket_path
+    ):
         monkeypatch.setattr(claude_pty, "READY_QUIET_S", 0.05)
         monkeypatch.setattr(claude_pty, "SWITCH_TIMEOUT_S", 0.25)
         monkeypatch.setattr(claude_pty, "ESC_GAP_S", 0.05)
         monkeypatch.setattr(claude_pty, "PASTE_SUBMIT_DELAY_S", 0.05)
 
-        socket_path = tmp_path / "first.sock"
         capture = tmp_path / "capture.json"
         restore_called: list[bool] = []
         fake_claude = tmp_path / "fc.py"
@@ -302,12 +311,11 @@ capture_path.write_text(json.dumps({
 
 
 class TestPersistTimeoutFailOpen:
-    def test_persist_timeout_does_not_sigterm_and_submits(self, tmp_path, monkeypatch):
+    def test_persist_timeout_does_not_sigterm_and_submits(self, tmp_path, monkeypatch, socket_path):
         monkeypatch.setattr(claude_pty, "READY_QUIET_S", 0.05)
         monkeypatch.setattr(claude_pty, "MODEL_PERSIST_TIMEOUT_S", 0.25)
         monkeypatch.setattr(claude_pty, "PASTE_SUBMIT_DELAY_S", 0.05)
 
-        socket_path = tmp_path / "first.sock"
         capture = tmp_path / "capture.json"
         restore_called: list[bool] = []
         fake_claude = tmp_path / "fc.py"
@@ -359,13 +367,12 @@ capture_path.write_text(json.dumps({
 
 
 class TestWaitingToSwitchTimeout:
-    def test_ready_timeout_submits_without_model_switch(self, tmp_path, monkeypatch):
+    def test_ready_timeout_submits_without_model_switch(self, tmp_path, monkeypatch, socket_path):
         # READY_QUIET_S >> READY_TIMEOUT_S so the quiet check never fires first.
         monkeypatch.setattr(claude_pty, "READY_QUIET_S", 100.0)
         monkeypatch.setattr(claude_pty, "READY_TIMEOUT_S", 0.3)
         monkeypatch.setattr(claude_pty, "PASTE_SUBMIT_DELAY_S", 0.05)
 
-        socket_path = tmp_path / "first.sock"
         capture = tmp_path / "capture.json"
         fake_claude = tmp_path / "fc.py"
         _write_fake_claude(
@@ -420,8 +427,7 @@ capture_path.write_text(json.dumps({
 
 
 class TestOnSubmittedPromptCallback:
-    def test_callback_fires_on_post_claim_route_request(self, tmp_path):
-        socket_path = tmp_path / "first.sock"
+    def test_callback_fires_on_post_claim_route_request(self, socket_path):
         submitted: list[str] = []
         stop = threading.Event()
 
@@ -458,8 +464,7 @@ class TestOnSubmittedPromptCallback:
         assert r2 is not None and r2["action"] == "allow"
         assert submitted == ["fix the parser"], "on_submitted_prompt must fire once after claim"
 
-    def test_callback_not_fired_for_initial_block(self, tmp_path):
-        socket_path = tmp_path / "first.sock"
+    def test_callback_not_fired_for_initial_block(self, socket_path):
         submitted: list[str] = []
         stop = threading.Event()
 
@@ -477,11 +482,12 @@ class TestOnSubmittedPromptCallback:
             while not socket_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
 
-            claude_pty.request_first_prompt_route(
+            response = claude_pty.request_first_prompt_route(
                 socket_path, {"prompt": "fix the parser", "session_id": "s1"}
             )
             time.sleep(0.05)  # small pause so any spurious callback could fire
         finally:
             stop.set()
 
+        assert response is not None and response["action"] == "block"
         assert submitted == [], "on_submitted_prompt must not fire for the initial block"
