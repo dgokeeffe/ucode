@@ -267,8 +267,55 @@ class TestConfigureClientMcpServer:
         assert http_calls == []
         assert len(proxy_calls) == 1
 
+    def _capture_codex(self, monkeypatch, *, codex_client_available: bool):
+        http_calls: list[tuple[str, str, str]] = []
+        proxy_calls: list[tuple[str, list[str]]] = []
+        monkeypatch.setattr(
+            mcp, "oauth_client_available", lambda ws, client_id: codex_client_available
+        )
+        monkeypatch.setattr(mcp, "get_databricks_token", lambda *a, **k: "token")
+        monkeypatch.setattr(mcp, "mcp_service_needs_connection_login", lambda *a, **k: True)
+        monkeypatch.setattr(mcp, "remove_codex_mcp_server", lambda name: False)
+        monkeypatch.setattr(
+            mcp,
+            "add_codex_http_mcp_server",
+            lambda name, url, client_id: http_calls.append((name, url, client_id)),
+        )
+        monkeypatch.setattr(
+            mcp, "add_codex_mcp_server", lambda name, argv: proxy_calls.append((name, argv))
+        )
+        return http_calls, proxy_calls
+
+    def test_codex_aigw_service_registers_http_when_client_available(self, monkeypatch):
+        http_calls, proxy_calls = self._capture_codex(monkeypatch, codex_client_available=True)
+        mcp.configure_client_mcp_server("codex", "github", AIGW_MCP_URL, WS, "p")
+        assert http_calls == [("github", AIGW_MCP_URL, mcp.CODEX_CLI_OAUTH_CLIENT_ID)]
+        assert proxy_calls == []
+
+    def test_codex_aigw_service_falls_back_to_proxy_without_client(self, monkeypatch):
+        http_calls, proxy_calls = self._capture_codex(monkeypatch, codex_client_available=False)
+        mcp.configure_client_mcp_server("codex", "github", AIGW_MCP_URL, WS, "p")
+        assert http_calls == []
+        assert len(proxy_calls) == 1  # workspaces without codex-cli keep the stdio proxy
+
+    def test_codex_aigw_service_with_pat_keeps_proxy(self, monkeypatch):
+        # PAT auth has no interactive OAuth, so it can't use the HTTP login path.
+        http_calls, proxy_calls = self._capture_codex(monkeypatch, codex_client_available=True)
+        mcp.configure_client_mcp_server("codex", "github", AIGW_MCP_URL, WS, "p", use_pat=True)
+        assert http_calls == []
+        assert len(proxy_calls) == 1
+
+    def test_codex_no_login_service_uses_proxy(self, monkeypatch):
+        # A no-login mcp-service (web_search) must NOT get the native HTTP+OAuth entry (AIGTWY-4856).
+        http_calls, proxy_calls = self._capture_codex(monkeypatch, codex_client_available=True)
+        monkeypatch.setattr(mcp, "mcp_service_needs_connection_login", lambda *a, **k: False)
+        url = f"{WS}/ai-gateway/mcp-services/system.ai.web_search"
+        mcp.configure_client_mcp_server("codex", "web_search", url, WS, "p")
+        assert http_calls == []
+        assert len(proxy_calls) == 1
+
     def test_oauthless_client_keeps_proxy_and_skips_probe(self, monkeypatch):
-        # An agent with no mapped OAuth client (codex) always proxies, and must not
+        # An agent with no mapped OAuth client (gemini) always proxies, and must not
         # even probe /oidc — there's nothing it could pin.
         probed: list[str] = []
         proxy_calls: list[tuple[str, list[str]]] = []
@@ -276,12 +323,12 @@ class TestConfigureClientMcpServer:
             mcp, "oauth_client_available", lambda ws, client_id: probed.append(client_id) or True
         )
         monkeypatch.setattr(
-            mcp, "add_codex_mcp_server", lambda name, argv: proxy_calls.append((name, argv))
+            mcp, "add_gemini_mcp_server", lambda name, argv: proxy_calls.append((name, argv))
         )
-        monkeypatch.setattr(mcp, "remove_codex_mcp_server", lambda name: False)
-        mcp.configure_client_mcp_server("codex", "github", AIGW_MCP_URL, WS, "p")
+        monkeypatch.setattr(mcp, "remove_gemini_mcp_server", lambda name: False)
+        mcp.configure_client_mcp_server("gemini", "github", AIGW_MCP_URL, WS, "p")
         assert len(proxy_calls) == 1
-        assert probed == []  # AGENT_OAUTH_CLIENT has no entry for codex → no probe
+        assert probed == []  # AGENT_OAUTH_CLIENT has no entry for gemini → no probe
 
 
 class TestMcpPicker:
@@ -683,6 +730,20 @@ class TestManagedMcpEntry:
             http_client="cursor-oauth",
         )
         assert e == mcp.cursor.build_http_mcp_server_entry(self.MCP_URL, "cursor-oauth")
+
+    def test_codex_http_entry_uses_client_id(self, monkeypatch):
+        monkeypatch.setattr(mcp, "get_databricks_token", lambda *a, **k: "token")
+        monkeypatch.setattr(mcp, "mcp_service_needs_connection_login", lambda *a, **k: True)
+        e = mcp._managed_mcp_entry(
+            "codex",
+            self.MCP_URL,
+            WS,
+            None,
+            use_pat=False,
+            always_load=False,
+            http_client="codex-cli",
+        )
+        assert e == mcp.codex.managed_mcp_http_entry(self.MCP_URL, "codex-cli")
 
     def test_other_agents_use_stdio_proxy_entry(self):
         argv = self._argv()
@@ -3938,6 +3999,72 @@ class TestParseMcpListOutput:
         # A hard ✘ failure whose message happens to mention authentication is still a failure.
         out = "svc: https://ws/x (HTTP) - ✘ Failed to connect — 401 authentication error\n"
         assert mcp.parse_mcp_list_output("claude", out) == {"svc": mcp.LIVE_FAILED}
+
+
+class TestConfiguredMcpServersByName:
+    """The shared enumeration used by both `ug mcp list` and `ug status`."""
+
+    @pytest.fixture(autouse=True)
+    def _no_managed_files(self, monkeypatch):
+        # Default: no OS-managed-file servers, so state-only cases are deterministic.
+        monkeypatch.setattr(mcp.claude, "read_managed_mcp_urls", dict)
+        monkeypatch.setattr(mcp.codex, "read_managed_mcp_urls", dict)
+
+    def _state(self):
+        return {
+            "mcp_servers": [
+                {"name": "system-ai-github", "url": "u1", "clients": ["claude", "codex"]},
+                {
+                    "name": mcp.SKILLS_MCP_SERVER_NAME,
+                    "kind": mcp.SKILLS_MCP_KIND,
+                    "clients": ["claude"],
+                },
+            ],
+            "managed_mcp_servers": [
+                {"name": "system-ai-github", "url": "u1", "clients": ["cursor"]},
+                {"name": "databricks-genie-abc", "url": "u2", "clients": ["claude"]},
+            ],
+        }
+
+    def test_merges_by_name_and_unions_clients(self):
+        by_name = mcp.configured_mcp_servers_by_name(self._state())
+        assert set(by_name) == {"system-ai-github", "databricks-genie-abc"}
+        gh = by_name["system-ai-github"]
+        # Developer + workspace-managed entries unioned; managed flag sticks.
+        assert gh["clients"] == ["claude", "codex", "cursor"]
+        assert gh["managed"] is True
+
+    def test_excludes_skills_connection(self):
+        assert mcp.SKILLS_MCP_SERVER_NAME not in mcp.configured_mcp_servers_by_name(self._state())
+
+    def test_agents_scope_drops_servers_with_no_in_scope_agent(self):
+        by_name = mcp.configured_mcp_servers_by_name(self._state(), agents={"cursor"})
+        # Only the github service has a cursor client; genie (claude-only) is dropped.
+        assert set(by_name) == {"system-ai-github"}
+        assert by_name["system-ai-github"]["clients"] == ["cursor"]
+
+    def test_includes_servers_delivered_via_os_managed_files(self, monkeypatch):
+        # Managed servers written to the agents' OS-managed files (Claude/Codex) live in those
+        # files, not state, so `ug status`/`ug mcp list` must still see them via the managed-file read.
+        url = f"{WS}/ai-gateway/mcp-services/system.ai.slack"
+        monkeypatch.setattr(mcp.claude, "read_managed_mcp_urls", lambda: {"system-ai-slack": url})
+        monkeypatch.setattr(mcp.codex, "read_managed_mcp_urls", lambda: {"system-ai-slack": url})
+        by_name = mcp.configured_mcp_servers_by_name({"mcp_servers": [], "managed_mcp_servers": []})
+        assert "system-ai-slack" in by_name
+        entry = by_name["system-ai-slack"]
+        # Delivered to both agents' managed files → unioned, flagged managed, URL preserved.
+        assert entry["clients"] == ["claude", "codex"]
+        assert entry["managed"] is True
+        assert entry["server"]["url"] == url
+
+    def test_managed_file_read_respects_agents_scope(self, monkeypatch):
+        url = f"{WS}/ai-gateway/mcp-services/system.ai.slack"
+        monkeypatch.setattr(mcp.claude, "read_managed_mcp_urls", lambda: {"system-ai-slack": url})
+        monkeypatch.setattr(mcp.codex, "read_managed_mcp_urls", lambda: {"system-ai-slack": url})
+        by_name = mcp.configured_mcp_servers_by_name(
+            {"mcp_servers": [], "managed_mcp_servers": []}, agents={"codex"}
+        )
+        assert by_name["system-ai-slack"]["clients"] == ["codex"]
 
 
 class TestListMcpCommand:

@@ -26,6 +26,7 @@ from ucode.databricks import (
 )
 from ucode.managed_config import refresh_managed_config
 from ucode.managed_files import managed_write_batch
+from ucode.os_compatibility import subprocess_cross_os
 from ucode.state import get_provider_service, load_state, save_state
 from ucode.telemetry import agent_version
 from ucode.ui import (
@@ -37,6 +38,7 @@ from ucode.ui import (
     prompt_yes_no,
     prompt_yes_no_default,
     spinner,
+    status_subprocess_stdout,
 )
 
 from . import claude, codex, copilot, gemini, opencode, pi
@@ -138,7 +140,7 @@ def _update_installed_tool_binary(tool: str, version: str | None = None) -> bool
         # Detach potentially incompatible metadata until the next validated refresh.
         codex.detach_app_model_catalog()
     try:
-        subprocess.run(command, check=True, timeout=300)
+        subprocess_cross_os.run(command, check=True, timeout=300, stdout=status_subprocess_stdout())
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         print_warning(f"Could not update {spec['display']}; continuing.")
         return False
@@ -230,8 +232,13 @@ def install_tool_binary(
     if tool == "codex":
         codex.detach_app_model_catalog()
     try:
-        subprocess.run(["npm", "install", "-g", package], check=True, timeout=300)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        subprocess_cross_os.run(
+            ["npm", "install", "-g", package],
+            check=True,
+            timeout=300,
+            stdout=status_subprocess_stdout(),
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         message = f"Failed to install {spec['display']} automatically."
         if strict:
             raise RuntimeError(message) from exc

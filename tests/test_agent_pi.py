@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1241,7 +1242,7 @@ class TestMlflowProxyLifecycle:
             patch.object(pi, "_start_oss_proxy", side_effect=start),
             patch.object(pi, "_configure_launch", side_effect=configure),
             patch.object(pi, "_restore_direct_oss_config") as restore,
-            patch.object(pi.subprocess, "Popen", return_value=proc),
+            patch.object(pi.subprocess_cross_os, "popen", return_value=proc),
             pytest.raises(SystemExit) as exit_info,
         ):
             pi.launch(state, [], options=LaunchOptions())
@@ -1261,7 +1262,7 @@ class TestMlflowProxyLifecycle:
             patch.object(pi, "_start_oss_proxy", return_value=proxy),
             patch.object(pi, "_configure_launch", return_value="tok"),
             patch.object(pi, "_restore_direct_oss_config") as restore,
-            patch.object(pi.subprocess, "Popen", return_value=proc),
+            patch.object(pi.subprocess_cross_os, "popen", return_value=proc),
             pytest.raises(SystemExit) as exit_info,
         ):
             pi.launch(state, [], options=LaunchOptions())
@@ -1285,7 +1286,7 @@ class TestMlflowProxyLifecycle:
             patch.object(pi, "_start_oss_proxy", return_value=proxy),
             patch.object(pi, "_configure_launch", configure),
             patch.object(pi, "_restore_direct_oss_config") as restore,
-            patch.object(pi.subprocess, "Popen", popen),
+            patch.object(pi.subprocess_cross_os, "popen", popen),
             pytest.raises((RuntimeError, OSError)) as exc_info,
         ):
             pi.launch(state, [], options=LaunchOptions())
@@ -1306,7 +1307,7 @@ class TestMlflowProxyLifecycle:
                 pi, "_restore_direct_oss_config", side_effect=RuntimeError("restore failed")
             ),
             patch.object(pi, "print_warning") as warning,
-            patch.object(pi.subprocess, "Popen", side_effect=OSError("binary missing")),
+            patch.object(pi.subprocess_cross_os, "popen", side_effect=OSError("binary missing")),
             pytest.raises(OSError, match="binary missing"),
         ):
             pi.launch(state, [], options=LaunchOptions())
@@ -1323,7 +1324,7 @@ class TestMlflowProxyLifecycle:
             patch.object(pi, "_start_oss_proxy", return_value=proxy),
             patch.object(pi, "_configure_launch", return_value="tok"),
             patch.object(pi, "_restore_direct_oss_config", side_effect=OSError("restore failed")),
-            patch.object(pi.subprocess, "Popen", return_value=proc),
+            patch.object(pi.subprocess_cross_os, "popen", return_value=proc),
             pytest.raises(OSError, match="restore failed"),
         ):
             pi.launch(state, [], options=LaunchOptions())
@@ -1355,6 +1356,28 @@ class TestBuildPiApiKey:
         api_key = pi.build_pi_api_key({"workspace": WS})
 
         assert api_key == f"!/tools/ug auth-token --host {WS}"
+
+    @pytest.mark.parametrize(
+        "ug_exe",
+        [r"C:\Users\me\.local\bin\ug.EXE", r"C:\Program Files\ug.exe", r"C:\Users\O'Brien\ug.exe"],
+    )
+    def test_windows_executable_path_survives_bash(self, monkeypatch, ug_exe):
+        # Pi runs `!command` through Git Bash on Windows, so the command must be
+        # POSIX-quoted: an unquoted `C:\...\ug.EXE` would lose its backslashes.
+        monkeypatch.setattr("ucode.databricks.platform.system", lambda: "Windows")
+        monkeypatch.setattr("ucode.databricks.shutil.which", lambda command: ug_exe)
+        api_key = pi.build_pi_api_key({"workspace": WS, "profile": "my profile", "use_pat": True})
+
+        assert api_key.startswith("!")
+        assert shlex.split(api_key[1:]) == [
+            ug_exe,
+            "auth-token",
+            "--host",
+            WS,
+            "--profile",
+            "my profile",
+            "--use-pat",
+        ]
 
     def test_omits_force_refresh(self):
         # Pi has no token cache on this path, so --force-refresh would round-trip
