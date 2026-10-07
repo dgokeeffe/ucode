@@ -172,15 +172,22 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(claude, "ug_version", lambda: "1.0")
     monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.0")
     # No admin ever touches this managed file, so the pre-ucode baseline has no picker (None) and
-    # ucode's last write is the current file. The static picker therefore reverts to that empty
-    # baseline (i.e. clears) on a later unmanaged run.
+    # ucode's last write is the current file. ucode recorded writing the static picker, so it reverts
+    # to that empty baseline (i.e. clears) on a later unmanaged run.
+    ug_picker: dict = {}
     monkeypatch.setattr(
         claude,
         "managed_file_snapshots",
         lambda tool, parser: managed_files.ManagedFileSnapshots(
             None,
             json.loads(h.claude_managed.read_text()) if h.claude_managed.exists() else None,
+            dict(ug_picker),
         ),
+    )
+    monkeypatch.setattr(
+        claude,
+        "record_ug_picker",
+        lambda tool, picker: (ug_picker.clear(), ug_picker.update(picker)),
     )
     monkeypatch.setattr(
         claude,

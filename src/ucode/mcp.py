@@ -38,9 +38,11 @@ from ucode.databricks import (
 from ucode.mcp_connection_login import connection_from_url
 from ucode.mcp_oauth import (
     CLAUDE_CODE_OAUTH_CLIENT_ID,
+    CODEX_CLI_OAUTH_CLIENT_ID,
     CURSOR_OAUTH_CLIENT_ID,
     oauth_client_available,
 )
+from ucode.os_compatibility import subprocess_cross_os
 from ucode.skills_api import (
     _SKILLS_WALK_DEADLINE_SECONDS,
     _SKILLS_WALK_TIMEOUT_REASON,
@@ -79,13 +81,18 @@ MCP_SQL_PATH = "/api/2.0/mcp/sql"
 # Both need the app *published on the workspace* (checked per-workspace via
 # `oauth_client_available`) and its loopback `/callback` redirect registered on
 # `/oidc` — which lacks dynamic client registration, so a pre-registered client is
-# required. Agents whose `mcp add` accept only a static bearer, not an OAuth client
-# — codex (`--bearer-token-env-var`), gemini (`--header`) — stay on the stdio proxy
-# even where their apps exist; add one here (with its registration branch below)
-# once its CLI can pin a client.
+# required.
+#   - Codex: a `url` server with `oauth.client_id` (`codex mcp add --oauth-client-id
+#     --oauth-resource`). Codex derives a per-MCP-server callback path
+#     (`/callback/<hash>`) that can't be pre-registered, so `/oidc` accepts it via the
+#     `enableCodexLoopbackRedirectExemption` SAFE flag (loopback + codex-cli only).
+# Agents whose `mcp add` accepts only a static bearer, not an OAuth client — gemini
+# (`--header`) — stay on the stdio proxy even where their apps exist; add one here
+# (with its registration branch below) once its CLI can pin a client.
 AGENT_OAUTH_CLIENT = {
     "claude": CLAUDE_CODE_OAUTH_CLIENT_ID,
     "cursor": CURSOR_OAUTH_CLIENT_ID,
+    "codex": CODEX_CLI_OAUTH_CLIENT_ID,
 }
 
 MCP_CLIENTS = {
@@ -150,7 +157,7 @@ def add_codex_mcp_server(name: str, argv: list[str]) -> None:
     # `--` fences the proxy argv off from codex's own flag parser, registering
     # it as a stdio server (codex spawns the command and speaks MCP over it).
     try:
-        subprocess.run(
+        subprocess_cross_os.run(
             ["codex", "mcp", "add", name, "--", *argv],
             check=True,
             capture_output=True,
@@ -161,9 +168,40 @@ def add_codex_mcp_server(name: str, argv: list[str]) -> None:
         raise RuntimeError(f"Failed to add MCP server '{name}' via codex CLI.") from exc
 
 
+def add_codex_http_mcp_server(name: str, url: str, client_id: str) -> None:
+    """Register a Databricks MCP endpoint as a **direct HTTP** server so Codex is the OAuth client
+    and drives the RFC 8707 connection login itself, instead of the token-injecting stdio proxy.
+
+    `--oauth-client-id` pins the published `codex-cli` app and `--oauth-resource` sends the
+    connection FQN as the RFC 8707 resource so `/oidc` drives the connection's SaaS login. Codex
+    derives its own per-server loopback `/callback/<hash>` redirect at login time; `/oidc` accepts
+    that unregistered path via the `enableCodexLoopbackRedirectExemption` flag (loopback host only)."""
+    try:
+        subprocess_cross_os.run(
+            [
+                "codex",
+                "mcp",
+                "add",
+                name,
+                "--url",
+                url,
+                "--oauth-client-id",
+                client_id,
+                "--oauth-resource",
+                url,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Failed to add HTTP MCP server '{name}' via codex CLI.") from exc
+
+
 def remove_codex_mcp_server(name: str) -> bool:
     try:
-        result = subprocess.run(
+        result = subprocess_cross_os.run(
             ["codex", "mcp", "remove", name],
             check=False,
             capture_output=True,
@@ -192,7 +230,7 @@ def add_gemini_mcp_server(name: str, argv: list[str]) -> None:
     # Register the proxy as a stdio server: `gemini mcp add <name> <cmd> <args…>
     # --type stdio`. The scope/type flags trail the captured command + args.
     try:
-        subprocess.run(
+        subprocess_cross_os.run(
             [
                 "gemini",
                 "mcp",
@@ -216,7 +254,7 @@ def add_gemini_mcp_server(name: str, argv: list[str]) -> None:
 
 def remove_gemini_mcp_server(name: str) -> bool:
     try:
-        result = subprocess.run(
+        result = subprocess_cross_os.run(
             ["gemini", "mcp", "remove", name, "--scope", MCP_USER_SCOPE],
             check=False,
             capture_output=True,
@@ -322,6 +360,10 @@ def configure_client_mcp_server(
             return removed_scopes
         if client == "cursor":
             removed = cursor.write_http_mcp_server_config(name, url, client_id=http_client)
+            return [MCP_USER_SCOPE] if removed else []
+        if client == "codex":
+            removed = remove_codex_mcp_server(name)
+            add_codex_http_mcp_server(name, url, client_id=http_client)
             return [MCP_USER_SCOPE] if removed else []
 
     # Every other case registers the `ug mcp-proxy ...` stdio command; the proxy
@@ -1336,6 +1378,8 @@ def _managed_mcp_entry(
         return claude.user_stdio_mcp_entry(argv, always_load=always_load)
     if client == "cursor" and native_client is not None:
         return cursor.build_http_mcp_server_entry(url, native_client)
+    if client == "codex" and native_client is not None:
+        return codex.managed_mcp_http_entry(url, native_client)
     argv = build_mcp_proxy_argv(url, workspace, profile, use_pat=use_pat)
     if client == "codex":
         return codex.managed_mcp_entry(argv)
@@ -2316,8 +2360,13 @@ def _run_mcp_list(client: str) -> str | None:
     # Gemini reads its config from a pinned home dir, matching how ucode registers servers there.
     env = _gemini_cli_env() if client == "gemini" else None
     try:
-        result = subprocess.run(
-            argv, check=False, capture_output=True, text=True, timeout=90, env=env
+        result = subprocess_cross_os.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            env=env,
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -2444,6 +2493,42 @@ def _row_status(
     )
 
 
+def configured_mcp_servers_by_name(
+    state: dict, agents: set[str] | None = None
+) -> dict[str, dict[str, Any]]:
+    """Merge the developer- and workspace-managed MCP servers ug has configured, keyed by
+    registered name, unioning the agents each is on. Skills connections are excluded (they are
+    reported/handled separately). ``agents`` drops agents outside that scope, and a server left
+    with no in-scope agent is omitted. Each value is ``{"server", "clients", "managed"}``.
+
+    Managed servers (the ``managed_mcp_servers`` fallback state and each agent's OS-managed file)
+    come from the shared ``managed_mcp_servers`` helper, so this stays in agreement with ``ug mcp
+    list`` and the ``ug mcp add`` picker. Used by ``ug mcp list`` and ``ug status`` so both see the
+    same configured-server set regardless of how a managed server was delivered."""
+    configured: dict[str, dict[str, Any]] = {}
+
+    def _collect(server: dict, *, managed: bool) -> None:
+        name = _server_name(server)
+        if not name or server.get("kind") == SKILLS_MCP_KIND:
+            return
+        clients = [
+            client for client in _mcp_server_clients(server) if agents is None or client in agents
+        ]
+        if not clients:
+            return
+        entry = configured.setdefault(name, {"server": server, "clients": [], "managed": managed})
+        entry["clients"] = _merge_clients(entry["clients"], clients)
+        entry["managed"] = entry["managed"] or managed
+
+    for server in state.get("mcp_servers") or []:
+        _collect(server, managed=False)
+    # Fallback ``managed_mcp_servers`` state + each agent's OS-managed file, via the shared helper
+    # (keeps the isinstance guard and _MANAGED_FILE_AGENTS set, so this can't drift from `ug mcp list`).
+    for server in managed_mcp_servers(state, agents):
+        _collect(server, managed=True)
+    return configured
+
+
 def list_mcp_command(agents: set[str] | None = None) -> int:
     """`ug mcp list`: show the Databricks MCP servers ug has configured and their live
     connection status in each coding agent, one row per server.
@@ -2475,28 +2560,10 @@ def list_mcp_command(agents: set[str] | None = None) -> int:
 
     live = _query_live_statuses(probe_clients)
 
-    # Merge developer- and workspace-managed servers by registered name, unioning their agents.
-    # ``--agents`` drops agents outside the scope, and a server left with no in-scope agent is
-    # omitted. The skills connection is intentionally excluded — it's reported by the skill commands.
-    configured: dict[str, dict[str, Any]] = {}
-
-    def _collect(server: dict, *, managed: bool) -> None:
-        name = _server_name(server)
-        if not name or server.get("kind") == SKILLS_MCP_KIND:
-            return
-        clients = [
-            client for client in _mcp_server_clients(server) if agents is None or client in agents
-        ]
-        if not clients:
-            return
-        entry = configured.setdefault(name, {"server": server, "clients": [], "managed": managed})
-        entry["clients"] = _merge_clients(entry["clients"], clients)
-        entry["managed"] = entry["managed"] or managed
-
-    for server in state.get("mcp_servers") or []:
-        _collect(server, managed=False)
-    for server in managed_mcp_servers(state, agents):
-        _collect(server, managed=True)
+    # Merge developer- and workspace-managed servers by registered name, unioning their agents
+    # (shared with `ug status` so both see the same configured-server set, including the servers
+    # delivered through the agents' OS-managed files).
+    configured = configured_mcp_servers_by_name(state, agents)
 
     if configured:
         table = Table(box=None, pad_edge=False, header_style="bold")

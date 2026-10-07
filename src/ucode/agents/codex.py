@@ -7,7 +7,6 @@ import hashlib
 import os
 import re
 import signal
-import subprocess
 import tempfile
 import threading
 from collections.abc import Callable
@@ -70,6 +69,7 @@ from ucode.managed_files import (
     reconcile_managed_file,
     revert_managed_file,
 )
+from ucode.os_compatibility import subprocess_cross_os
 from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
@@ -532,6 +532,33 @@ def _parse_managed_config(text: str) -> dict:
         raise RuntimeError(f"invalid TOML: {exc}") from exc
 
 
+def managed_user_agent() -> str | None:
+    """The User-Agent value in Codex's OS-managed Databricks provider headers, if one is there."""
+    path = codex_managed_config_path()
+    try:
+        text = read_managed_file(path) if path else None
+        doc = _parse_managed_config(text) if text else {}
+    except (RuntimeError, ValueError):  # ValueError: a file that isn't UTF-8
+        return None
+    headers = _managed_provider_headers(doc)
+    key = _user_agent_key(headers)
+    value = headers[key] if headers is not None and key is not None else None
+    return value if isinstance(value, str) else None
+
+
+def _managed_provider_headers(doc: dict) -> dict | None:
+    """The Databricks provider's ``http_headers`` table in a Codex config document, if present."""
+    providers = doc.get("model_providers")
+    provider = providers.get(CODEX_MODEL_PROVIDER_NAME) if isinstance(providers, dict) else None
+    headers = provider.get("http_headers") if isinstance(provider, dict) else None
+    return headers if isinstance(headers, dict) else None
+
+
+def _user_agent_key(headers: dict | None) -> str | None:
+    """The ``User-Agent`` key in ``headers`` under any casing, else None."""
+    return next((key for key in headers or {} if str(key).casefold() == "user-agent"), None)
+
+
 def managed_config_is_current(state: dict) -> bool:
     path = codex_managed_config_path()
     if path is None:
@@ -613,6 +640,11 @@ def _reconcile_managed_config(state: dict, compose: Callable[[dict], dict]) -> N
 
 
 MANAGED_MCP_CONFIG_KEY = "mcp_servers"
+_CODEX_MCP_AUTH_ENV_VARS = [
+    "DATABRICKS_BEARER",
+    "DATABRICKS_BEARER_COMMAND",
+    "DATABRICKS_CONFIG_FILE",
+]
 
 
 def managed_mcp_uses_managed_file() -> bool:
@@ -627,7 +659,20 @@ def managed_mcp_uses_managed_file() -> bool:
 
 def managed_mcp_entry(argv: list[str]) -> dict:
     """A ``[mcp_servers.<name>]`` stdio entry from the ``ug mcp-proxy`` argv (same as user scope)."""
-    return {"command": argv[0], "args": list(argv[1:])}
+    return {
+        "command": argv[0],
+        "args": list(argv[1:]),
+        "env_vars": list(_CODEX_MCP_AUTH_ENV_VARS),
+    }
+
+
+def managed_mcp_http_entry(url: str, client_id: str) -> dict:
+    """A ``[mcp_servers.<name>]`` **direct HTTP+OAuth** entry: Codex is the OAuth client and drives
+    the connection login itself (the batched analogue of ``add_codex_http_mcp_server``). ``url`` is
+    both the server URL and the RFC 8707 ``oauth_resource``; ``client_id`` is the published
+    ``codex-cli`` app. Codex derives its per-server loopback ``/callback/<hash>`` redirect at login,
+    so no callback need be written here."""
+    return {"url": url, "oauth_resource": url, "oauth": {"client_id": client_id}}
 
 
 def user_mcp_config_path() -> Path:
@@ -658,14 +703,23 @@ def write_user_mcp_servers(add: dict[str, dict], remove: set[str]) -> set[str]:
 
     If the file exists but can't be parsed, defer to the per-server ``codex`` CLI rather than
     overwrite it."""
-    from ucode.mcp import add_codex_mcp_server, remove_codex_mcp_server
+    from ucode.mcp import (
+        add_codex_http_mcp_server,
+        add_codex_mcp_server,
+        remove_codex_mcp_server,
+    )
 
     path = user_mcp_config_path()
     doc = _read_user_config_for_rewrite(path)
     if doc is None:
         removed = {name for name in remove if remove_codex_mcp_server(name)}
         for name, entry in add.items():
-            add_codex_mcp_server(name, [entry["command"], *entry.get("args", [])])
+            # Dispatch on entry shape: a native HTTP+OAuth entry has `url` (+ `oauth.client_id`)
+            # and no `command`, so it must go through the HTTP CLI path, not the stdio proxy one.
+            if "url" in entry:
+                add_codex_http_mcp_server(name, entry["url"], entry["oauth"]["client_id"])
+            else:
+                add_codex_mcp_server(name, [entry["command"], *entry.get("args", [])])
         return removed
 
     table = doc.get(MANAGED_MCP_CONFIG_KEY)
@@ -770,7 +824,6 @@ def default_model(state: dict) -> str | None:
         return state["codex_default_model"]
     if smart_routing_v2.smart_routing_enabled():
         return _smart_routing_config_model(state)
-    clear_model_preferences(state)
     return None
 
 
@@ -1033,7 +1086,7 @@ def _launch_codex_with_otel_proxy(
     server_thread.start()
     endpoint = f"http://{LOOPBACK_HOST}:{server.server_address[1]}/v1/traces"
     otel_args = codex_config_args(_otel_proxy_overlay(endpoint))
-    proc = subprocess.Popen([*base_argv, *otel_args, *tool_args])
+    proc = subprocess_cross_os.popen([*base_argv, *otel_args, *tool_args])
     try:
         returncode = proc.wait()
     except KeyboardInterrupt:

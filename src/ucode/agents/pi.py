@@ -43,8 +43,8 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import shlex
 import signal
-import subprocess
 import threading
 from pathlib import Path
 from typing import cast
@@ -61,7 +61,7 @@ from ucode.config_io import (
 )
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
-    build_auth_shell_command,
+    build_auth_token_argv,
     build_pi_base_urls,
     classify_model_family,
     claude_model_capabilities,
@@ -72,6 +72,7 @@ from ucode.databricks import (
     model_token_limits,
     preferred_gpt_model,
 )
+from ucode.os_compatibility import subprocess_cross_os
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ug_version
 from ucode.ui import print_warning
@@ -464,12 +465,17 @@ def build_pi_api_key(state: dict) -> str:
     the command after 10s and discards its stderr, so plain `auth-token` serves
     ucode's own token cache (`ucode.token_cache`, answered by `ucode._entry`
     before the full CLI imports) and bounds any CLI call it does make — see
-    `AUTH_TOKEN_CLI_BUDGET_SECONDS`."""
-    return "!" + build_auth_shell_command(
+    `AUTH_TOKEN_CLI_BUDGET_SECONDS`.
+
+    Always POSIX-quoted: pi runs `!command` values through bash on every OS
+    (Git Bash on Windows), which strips the backslashes from a cmd.exe-style
+    ``C:\\...\\ug.exe`` path."""
+    argv = build_auth_token_argv(
         state["workspace"],
         state.get("profile"),
         use_pat=bool(state.get("use_pat")),
     )
+    return "!" + shlex.join(argv)
 
 
 def write_tool_config(
@@ -775,7 +781,7 @@ def launch(state: dict, tool_args: list[str], *, options: LaunchOptions) -> None
         token = _configure_launch(state)
         env = build_runtime_env(token)
 
-        proc = subprocess.Popen([SPEC["binary"], *tool_args], env=env)
+        proc = subprocess_cross_os.popen([SPEC["binary"], *tool_args], env=env)
         try:
             returncode = proc.wait()
         except KeyboardInterrupt:
