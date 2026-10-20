@@ -19,7 +19,7 @@ from rich.text import Text
 from typer import _click
 from typer.core import HAS_RICH, TyperCommand, TyperGroup, TyperOption
 
-from ucode import custom_oauth, token_cache
+from ucode import auth_token_log, custom_oauth, token_cache
 from ucode.agents import (
     TOOL_SPECS,
     LaunchOptions,
@@ -2146,29 +2146,9 @@ def mcp_proxy_cmd(
 # Pi kills its `!command` apiKey after 10s (and discards stderr); leave room for
 # interpreter startup so a slow CLI fails with our error rather than pi's.
 AUTH_TOKEN_CLI_BUDGET_SECONDS = 7.0
-AUTH_TOKEN_ERROR_LOG_MAX_BYTES = 256 * 1024
-
-
-def _log_auth_token_failure(workspace: str, profile: str | None, message: str) -> None:
-    """Append a failure to ~/.ucode/auth-token-errors.log, best-effort.
-
-    Agents run `auth-token` headless and some (pi) throw its stderr away, so
-    without this the only trace of *why* a turn failed is a generic error."""
-    import time
-
-    from ucode import config_io
-
-    path = config_io.APP_DIR / "auth-token-errors.log"
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists() and path.stat().st_size > AUTH_TOKEN_ERROR_LOG_MAX_BYTES:
-            path.unlink()
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        line = " ".join(message.split())
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(f"{stamp} host={workspace} profile={profile or '<none>'} {line}\n")
-    except OSError:
-        pass
+# Nobody waits on the background refresher (`--refresh-cache`), but it still
+# must not linger.
+AUTH_TOKEN_BACKGROUND_BUDGET_SECONDS = 30.0
 
 
 @app.command("auth-token", hidden=True)
@@ -2185,6 +2165,15 @@ def auth_token_cmd(
     force_refresh: Annotated[
         bool,
         typer.Option("--force-refresh", help="Force the Databricks CLI to mint a new token."),
+    ] = False,
+    refresh_cache: Annotated[
+        bool,
+        typer.Option(
+            "--refresh-cache",
+            hidden=True,
+            help="Re-read the token through the Databricks CLI into ug's cache and print "
+            "nothing. Started in the background when a cached token is due for a re-check.",
+        ),
     ] = False,
     client_id: Annotated[
         str | None,
@@ -2221,6 +2210,9 @@ def auth_token_cmd(
     if client_id is not None and use_pat:
         print_err("--client-id cannot be combined with --use-pat.")
         raise typer.Exit(1)
+    if client_id is not None and refresh_cache:
+        print_err("--client-id cannot be combined with --refresh-cache.")
+        raise typer.Exit(1)
     if redirect_url is not None and client_id is None:
         print_err("--redirect-url requires --client-id.")
         raise typer.Exit(1)
@@ -2254,6 +2246,9 @@ def auth_token_cmd(
     try:
         if client_id is not None:
             assert scopes is not None
+            auth_token_log.set_stage(
+                "fetching a custom OAuth client token", host=workspace, profile=profile
+            )
             token = custom_oauth.get_custom_client_token(
                 workspace,
                 client_id=client_id,
@@ -2265,27 +2260,45 @@ def auth_token_cmd(
                 force_refresh=force_refresh,
             )
         else:
-            # token_cache.read/write are no-ops when DATABRICKS_BEARER(_COMMAND)
-            # owns auth — including the bearer the --use-pat branch just exported —
-            # so only CLI-minted OAuth tokens are ever cached.
-            cached = None if force_refresh else token_cache.read(workspace, profile)
+            # token_cache is a no-op when DATABRICKS_BEARER(_COMMAND) owns auth —
+            # including the bearer the --use-pat branch just exported — so only
+            # CLI-minted OAuth tokens are ever cached. A served entry that is due
+            # for a re-check starts the background refresher.
+            skip_cache = force_refresh or refresh_cache
+            cached = None if skip_cache else token_cache.serve(workspace, profile)
             if cached:
                 token = cached
             else:
                 # Headless helper: bound the CLI call, and skip the
                 # `auth login --no-browser` fallback — nobody sees its URL here.
+                auth_token_log.set_stage(
+                    "waiting for `databricks auth token`", host=workspace, profile=profile
+                )
                 token = get_databricks_token(
                     workspace,
                     profile,
                     force_refresh=force_refresh,
-                    budget_seconds=AUTH_TOKEN_CLI_BUDGET_SECONDS,
+                    budget_seconds=(
+                        AUTH_TOKEN_BACKGROUND_BUDGET_SECONDS
+                        if refresh_cache
+                        else AUTH_TOKEN_CLI_BUDGET_SECONDS
+                    ),
                     allow_reauth=False,
                 )
                 token_cache.write(workspace, profile, token)
     except RuntimeError as exc:
-        _log_auth_token_failure(workspace, profile, str(exc))
-        print_err(str(exc))
+        message = str(exc)
+        # A failed background refresh failed no request: the caller that started
+        # it was already served the cached token. Label it so the log says so.
+        auth_token_log.log_failure(
+            workspace,
+            profile,
+            f"background refresh failed: {message}" if refresh_cache else message,
+        )
+        print_err(message)
         raise typer.Exit(1) from None
+    if refresh_cache:
+        return  # the cache is the output; nothing reads this process's stdout
     # Write the bare token (with trailing newline) to stdout — nothing else may
     # land on stdout or the consuming agent will treat it as part of the token.
     sys.stdout.write(token + "\n")
