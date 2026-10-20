@@ -4380,6 +4380,54 @@ class TestHttpGetJsonTimeout:
         assert reason is not None
         assert "timed out" in reason
 
+    def test_truncated_body_returns_reason_instead_of_raising(self, monkeypatch):
+        from http.client import IncompleteRead
+
+        def raise_incomplete(request, timeout=None):
+            raise IncompleteRead(b"x" * 10, 5)
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", raise_incomplete)
+
+        payload, reason = db_mod._http_get_json(f"{WS}/api/2.0/anything", "tok")
+
+        assert payload is None
+        assert reason is not None
+        assert reason.startswith("network error:")
+        assert "IncompleteRead" in reason
+
+    def test_post_truncated_body_returns_reason_instead_of_raising(self, monkeypatch):
+        from http.client import RemoteDisconnected
+
+        def raise_disconnect(request, timeout=None):
+            raise RemoteDisconnected("Remote end closed connection without response")
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", raise_disconnect)
+
+        payload, reason = db_mod._http_post_json(f"{WS}/api/2.0/anything", "tok", {"k": "v"})
+
+        assert payload is None
+        assert reason is not None
+        assert "closed connection" in reason
+
+    def test_truncated_body_is_retried(self, monkeypatch):
+        from http.client import IncompleteRead
+
+        outcomes = iter([IncompleteRead(b"x" * 10, 5), _FakeResponse({"ok": True})])
+
+        def fake_urlopen(request, timeout=None):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(db_mod.time, "sleep", lambda _s: None)
+
+        payload, reason = db_mod._http_get_json(f"{WS}/api/2.0/anything", "tok", max_retries=1)
+
+        assert payload == {"ok": True}
+        assert reason is None
+
 
 class TestInstallAiTools:
     def _capture_run(self, monkeypatch, *, raises=None):
