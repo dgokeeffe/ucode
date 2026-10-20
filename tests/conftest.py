@@ -31,6 +31,7 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     it can never touch the developer's real ~/.ucode/state.json or invoke the
     privileged writer for an OS-managed agent config.
     """
+    import ucode.auth_token_log as auth_token_log_mod
     import ucode.codex_config as codex_config_mod
     import ucode.config_io as config_io_mod
     import ucode.databricks as databricks_mod
@@ -44,6 +45,10 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     state_dir = tmp_path / ".ucode"
     state_dir.mkdir()
     monkeypatch.setattr(token_cache_mod, "CACHE_DIR", state_dir / "token-cache")
+    monkeypatch.setattr(auth_token_log_mod, "LOG_PATH", state_dir / "auth-token-errors.log")
+    # A real background refresher is a separate process that sees none of these patches: it
+    # would run the developer's Databricks CLI and write their real ~/.ucode token cache.
+    monkeypatch.setattr(token_cache_mod, "_spawn_detached", lambda argv: None)
     monkeypatch.setattr(state_mod, "STATE_PATH", state_dir / "state.json")
     monkeypatch.setattr(config_io_mod, "APP_DIR", state_dir)
     # MANAGED_CONFIG_PATH is bound from APP_DIR at import, so patching APP_DIR alone doesn't move it;

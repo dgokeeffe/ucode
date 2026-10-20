@@ -13,12 +13,18 @@ import sys
 
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "auth-token":
+        from ucode import auth_token_log
         from ucode.token_cache import fast_path_token
 
+        # Installed before the cache check so a caller's timeout is logged
+        # whichever stage it lands in.
+        auth_token_log.log_if_killed(sys.argv[2:])
+        auth_token_log.set_stage("checking the token cache")
         token = fast_path_token(sys.argv[1:])
         if token:
             sys.stdout.write(token + "\n")
             return
+        auth_token_log.set_stage("loading the ug CLI")
 
     from ucode.cli import main as cli_main
 

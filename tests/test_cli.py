@@ -2065,6 +2065,86 @@ class TestAuthTokenCommand:
         assert result.exit_code == 0
         assert result.stdout == "ci-bearer\n"
 
+    def test_old_cached_token_is_served_and_refreshed_in_background(self, monkeypatch):
+        spawned: list[list[str]] = []
+        monkeypatch.setattr(token_cache, "_spawn_detached", spawned.append)
+        token = _jwt(time.time() + 86400)
+        token_cache.write("https://ws", None, token)
+        path = token_cache._cache_path("https://ws", None)
+        entry = json.loads(path.read_text())
+        entry["cached_at"] -= token_cache.REFRESH_AFTER_SECONDS + 1
+        path.write_text(json.dumps(entry))
+        with (
+            patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
+            patch("ucode.cli.get_databricks_token") as fetch,
+        ):
+            result = runner.invoke(app, ["auth-token"])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == token + "\n"
+        # The re-check never runs inside the caller's deadline.
+        fetch.assert_not_called()
+        assert spawned == [token_cache.refresh_command("https://ws", None)]
+
+    def test_refresh_cache_rereads_the_cli_and_prints_nothing(self):
+        old, new = _jwt(time.time() + 3600, "old"), _jwt(time.time() + 3600, "new")
+        token_cache.write("https://ws", "prod", old)
+        with (
+            patch("ucode.cli.load_state", return_value={}),
+            patch("ucode.cli.get_databricks_token", return_value=new) as fetch,
+        ):
+            result = runner.invoke(
+                app, ["auth-token", "--host", "https://ws", "--profile", "prod", "--refresh-cache"]
+            )
+        assert result.exit_code == 0, result.output
+        assert result.stdout == ""
+        fetch.assert_called_once_with(
+            "https://ws",
+            "prod",
+            force_refresh=False,
+            budget_seconds=cli_mod.AUTH_TOKEN_BACKGROUND_BUDGET_SECONDS,
+            allow_reauth=False,
+        )
+        assert token_cache.read("https://ws", "prod") == new
+
+    def test_failed_background_refresh_is_labelled_in_the_log(self):
+        from ucode import auth_token_log
+
+        with (
+            patch("ucode.cli.load_state", return_value={}),
+            patch("ucode.cli.get_databricks_token", side_effect=RuntimeError("boom")),
+        ):
+            result = runner.invoke(app, ["auth-token", "--host", "https://ws", "--refresh-cache"])
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        log = auth_token_log.LOG_PATH.read_text()
+        assert "host=https://ws profile=<none> background refresh failed: boom" in log
+
+    def test_refresh_cache_rejects_client_id(self):
+        result = runner.invoke(
+            app,
+            ["auth-token", "--host", "https://ws", "--refresh-cache", "--client-id", "c"],
+        )
+        assert result.exit_code == 1
+        assert result.stdout == ""
+
+    def test_cli_call_is_named_for_the_kill_log(self):
+        # The SIGTERM handler reports this stage if the caller's deadline lands here.
+        from ucode import auth_token_log
+
+        stages: list[str] = []
+
+        def fetch(*_args, **_kwargs):
+            stages.append(auth_token_log._stage)
+            return "tok"
+
+        with (
+            patch("ucode.cli.load_state", return_value={}),
+            patch("ucode.cli.get_databricks_token", side_effect=fetch),
+        ):
+            result = runner.invoke(app, ["auth-token", "--host", "https://ws"])
+        assert result.exit_code == 0, result.output
+        assert stages == ["waiting for `databricks auth token`"]
+
 
 class TestOtelHeadersCommand:
     def test_prints_only_the_authorization_header_json(self):
