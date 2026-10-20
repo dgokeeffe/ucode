@@ -666,6 +666,8 @@ class TestClaudeModelCapabilities:
             ("claude-sonnet-4-6[1m]", 1_000_000, 64_000, True, True),
             ("claude-sonnet-5", 1_000_000, 64_000, True, True),
             ("claude-haiku-4-5", 200_000, 64_000, False, False),
+            ("system.ai.claude-haiku-5-5", 1_000_000, 128_000, False, True),
+            ("claude-haiku-5.5", 1_000_000, 128_000, False, True),
             ("system.ai.claude-fable-5", 1_000_000, 128_000, False, True),
             ("claude-future", 200_000, 64_000, False, False),
         ],
@@ -686,6 +688,8 @@ class TestClaudeModelCapabilities:
         expected_xhigh = model_id in {
             "claude-sonnet-5",
             "system.ai.claude-fable-5",
+            "system.ai.claude-haiku-5-5",
+            "claude-haiku-5.5",
         }
         assert capabilities.supports_xhigh_thinking is expected_xhigh
         assert db_mod.claude_model_supports_1m(model_id) is supports_1m
@@ -706,6 +710,9 @@ class TestClaudeModelCapabilities:
             ("claude-sonnet-6", False),
             ("claude-fable-5", True),
             ("claude-fable-6", False),
+            ("claude-haiku-4-5", False),
+            ("claude-haiku-5-5", True),
+            ("claude-haiku-6", False),
         ],
     )
     def test_xhigh_thinking_is_explicitly_allowlisted(self, model_id, expected):
@@ -2358,6 +2365,34 @@ class TestDiscoverOssModelSpecs:
 
         assert specs == []
         assert reason is not None
+
+    def test_anthropic_messages_support_does_not_hide_oss_models(self, monkeypatch):
+        # The gateway also serves GLM/Kimi over Anthropic Messages and Codex
+        # Responses. Neither routes them to another bucket (Claude is name-based,
+        # Codex needs openai/v1/responses), so they must stay OSS.
+        multi_api = [
+            "mlflow/v1/chat/completions",
+            "mlflow/v1/responses",
+            "anthropic/v1/messages",
+            "codex/v1/responses",
+        ]
+        payload = {
+            "endpoints": [
+                _foundation_endpoint("databricks-glm-5-3", multi_api),
+                _foundation_endpoint("databricks-kimi-k3", multi_api),
+                _foundation_endpoint("databricks-claude-sonnet-5", multi_api),
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(
+            WS,
+            "token",
+            ["system.ai.glm-5-3", "system.ai.kimi-k3", "system.ai.claude-sonnet-5"],
+        )
+
+        assert reason is None
+        assert [spec["id"] for spec in specs] == ["system.ai.glm-5-3", "system.ai.kimi-k3"]
 
     def test_unavailable_metadata_keeps_static_glm_kimi_fallback(self, monkeypatch):
         monkeypatch.setattr(

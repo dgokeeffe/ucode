@@ -1731,9 +1731,13 @@ _CODEX_MODEL_FAMILIES = ("gpt-", "grok-")
 
 # Native routes take precedence over the generic MLflow chat-completions route.
 # A foundation model advertising any of these must not be duplicated as OSS.
-_NATIVE_PROVIDER_API_TYPES = frozenset(
-    {"anthropic/v1/messages", "openai/v1/responses", "gemini/v1/generateContent"}
-)
+# Only list API types that `discover_model_services` buckets by capability:
+# a model advertising one of these lands in the Codex/Gemini bucket instead.
+# `anthropic/v1/messages` is deliberately absent — the Claude bucket is
+# name-based (`claude-*` ids are excluded from OSS by name), and the gateway also serves
+# GLM/Kimi over Anthropic Messages, so excluding it would drop them from every
+# bucket.
+_NATIVE_PROVIDER_API_TYPES = frozenset({"openai/v1/responses", "gemini/v1/generateContent"})
 
 # Non-chat services must never be offered to a chat agent, even if malformed
 # metadata happens to advertise a chat API type.
@@ -2352,7 +2356,9 @@ def claude_model_capabilities(model_id: str) -> ClaudeModelCapabilities:
     Opus gained the opt-in 1M window in 4.6; Sonnet gained it in 4.5.
     Sonnet's verified 1M tiers retain a conservative 64k output cap. Fable 5
     is 1M by default (so it needs no ``[1m]`` suffix) with a 128k output cap.
-    Opus 4.5, Haiku, and unrecognized ids use the conservative 200k fallback.
+    Haiku 5.5 is likewise 1M by default with a 128k output cap, and rejects
+    budget-based thinking (HTTP 400), so it must use adaptive thinking.
+    Opus 4.5, older Haiku, and unrecognized ids use the conservative 200k fallback.
     """
     tail = _normalized_foundation_model_id(model_id)
     match = _CLAUDE_MODEL_RE.match(tail)
@@ -2384,6 +2390,13 @@ def claude_model_capabilities(model_id: str) -> ClaudeModelCapabilities:
             output=128_000,
             force_adaptive_thinking=True,
             supports_xhigh_thinking=version == (5, 0),
+        )
+    if family == "haiku" and version >= (5, 5):
+        return ClaudeModelCapabilities(
+            context=1_000_000,
+            output=128_000,
+            force_adaptive_thinking=True,
+            supports_xhigh_thinking=version == (5, 5),
         )
     return _CLAUDE_FALLBACK_CAPABILITIES
 

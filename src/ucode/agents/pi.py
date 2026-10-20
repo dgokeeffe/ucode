@@ -153,7 +153,7 @@ def _pi_claude_model_entry(model_id: str) -> dict:
         entry["compat"] = {"forceAdaptiveThinking": True}
         # Pi hides its extended levels unless custom models declare them. All
         # adaptive Claude models support `max`; native `xhigh` is limited to
-        # Opus 4.7/4.8, Sonnet 5, and Fable 5.
+        # Opus 4.7/4.8, Sonnet 5, Fable 5, and Haiku 5.5.
         entry["thinkingLevelMap"] = {"max": "max"}
         if capabilities.supports_xhigh_thinking:
             entry["thinkingLevelMap"]["xhigh"] = "xhigh"
@@ -297,15 +297,19 @@ def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
             "xhigh": "xhigh",
             "max": "max",
         }
-    elif normalized_id.startswith(("gpt-6-sol", "gpt-6-luna")):
-        # GPT-6 Sol and Luna support the full none/low/medium/high/xhigh/max
-        # effort range (unlike Astra, which has no `none`). Pi's `minimal` is
-        # not an API value, so it stays suppressed.
+    elif normalized_id.startswith(("gpt-6-sol", "gpt-6-luna", "gpt-6-1-sol", "gpt-6-1-luna")):
+        # GPT-6 Sol and Luna (including 6.1 IDs, normalised to 6-1) support
+        # the full none/low/medium/high/xhigh/max effort range (unlike Astra,
+        # which has no `none`). Pi's `minimal` is not an API value, so it stays
+        # suppressed.
         entry["reasoning"] = True
         entry["input"] = ["text", "image"]
         entry["thinkingLevelMap"] = {
             "off": "none",
             "minimal": None,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
             "xhigh": "xhigh",
             "max": "max",
         }

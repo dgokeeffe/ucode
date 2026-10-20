@@ -112,6 +112,25 @@ class TestRenderOverlayProviders:
             "max": "max",
         }
 
+    @pytest.mark.parametrize(
+        "model_id",
+        ["system.ai.gpt-6-1-sol", "system.ai.gpt-6.1-sol"],
+    )
+    def test_gpt61_sol_exposes_full_effort_range(self, model_id):
+        overlay, _ = _overlay(model_id, codex_models=[model_id])
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+
+        assert entry["reasoning"] is True
+        assert entry["thinkingLevelMap"] == {
+            "off": "none",
+            "minimal": None,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max",
+        }
+
     @pytest.mark.parametrize("family", ["sol", "luna"])
     def test_gpt6_sol_and_luna_expose_full_effort_range(self, family):
         # Regression: these matched no branch at all, so Pi received a 128k
@@ -128,6 +147,9 @@ class TestRenderOverlayProviders:
         assert entry["thinkingLevelMap"] == {
             "off": "none",
             "minimal": None,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
             "xhigh": "xhigh",
             "max": "max",
         }
@@ -269,6 +291,21 @@ class TestRenderOverlayProviders:
             "max": "max",
             "xhigh": "xhigh",
         }
+
+    def test_haiku_5_5_uses_adaptive_thinking(self):
+        # Haiku 5.5 rejects budget-based thinking with HTTP 400, so Pi must
+        # send adaptive thinking with an effort level instead.
+        overlay, _ = _overlay(
+            "system.ai.claude-haiku-5-5",
+            claude_models={"haiku": "system.ai.claude-haiku-5-5"},
+        )
+        entries = {m["id"]: m for m in overlay["providers"]["databricks-claude"]["models"]}
+        haiku = entries["system.ai.claude-haiku-5-5"]
+        assert haiku["reasoning"] is True
+        assert haiku["contextWindow"] == 1_000_000
+        assert haiku["maxTokens"] == 128_000
+        assert haiku["compat"] == {"forceAdaptiveThinking": True}
+        assert haiku["thinkingLevelMap"] == {"max": "max", "xhigh": "xhigh"}
 
     def test_gemini_provider_uses_google_generative_ai(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
