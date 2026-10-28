@@ -16,11 +16,15 @@ Per-provider `compat` flags work around fields the gateway translators reject:
   pi uses for every request. With this flag pi omits the per-tool field and
   sends the legacy `anthropic-beta: fine-grained-tool-streaming-...` header
   instead, which the gateway accepts.
-- mlflow: `supportsStore: false`, `supportsStrictMode: false` and
-  `supportsLongCacheRetention: false` — the MLflow chat-completions gateway
-  rejects OpenAI's `store` field, `tools[].function.strict`, and the
-  `prompt_cache_retention` / `prompt_cache_key` fields Pi sends for long
-  cache retention (`json: unknown field`, HTTP 400).
+- mlflow: `supportsStore: false`, `supportsStrictMode: false`,
+  `supportsLongCacheRetention: false` and `maxTokensField: "max_tokens"` —
+  the MLflow chat-completions gateway rejects OpenAI's `store` field,
+  `tools[].function.strict`, the `prompt_cache_retention` /
+  `prompt_cache_key` fields Pi sends for long cache retention, and (for Qwen,
+  gpt-oss, Gemma and Llama) `max_completion_tokens` (`json: unknown field`,
+  HTTP 400). Every MLflow model accepts `max_tokens`. Also
+  `supportsDeveloperRole: false`: OSS chat templates (Qwen 3.5) reject the
+  `developer` role, so Pi sends instructions as `system`.
 - openai: no `compat` flags needed, but the per-model `thinkingLevelMap`
   matters — see `_pi_gpt_model_entry`. Declaring `reasoning: true` without an
   off-state makes Pi send `reasoning: {effort: "none"}`, which `gpt-5`,
@@ -65,6 +69,7 @@ from ucode.databricks import (
     build_pi_base_urls,
     classify_model_family,
     claude_model_capabilities,
+    claude_model_version,
     discover_claude_models_unbucketed,
     get_databricks_token,
     gpt_model_token_limits,
@@ -133,6 +138,18 @@ def _resolve_model_selector(
     if model in oss_models:
         return f"databricks-mlflow/{model}"
     return model
+
+
+# Claude models older than 4.5 (e.g. Opus 4.1) reject Pi's Anthropic request
+# shape: `cache_control.ephemeral.ttl` and `thinking.enabled.display` are
+# "Extra inputs are not permitted" (HTTP 400), and tool calls are refused even
+# with those disabled. Pi only; other agents still list them.
+_PI_MIN_CLAUDE_VERSION = (4, 5)
+
+
+def _pi_supports_claude_model(model_id: str) -> bool:
+    version = claude_model_version(model_id)
+    return version is None or version >= _PI_MIN_CLAUDE_VERSION
 
 
 def _pi_claude_model_entry(model_id: str) -> dict:
@@ -466,7 +483,11 @@ def render_overlay(
     # `/` and a space so it can never collide — safe to pass as a literal.
     ua_headers = {"User-Agent": f"ucode/{ug_version()} pi/{agent_version('pi')}"}
 
-    claude_ids = sorted(set(claude_models.values()) | set(claude_model_ids or []))
+    claude_ids = sorted(
+        m
+        for m in set(claude_models.values()) | set(claude_model_ids or [])
+        if _pi_supports_claude_model(m)
+    )
     if claude_ids:
         providers["databricks-claude"] = {
             "baseUrl": pi_base_urls["claude"],
@@ -522,10 +543,16 @@ def render_overlay(
             # per-tool `strict`, and the `prompt_cache_retention` /
             # `prompt_cache_key` pair Pi adds under long cache retention (which
             # `build_runtime_env` turns on). Pi omits each when these are false.
+            # Qwen, gpt-oss, Gemma and Llama also reject `max_completion_tokens`
+            # (`json: unknown field`); every MLflow model accepts `max_tokens`.
+            # OSS chat templates (e.g. Qwen 3.5) reject the `developer` role
+            # ("Unexpected message role"); `system` is the safe default.
             "compat": {
                 "supportsStore": False,
                 "supportsStrictMode": False,
                 "supportsLongCacheRetention": False,
+                "maxTokensField": "max_tokens",
+                "supportsDeveloperRole": False,
             },
             "headers": ua_headers,
             "models": [_pi_oss_model_entry(m, specs_by_id.get(m)) for m in oss_models],
@@ -780,7 +807,18 @@ def build_runtime_env(token: str) -> dict[str, str]:
     # 1h cache-write price) wins.
     if not env.get("PI_CACHE_RETENTION", "").strip():
         env["PI_CACHE_RETENTION"] = PI_CACHE_RETENTION_DEFAULT
+    # Pi's databricks-gemini provider must hit the gateway's Gemini route
+    # (`/v1beta/models/<id>:streamGenerateContent`). With Vertex settings
+    # inherited from the shell (often exported for unrelated tools), Pi's
+    # @google/genai SDK switches to Vertex `publishers/google/models/...`
+    # paths, which the gateway rejects. Pin the SDK to the Gemini API.
+    env["GOOGLE_GENAI_USE_VERTEXAI"] = "false"
+    for name in _VERTEX_PROJECT_ENV_VARS:
+        env.pop(name, None)
     return env
+
+
+_VERTEX_PROJECT_ENV_VARS = ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION")
 
 
 def _is_loopback_origin(origin: str) -> bool:

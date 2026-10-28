@@ -5708,3 +5708,291 @@ class TestRunDecodesUtf8:
         script = r"import sys; sys.stdout.buffer.write(b'\xff')"
         result = db_mod.run([sys.executable, "-c", script], capture_output=True)
         assert result.stdout == b"\xff"
+
+
+class TestProbeDeadOssModels:
+    """Configure-time 1-token probe drops only definitively dead MLflow endpoints."""
+
+    DEPRECATED = (
+        '{"error_code":"BAD_REQUEST","message":"BAD_REQUEST: This endpoint '
+        "databricks-deepseek-v4-flash-0731 is deprecated. For a list of supported models, "
+        'refer to Databricks docs at https://docs.databricks.com/aws/en/machine-learning/"}'
+    )
+    NOT_FOUND = '{"error_code":"ENDPOINT_NOT_FOUND","message":"The given endpoint does not exist"}'
+
+    @staticmethod
+    def _http_error(code: int, body: str):
+        import io
+        from urllib import error as urllib_error
+
+        return urllib_error.HTTPError(
+            "https://x",
+            code,
+            "Bad Request" if code == 400 else "Not Found",
+            None,
+            io.BytesIO(body.encode()),
+        )
+
+    def _patch_urlopen(self, monkeypatch, responses: dict):
+        seen: list[tuple[str, dict, float | None]] = []
+
+        def fake_urlopen(request, timeout=None):
+            body = json.loads(request.data)
+            seen.append((request.full_url, body, timeout))
+            outcome = responses[body["model"]]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            raise AssertionError("success responses are not used in these tests")
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        return seen
+
+    def test_drops_deprecated_and_not_found_keeps_everything_else(self, monkeypatch):
+        seen = self._patch_urlopen(
+            monkeypatch,
+            {
+                "system.ai.deepseek-v4-flash-0731": self._http_error(400, self.DEPRECATED),
+                "databricks-kimi-k3-neo": self._http_error(404, self.NOT_FOUND),
+                "system.ai.glm-5-2": self._http_error(
+                    400, '{"error_code":"BAD_REQUEST","message":"max_tokens too small"}'
+                ),
+                "system.ai.kimi-k3": TimeoutError("The read operation timed out"),
+                "system.ai.qwen": self._http_error(429, '{"error_code":"REQUEST_LIMIT_EXCEEDED"}'),
+                "system.ai.gemma": self._http_error(403, '{"error_code":"PERMISSION_DENIED"}'),
+                "system.ai.llama": self._http_error(404, "<html>Not Found</html>"),
+            },
+        )
+        ids = [
+            "system.ai.deepseek-v4-flash-0731",
+            "databricks-kimi-k3-neo",
+            "system.ai.glm-5-2",
+            "system.ai.kimi-k3",
+            "system.ai.qwen",
+            "system.ai.gemma",
+            "system.ai.llama",
+        ]
+
+        dead = db_mod.probe_dead_oss_models(WS, "tok", ids)
+
+        assert dead == ["system.ai.deepseek-v4-flash-0731", "databricks-kimi-k3-neo"]
+        url, body, timeout = seen[0]
+        assert url == f"{WS}/ai-gateway/mlflow/v1/chat/completions"
+        assert body["max_tokens"] == 1
+        assert body["messages"] == [{"role": "user", "content": "ok"}]
+        assert timeout == 10
+
+    def test_unfinished_probes_keep_their_model(self, monkeypatch):
+        release = threading.Event()
+
+        def slow_post(url, token, payload, timeout=10):
+            release.wait(timeout=2)
+            return None, "HTTP 404 Not Found: ENDPOINT_NOT_FOUND"
+
+        monkeypatch.setattr(db_mod, "_http_post_json", slow_post)
+        started = time.monotonic()
+        try:
+            dead = db_mod.probe_dead_oss_models(WS, "tok", ["system.ai.a"], total_timeout=0.2)
+        finally:
+            release.set()
+
+        assert dead == []
+        assert time.monotonic() - started < 1.5
+
+    def test_no_models_sends_nothing(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_post_json", lambda *a, **k: pytest.fail("no probe expected")
+        )
+        assert db_mod.probe_dead_oss_models(WS, "tok", []) == []
+
+
+class TestProbeToolLessModels:
+    """Configure-time tool probe drops only catalog-flagged models that reject tools."""
+
+    # Gemini nests the message in a JSON envelope, padded past the default 200-char excerpt.
+    GEMINI_NO_TOOLS = json.dumps(
+        {
+            "error_code": "BAD_REQUEST",
+            "message": json.dumps(
+                {
+                    "error": {
+                        "code": 400,
+                        "status": "INVALID_ARGUMENT",
+                        "details": [{"@type": "type.googleapis.com/google.rpc.BadRequest"}] * 4,
+                        "message": "Model databricks-gemini-3-1-flash-lite-image does not "
+                        "support function calling.",
+                    }
+                }
+            ),
+        }
+    )
+
+    @staticmethod
+    def _catalog(flags: dict[str, bool | None]) -> dict:
+        endpoints = []
+        for name, flag in flags.items():
+            endpoint: dict = {"name": name, "config": {"served_entities": []}}
+            if flag is not None:
+                endpoint["capabilities"] = {"function_calling": flag}
+            endpoints.append(endpoint)
+        return {"endpoints": endpoints}
+
+    def _patch(self, monkeypatch, flags: dict[str, bool | None], responses: dict):
+        import io
+        from urllib import error as urllib_error
+
+        monkeypatch.setattr(
+            db_mod, "_get_foundation_models_payload", lambda w, t: (self._catalog(flags), None)
+        )
+        seen: list[tuple[str, dict]] = []
+
+        class _Ok:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        def fake_urlopen(request, timeout=None):
+            body = json.loads(request.data)
+            seen.append((request.full_url, body))
+            key = body.get("model") or request.full_url.rsplit("/", 1)[-1].split(":")[0]
+            outcome = responses[key]
+            if outcome == 200:
+                return _Ok()
+            if isinstance(outcome, tuple):
+                code, text = outcome
+                raise urllib_error.HTTPError(
+                    "https://x", code, "Bad Request", None, io.BytesIO(text.encode())
+                )
+            raise outcome
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        return seen
+
+    def test_drops_only_flagged_models_that_reject_tools(self, monkeypatch):
+        seen = self._patch(
+            monkeypatch,
+            {
+                "databricks-gemini-3-1-flash-lite-image": False,
+                "databricks-gemini-3-1-flash-image": False,
+                "databricks-gemini-3-pro-image": False,
+                "databricks-gemini-3-5-flash": True,
+                "databricks-meta-llama-3-1-8b-instruct": False,
+                "databricks-llama-4-maverick": False,
+                "databricks-qwen": False,
+                "databricks-glm-5-2": None,
+            },
+            {
+                "databricks-gemini-3-1-flash-lite-image": (400, self.GEMINI_NO_TOOLS),
+                "databricks-gemini-3-1-flash-image": 200,
+                "databricks-gemini-3-pro-image": (400, '{"message":"bad tool schema"}'),
+                "system.ai.meta-llama-3-1-8b-instruct": 200,
+                "system.ai.llama-4-maverick": TimeoutError("timed out"),
+                "system.ai.qwen": (
+                    429,
+                    '{"message":"rate limited; does not support function calling"}',
+                ),
+            },
+        )
+
+        tool_less = db_mod.probe_tool_less_models(
+            WS,
+            "tok",
+            gemini_models=[
+                "databricks-gemini-3-1-flash-lite-image",
+                "databricks-gemini-3-1-flash-image",
+                "databricks-gemini-3-pro-image",
+                "databricks-gemini-3-5-flash",
+            ],
+            oss_models=[
+                "system.ai.meta-llama-3-1-8b-instruct",
+                "system.ai.llama-4-maverick",
+                "system.ai.qwen",
+                "system.ai.glm-5-2",
+            ],
+        )
+
+        assert tool_less == ["databricks-gemini-3-1-flash-lite-image"]
+        probed_urls = {url for url, _ in seen}
+        # Unflagged (True or absent) models are never probed.
+        assert not any("gemini-3-5-flash" in url for url in probed_urls)
+        assert all(body.get("model") != "system.ai.glm-5-2" for _, body in seen)
+        gemini = next(b for u, b in seen if "flash-lite-image" in u)
+        assert gemini["generationConfig"] == {"maxOutputTokens": 1}
+        assert gemini["tools"][0]["functionDeclarations"][0]["name"] == "noop"
+        assert (
+            f"{WS}/ai-gateway/gemini/v1beta/models/databricks-gemini-3-1-flash-lite-image"
+            ":generateContent" in probed_urls
+        )
+        oss = next(b for _, b in seen if b.get("model") == "system.ai.meta-llama-3-1-8b-instruct")
+        assert oss["max_tokens"] == 1
+        assert oss["tools"][0]["type"] == "function"
+        assert f"{WS}/ai-gateway/mlflow/v1/chat/completions" in probed_urls
+
+    def test_drops_flagged_oss_model_that_rejects_tools(self, monkeypatch):
+        self._patch(
+            monkeypatch,
+            {"databricks-meta-llama-3-1-8b-instruct": False},
+            {
+                "system.ai.meta-llama-3-1-8b-instruct": (
+                    400,
+                    '{"error_code":"BAD_REQUEST","message":"Model Does Not Support '
+                    'Function Calling"}',
+                )
+            },
+        )
+        assert db_mod.probe_tool_less_models(
+            WS, "tok", gemini_models=[], oss_models=["system.ai.meta-llama-3-1-8b-instruct"]
+        ) == ["system.ai.meta-llama-3-1-8b-instruct"]
+
+    def test_no_flagged_models_sends_nothing(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_get_foundation_models_payload",
+            lambda w, t: (self._catalog({"databricks-gemini-3-5-flash": True}), None),
+        )
+        monkeypatch.setattr(
+            db_mod, "_http_post_json", lambda *a, **k: pytest.fail("no probe expected")
+        )
+        assert (
+            db_mod.probe_tool_less_models(
+                WS, "tok", gemini_models=["databricks-gemini-3-5-flash"], oss_models=[]
+            )
+            == []
+        )
+
+    def test_catalog_outage_fails_open(self, monkeypatch):
+        monkeypatch.setattr(db_mod, "_get_foundation_models_payload", lambda w, t: (None, "503"))
+        monkeypatch.setattr(
+            db_mod, "_http_post_json", lambda *a, **k: pytest.fail("no probe expected")
+        )
+        assert (
+            db_mod.probe_tool_less_models(WS, "tok", gemini_models=["gemini-x"], oss_models=[])
+            == []
+        )
+
+    def test_unfinished_probes_keep_their_model(self, monkeypatch):
+        release = threading.Event()
+        monkeypatch.setattr(
+            db_mod,
+            "_get_foundation_models_payload",
+            lambda w, t: (self._catalog({"databricks-gemini-x": False}), None),
+        )
+
+        def slow_post(url, token, payload, timeout=10, error_body_chars=200):
+            release.wait(timeout=2)
+            return None, "HTTP 400 Bad Request: does not support function calling"
+
+        monkeypatch.setattr(db_mod, "_http_post_json", slow_post)
+        try:
+            tool_less = db_mod.probe_tool_less_models(
+                WS, "tok", gemini_models=["databricks-gemini-x"], oss_models=[], total_timeout=0.2
+            )
+        finally:
+            release.set()
+        assert tool_less == []

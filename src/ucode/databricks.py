@@ -400,6 +400,7 @@ def _http_send_json(
     *,
     timeout: int = 10,
     allow_empty_body: bool = False,
+    error_body_chars: int = 200,
 ) -> tuple[dict | list | None, str | None]:
     """Send a request that may carry a JSON body, and decode a JSON response.
 
@@ -409,6 +410,8 @@ def _http_send_json(
 
     ``allow_empty_body`` is for DELETE, whose success response is ``google.protobuf.Empty`` — an
     empty body there is the expected result, not a decode failure.
+
+    ``error_body_chars`` caps how much of an HTTP error body the reason keeps.
     """
     body_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -437,7 +440,7 @@ def _http_send_json(
         if _debug_enabled() and body:
             _debug("body", body[:4000])
         reason = f"HTTP {exc.code} {exc.reason}"
-        body_excerpt = body.strip()[:200]
+        body_excerpt = body.strip()[:error_body_chars]
         if body_excerpt:
             reason = f"{reason}: {body_excerpt}"
         return None, reason
@@ -452,11 +455,13 @@ def _http_send_json(
 
 
 def _http_post_json(
-    url: str, token: str, payload: dict, *, timeout: int = 10
+    url: str, token: str, payload: dict, *, timeout: int = 10, error_body_chars: int = 200
 ) -> tuple[dict | list | None, str | None]:
     """POST a JSON body to an endpoint. Returns (payload, None) on success,
     (None, reason) on failure. Mirrors `_http_get_json`."""
-    return _http_send_json("POST", url, token, payload, timeout=timeout)
+    return _http_send_json(
+        "POST", url, token, payload, timeout=timeout, error_body_chars=error_body_chars
+    )
 
 
 def _http_patch_json(
@@ -2361,6 +2366,18 @@ _CLAUDE_FALLBACK_CAPABILITIES = ClaudeModelCapabilities(context=200_000, output=
 _CLAUDE_MODEL_RE = re.compile(r"^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d+))?")
 
 
+def claude_model_version(model_id: str) -> tuple[int, int] | None:
+    """Return ``(major, minor)`` for a ``claude-<family>-<major>[-<minor>]`` id.
+
+    ``None`` means the id does not follow that naming scheme.
+    """
+    match = _CLAUDE_MODEL_RE.match(_normalized_foundation_model_id(model_id))
+    if not match:
+        return None
+    _, major_raw, minor_raw = match.groups()
+    return (int(major_raw), int(minor_raw or 0))
+
+
 def claude_model_capabilities(model_id: str) -> ClaudeModelCapabilities:
     """Return the shared Claude capability policy for every agent.
 
@@ -2836,6 +2853,185 @@ def discover_model_services(
             ),
         )
     return claude_models, codex_models, gemini_models, oss_models, None
+
+
+_OSS_PROBE_TIMEOUT_SECONDS = 10
+_OSS_PROBE_TOTAL_SECONDS = 20.0
+_OSS_PROBE_MAX_WORKERS = 8
+
+
+def _is_dead_endpoint_reason(reason: str | None) -> bool:
+    """True only for a definitive "this endpoint is gone" response.
+
+    A 404 with a ``*NOT_FOUND`` error code, or a 400 saying the endpoint is
+    deprecated. Everything else (auth, throttling, 5xx, other 400s, network
+    errors) is not evidence the model is dead.
+    """
+    if not reason:
+        return False
+    if reason.startswith("HTTP 404"):
+        return "NOT_FOUND" in reason
+    if reason.startswith("HTTP 400"):
+        return "is deprecated" in reason.lower()
+    return False
+
+
+def probe_dead_oss_models(
+    workspace: str,
+    token: str,
+    model_ids: list[str],
+    *,
+    timeout: int = _OSS_PROBE_TIMEOUT_SECONDS,
+    total_timeout: float = _OSS_PROBE_TOTAL_SECONDS,
+    max_workers: int = _OSS_PROBE_MAX_WORKERS,
+) -> list[str]:
+    """Return the MLflow chat-completions ids that a live 1-token call proves dead.
+
+    The foundation-model catalog and UC listing keep advertising retired
+    endpoints as READY; only a call reveals the deprecation 400 or the 404.
+    Fails open: a model is dropped only on a definitive dead signal, and any
+    probe still running when ``total_timeout`` elapses keeps its model.
+    """
+    if not model_ids:
+        return []
+    url = f"{workspace}/ai-gateway/mlflow/v1/chat/completions"
+    deadline = time.monotonic() + total_timeout
+    dead: list[str] = []
+
+    def probe(model_id: str) -> bool:
+        payload = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "ok"}],
+            "max_tokens": 1,
+        }
+        _, reason = _http_post_json(url, token, payload, timeout=timeout)
+        return _is_dead_endpoint_reason(reason)
+
+    def collect(is_dead: bool, model_id: str) -> None:
+        if is_dead:
+            dead.append(model_id)
+
+    _collect_concurrently(
+        list(model_ids),
+        probe,
+        collect,
+        max_workers=max_workers,
+        should_stop=lambda: time.monotonic() >= deadline,
+    )
+    return [model_id for model_id in model_ids if model_id in set(dead)]
+
+
+_NO_FUNCTION_CALLING_PHRASE = "does not support function calling"
+# Gemini nests the message inside a JSON error envelope; keep enough body that
+# the phrase is never truncated away.
+_TOOL_PROBE_ERROR_BODY_CHARS = 4000
+_TOOL_PROBE_SCHEMA = {
+    "name": "noop",
+    "description": "Does nothing.",
+    "parameters": {"type": "object", "properties": {}},
+}
+
+
+def _function_calling_disabled_ids(payload: object) -> frozenset[str]:
+    """Canonical ids whose catalog entry sets ``capabilities.function_calling`` to False.
+
+    Absent or True is not a candidate. The flag over-reports (most flagged chat
+    models accept tools), so it only selects which models to probe.
+    """
+    if not isinstance(payload, dict):
+        return frozenset()
+    raw_endpoints = cast(dict[str, object], payload).get("endpoints")
+    if not isinstance(raw_endpoints, list):
+        return frozenset()
+    flagged: set[str] = set()
+    for endpoint in raw_endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        endpoint_dict = cast(dict[str, object], endpoint)
+        name = endpoint_dict.get("name")
+        capabilities = endpoint_dict.get("capabilities")
+        if not isinstance(name, str) or not isinstance(capabilities, dict):
+            continue
+        if cast(dict[str, object], capabilities).get("function_calling") is False:
+            flagged.add(_canonical_oss_model_id(name))
+    return frozenset(flagged)
+
+
+def _is_no_function_calling_reason(reason: str | None) -> bool:
+    """True only for a 400 whose body says the model cannot call tools."""
+    if not reason or not reason.startswith("HTTP 400"):
+        return False
+    return _NO_FUNCTION_CALLING_PHRASE in reason.lower()
+
+
+def probe_tool_less_models(
+    workspace: str,
+    token: str,
+    *,
+    gemini_models: list[str],
+    oss_models: list[str],
+    timeout: int = _OSS_PROBE_TIMEOUT_SECONDS,
+    total_timeout: float = _OSS_PROBE_TOTAL_SECONDS,
+    max_workers: int = _OSS_PROBE_MAX_WORKERS,
+) -> list[str]:
+    """Return the Gemini/OSS ids that reject a request carrying a tool.
+
+    Only models the foundation-model catalog flags with
+    ``capabilities.function_calling: false`` are probed, each with a 1-token
+    request and one trivial tool on its own route (Gemini ``generateContent``
+    or MLflow chat completions). A model is dropped only on a 400 saying it
+    "does not support function calling"; every other outcome, and any probe
+    still running at ``total_timeout``, keeps it.
+    """
+    if not (gemini_models or oss_models):
+        return []
+    payload, _ = _get_foundation_models_payload(workspace, token)
+    flagged = _function_calling_disabled_ids(payload)
+    if not flagged:
+        return []
+    candidates = [
+        *((m, "gemini") for m in gemini_models if _canonical_oss_model_id(m) in flagged),
+        *((m, "oss") for m in oss_models if _canonical_oss_model_id(m) in flagged),
+    ]
+    if not candidates:
+        return []
+    deadline = time.monotonic() + total_timeout
+    tool_less: set[str] = set()
+
+    def probe(candidate: tuple[str, str]) -> bool:
+        model_id, route = candidate
+        if route == "gemini":
+            url = f"{workspace}/ai-gateway/gemini/v1beta/models/{model_id}:generateContent"
+            body: dict = {
+                "contents": [{"role": "user", "parts": [{"text": "ok"}]}],
+                "tools": [{"functionDeclarations": [_TOOL_PROBE_SCHEMA]}],
+                "generationConfig": {"maxOutputTokens": 1},
+            }
+        else:
+            url = f"{workspace}/ai-gateway/mlflow/v1/chat/completions"
+            body = {
+                "model": model_id,
+                "messages": [{"role": "user", "content": "ok"}],
+                "tools": [{"type": "function", "function": _TOOL_PROBE_SCHEMA}],
+                "max_tokens": 1,
+            }
+        _, reason = _http_post_json(
+            url, token, body, timeout=timeout, error_body_chars=_TOOL_PROBE_ERROR_BODY_CHARS
+        )
+        return _is_no_function_calling_reason(reason)
+
+    def collect(is_tool_less: bool, candidate: tuple[str, str]) -> None:
+        if is_tool_less:
+            tool_less.add(candidate[0])
+
+    _collect_concurrently(
+        candidates,
+        probe,
+        collect,
+        max_workers=max_workers,
+        should_stop=lambda: time.monotonic() >= deadline,
+    )
+    return [model_id for model_id, _ in candidates if model_id in tool_less]
 
 
 # --- Managed coding-agent config (admin-authored, developer-read) -----------

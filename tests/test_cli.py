@@ -2390,6 +2390,36 @@ class TestStatusLiveModels:
         legacy_gemini.assert_not_called()
         save.assert_not_called()
 
+    def test_live_refresh_applies_recorded_skip_lists_without_probing(self):
+        state = {
+            **MINIMAL_STATE,
+            "profile": "explicit-profile",
+            "oss_dead_models": ["dead-oss"],
+            "tool_less_models": ["tool-less-gemini", "tool-less-oss"],
+        }
+        with (
+            patch("ucode.cli.get_databricks_token", return_value="token"),
+            patch(
+                "ucode.cli.discover_model_services",
+                return_value=(
+                    {"opus": "live-claude"},
+                    ["live-codex"],
+                    ["live-gemini", "tool-less-gemini"],
+                    ["live-oss", "dead-oss", "tool-less-oss"],
+                    None,
+                ),
+            ),
+            patch("ucode.cli.probe_tool_less_models") as tool_probe,
+            patch("ucode.cli.probe_dead_oss_models") as dead_probe,
+        ):
+            live, _ = cli_mod._live_status_model_state(state, {"pi"})
+
+        assert live["gemini_models"] == ["live-gemini"]
+        assert live["oss_models"] == ["live-oss"]
+        assert live["opencode_models"]["gemini"] == ["live-gemini"]
+        tool_probe.assert_not_called()
+        dead_probe.assert_not_called()
+
     def test_labels_cached_fallback_when_live_auth_fails(self):
         state = {**MINIMAL_STATE, "profile": "explicit-profile"}
         with patch("ucode.cli.get_databricks_token", side_effect=RuntimeError("expired login")):
@@ -4295,6 +4325,7 @@ class TestConfigureAgentsSelection:
             use_pat=False,
             databricks_ai_tools_enabled=None,
             clear_custom_oauth=False,
+            probe_models=False,
         ):
             captured["workspace"] = workspace
             captured["profile"] = profile
@@ -4649,6 +4680,10 @@ class TestConfigureSharedStateUsePat:
             ),
         )
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
+        monkeypatch.setattr(cli_mod, "probe_dead_oss_models", lambda w, t, ids: [])
+        monkeypatch.setattr(
+            cli_mod, "probe_tool_less_models", lambda w, t, gemini_models, oss_models: []
+        )
         return cli_mod, logins, ensures, saved
 
     def test_use_pat_exports_bearer_and_skips_login(self, monkeypatch):
@@ -4984,6 +5019,174 @@ class TestConfigureSharedStateUsePat:
 
         assert state["codex_models"] == ["system.ai.gpt-5-6-sol"]
         assert state["oss_models"] == ["system.ai.glm-5-2"]
+
+    def _stub_oss_probe(self, monkeypatch, cli_mod, dead):
+        calls: list[list[str]] = []
+
+        def probe(w, t, ids):
+            calls.append(list(ids))
+            return [m for m in ids if m in dead]
+
+        monkeypatch.setattr(cli_mod, "probe_dead_oss_models", probe)
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: (
+                {},
+                ["system.ai.gpt-5-6-sol"],
+                [],
+                ["system.ai.glm-5-2", "system.ai.inkling"],
+                None,
+            ),
+        )
+        return calls
+
+    def test_configure_probe_drops_dead_oss_models_and_records_them(self, monkeypatch):
+        cli_mod, _, _, saved = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        calls = self._stub_oss_probe(monkeypatch, cli_mod, {"system.ai.inkling"})
+        warnings: list[str] = []
+        monkeypatch.setattr(cli_mod, "print_warning", warnings.append)
+
+        state = cli_mod.configure_shared_state(
+            self.WS, profile="DEFAULT", tools=["pi"], probe_models=True
+        )
+
+        assert calls == [["system.ai.glm-5-2", "system.ai.inkling"]]
+        assert state["oss_models"] == ["system.ai.glm-5-2"]
+        assert [s["id"] for s in state["oss_model_specs"]] == ["system.ai.glm-5-2"]
+        assert saved[-1]["oss_dead_models"] == ["system.ai.inkling"]
+        assert any("system.ai.inkling" in w for w in warnings)
+
+    def test_launch_path_does_not_probe_but_reuses_recorded_dead_models(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={"workspace": self.WS, "oss_dead_models": ["system.ai.inkling"]},
+        )
+        calls = self._stub_oss_probe(monkeypatch, cli_mod, {"system.ai.inkling"})
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", tools=["pi"])
+
+        assert calls == []
+        assert state["oss_models"] == ["system.ai.glm-5-2"]
+
+    def test_launch_path_ignores_dead_list_from_another_workspace(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={
+                "workspace": "https://other.databricks.com",
+                "oss_dead_models": ["system.ai.inkling"],
+            },
+        )
+        calls = self._stub_oss_probe(monkeypatch, cli_mod, set())
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", tools=["pi"])
+
+        assert calls == []
+        assert state["oss_models"] == ["system.ai.glm-5-2", "system.ai.inkling"]
+        assert "oss_dead_models" not in state
+
+    def test_configure_command_enables_the_oss_probe(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        seen: list[dict] = []
+        monkeypatch.setattr(
+            cli_mod, "configure_shared_state", lambda *a, **kw: seen.append(kw) or {}
+        )
+
+        cli_mod._configure_shared_workspace_states(
+            [(self.WS, "DEFAULT")], ["pi"], force_login=False
+        )
+
+        assert seen[0]["probe_models"] is True
+
+    def _stub_tool_probe(self, monkeypatch, cli_mod, tool_less):
+        calls: list[tuple[list[str], list[str]]] = []
+
+        def probe(w, t, *, gemini_models, oss_models):
+            calls.append((list(gemini_models), list(oss_models)))
+            return [m for m in [*gemini_models, *oss_models] if m in tool_less]
+
+        monkeypatch.setattr(cli_mod, "probe_tool_less_models", probe)
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: (
+                {},
+                [],
+                ["databricks-gemini-3-1-flash-lite-image", "databricks-gemini-3-5-flash"],
+                ["system.ai.glm-5-2", "system.ai.tiny"],
+                None,
+            ),
+        )
+        return calls
+
+    def test_configure_probe_drops_tool_less_models_and_records_them(self, monkeypatch):
+        cli_mod, _, _, saved = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        calls = self._stub_tool_probe(
+            monkeypatch,
+            cli_mod,
+            {"databricks-gemini-3-1-flash-lite-image", "system.ai.tiny"},
+        )
+        warnings: list[str] = []
+        monkeypatch.setattr(cli_mod, "print_warning", warnings.append)
+
+        state = cli_mod.configure_shared_state(
+            self.WS, profile="DEFAULT", tools=["pi"], probe_models=True
+        )
+
+        assert calls == [
+            (
+                ["databricks-gemini-3-1-flash-lite-image", "databricks-gemini-3-5-flash"],
+                ["system.ai.glm-5-2", "system.ai.tiny"],
+            )
+        ]
+        assert state["gemini_models"] == ["databricks-gemini-3-5-flash"]
+        assert state["oss_models"] == ["system.ai.glm-5-2"]
+        assert [s["id"] for s in state["oss_model_specs"]] == ["system.ai.glm-5-2"]
+        assert saved[-1]["tool_less_models"] == [
+            "databricks-gemini-3-1-flash-lite-image",
+            "system.ai.tiny",
+        ]
+        assert warnings == [
+            "Skipping models that cannot call tools: "
+            "databricks-gemini-3-1-flash-lite-image, system.ai.tiny"
+        ]
+
+    def test_launch_path_reuses_recorded_tool_less_models_without_probing(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={
+                "workspace": self.WS,
+                "tool_less_models": ["databricks-gemini-3-1-flash-lite-image", "system.ai.tiny"],
+            },
+        )
+        calls = self._stub_tool_probe(monkeypatch, cli_mod, set())
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", tools=["pi"])
+
+        assert calls == []
+        assert state["gemini_models"] == ["databricks-gemini-3-5-flash"]
+        assert state["oss_models"] == ["system.ai.glm-5-2"]
+
+    def test_workspace_change_clears_recorded_tool_less_models(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={
+                "workspace": "https://other.databricks.com",
+                "tool_less_models": ["system.ai.tiny"],
+            },
+        )
+        calls = self._stub_tool_probe(monkeypatch, cli_mod, set())
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", tools=["pi"])
+
+        assert calls == []
+        assert state["oss_models"] == ["system.ai.glm-5-2", "system.ai.tiny"]
+        assert "tool_less_models" not in state
 
     def _stub_with_fable(self, monkeypatch):
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
