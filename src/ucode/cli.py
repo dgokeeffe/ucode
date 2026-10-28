@@ -76,6 +76,8 @@ from ucode.databricks import (
     list_tool_provider_services,
     map_claude_family_models,
     normalize_workspace_url,
+    probe_dead_oss_models,
+    probe_tool_less_models,
     probe_unity_gateway_capabilities,
     resolve_pat_token,
     resolve_provider_launch_model,
@@ -486,6 +488,7 @@ def configure_shared_state(
     databricks_ai_tools_enabled: bool | None = None,
     custom_oauth: CustomOAuthConfig | None = None,
     clear_custom_oauth: bool = False,
+    probe_models: bool = False,
 ) -> dict:
     """Log into Databricks, verify AI Gateway, fetch model lists, persist state.
 
@@ -505,6 +508,12 @@ def configure_shared_state(
     in ``_launch_tool``) and the gateway was verified by that earlier configure.
     Only the local profile resolution and the shared state assembly still run;
     the saved model lists are preserved.
+    If probe_models is True (explicit configure only), each discovered
+    MLflow chat-completions model gets a 1-token live call and definitively
+    dead endpoints are dropped and remembered in ``oss_dead_models``; Gemini
+    and OSS models the catalog flags as unable to call functions get a
+    1-token tool call, and those that reject it are remembered in
+    ``tool_less_models``. Launches reuse both lists instead of probing.
     """
     workspace = normalize_workspace_url(workspace)
     prior_state = load_state()
@@ -559,6 +568,10 @@ def configure_shared_state(
     # write. Never carry model ids across a full discovery or workspace change.
     if not skip_preflight or previous_workspace != workspace:
         state.pop("pi_claude_models", None)
+    # Probe-derived skip lists belong to the workspace that was probed.
+    if previous_workspace != workspace:
+        state.pop("oss_dead_models", None)
+        state.pop("tool_less_models", None)
 
     cli_custom_oauth = state.get("custom_oauth") if custom_oauth_cli_enabled(custom_oauth) else None
     if cli_custom_oauth:
@@ -703,6 +716,27 @@ def configure_shared_state(
                     # whose transient failure could leave broad models uncapped.
                     oss_specs, oss_reason = discover_oss_model_specs(workspace, token)
                     oss_models = [spec["id"] for spec in oss_specs]
+        if want_oss:
+            oss_models, oss_specs = _drop_dead_oss_models(
+                state,
+                workspace,
+                token,
+                oss_models,
+                oss_specs,
+                probe=probe_models,
+                same_workspace=previous_workspace == workspace,
+            )
+        if want_gemini or want_oss:
+            gemini_models, oss_models, oss_specs = _drop_tool_less_models(
+                state,
+                workspace,
+                token,
+                gemini_models,
+                oss_models,
+                oss_specs,
+                probe=probe_models,
+                same_workspace=previous_workspace == workspace,
+            )
         if claude_models:
             opencode_models["anthropic"] = list(claude_models.values())
         if gemini_models:
@@ -747,6 +781,90 @@ def configure_shared_state(
     return state
 
 
+def _drop_dead_oss_models(
+    state: dict,
+    workspace: str,
+    token: str,
+    oss_models: list[str],
+    oss_specs: list[dict],
+    *,
+    probe: bool,
+    same_workspace: bool,
+) -> tuple[list[str], list[dict]]:
+    """Filter retired MLflow endpoints that discovery still reports as READY.
+
+    Configure probes live and records the result in ``state["oss_dead_models"]``;
+    launches skip the probe and reuse the recorded list for this workspace.
+    """
+    if probe:
+        with spinner("Checking open-source model endpoints..."):
+            dead = probe_dead_oss_models(workspace, token, oss_models)
+        state["oss_dead_models"] = dead
+        if dead:
+            print_warning(
+                "Skipping retired model endpoints (deprecated or not found): " + ", ".join(dead)
+            )
+    elif not same_workspace:
+        # The recorded list belongs to the previous workspace.
+        state.pop("oss_dead_models", None)
+        dead = []
+    else:
+        recorded = state.get("oss_dead_models")
+        dead = [m for m in recorded if isinstance(m, str)] if isinstance(recorded, list) else []
+    if not dead:
+        return oss_models, oss_specs
+    dead_set = set(dead)
+    return (
+        [m for m in oss_models if m not in dead_set],
+        [spec for spec in oss_specs if spec.get("id") not in dead_set],
+    )
+
+
+def _recorded_model_ids(state: dict, key: str) -> set[str]:
+    recorded = state.get(key)
+    return {m for m in recorded if isinstance(m, str)} if isinstance(recorded, list) else set()
+
+
+def _drop_tool_less_models(
+    state: dict,
+    workspace: str,
+    token: str,
+    gemini_models: list[str],
+    oss_models: list[str],
+    oss_specs: list[dict],
+    *,
+    probe: bool,
+    same_workspace: bool,
+) -> tuple[list[str], list[str], list[dict]]:
+    """Filter Gemini/OSS models that reject tool calls (every coding agent sends tools).
+
+    Configure probes live and records the result in ``state["tool_less_models"]``;
+    launches skip the probe and reuse the recorded list for this workspace.
+    """
+    if probe:
+        with spinner("Checking model tool-calling support..."):
+            tool_less = probe_tool_less_models(
+                workspace, token, gemini_models=gemini_models, oss_models=oss_models
+            )
+        state["tool_less_models"] = tool_less
+        if tool_less:
+            print_warning("Skipping models that cannot call tools: " + ", ".join(tool_less))
+        skip = set(tool_less)
+    elif not same_workspace:
+        # The recorded list belongs to the previous workspace.
+        state.pop("tool_less_models", None)
+        skip = set()
+    else:
+        skip = _recorded_model_ids(state, "tool_less_models")
+    if not skip:
+        return gemini_models, oss_models, oss_specs
+    return (
+        [m for m in gemini_models if m not in skip],
+        [m for m in oss_models if m not in skip],
+        [spec for spec in oss_specs if spec.get("id") not in skip],
+    )
+
+
 def _configure_shared_workspace_states(
     workspaces: list[tuple[str, str | None]],
     tools: list[str] | None,
@@ -772,6 +890,7 @@ def _configure_shared_workspace_states(
                 force_login=force_login,
                 use_pat=use_pat,
                 databricks_ai_tools_enabled=databricks_ai_tools_enabled,
+                probe_models=True,
                 **custom_oauth_kwargs,
             )
         )
@@ -1211,6 +1330,16 @@ def _live_status_model_state(state: dict, tools: set[str]) -> tuple[dict, str]:
     except RuntimeError as exc:
         print_warning(f"Live model discovery failed ({exc}); showing cached models.")
         return state, "cached"
+
+    # Reuse the retired-endpoint and tool-less lists from the last configure;
+    # status never probes.
+    recorded_dead = state.get("oss_dead_models")
+    if isinstance(recorded_dead, list) and recorded_dead:
+        oss_models = [m for m in oss_models if m not in set(recorded_dead)]
+    tool_less = _recorded_model_ids(state, "tool_less_models")
+    if tool_less:
+        gemini_models = [m for m in gemini_models if m not in tool_less]
+        oss_models = [m for m in oss_models if m not in tool_less]
 
     live = dict(state)
     live["claude_models"] = claude_models

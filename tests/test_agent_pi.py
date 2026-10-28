@@ -76,6 +76,39 @@ class TestRenderOverlayProviders:
         overlay, _ = _overlay("foo")
         assert "providers" not in overlay
 
+    def test_claude_models_older_than_4_5_are_left_out(self):
+        overlay, _ = pi.render_overlay(
+            "system.ai.claude-opus-4-5",
+            "tok",
+            _base_urls(),
+            {"opus": "system.ai.claude-opus-4-5"},
+            [],
+            [],
+            [],
+            [],
+            [
+                "system.ai.claude-opus-4-1",
+                "databricks-claude-sonnet-4",
+                "system.ai.claude-sonnet-4-5",
+                "system.ai.claude-haiku-4-5",
+                "system.ai.claude-custom",
+            ],
+        )
+        ids = {m["id"] for m in overlay["providers"]["databricks-claude"]["models"]}
+        assert ids == {
+            "system.ai.claude-opus-4-5",
+            "system.ai.claude-sonnet-4-5",
+            "system.ai.claude-haiku-4-5",
+            "system.ai.claude-custom",
+        }
+
+    def test_no_claude_provider_when_only_old_claude_models(self):
+        overlay, _ = _overlay(
+            "system.ai.claude-opus-4-1",
+            claude_models={"opus": "system.ai.claude-opus-4-1"},
+        )
+        assert "databricks-claude" not in overlay.get("providers", {})
+
     def test_claude_provider_uses_anthropic_messages(self):
         overlay, _ = _overlay("claude-sonnet", claude_models={"sonnet": "claude-sonnet"})
         provider = overlay["providers"]["databricks-claude"]
@@ -328,10 +361,15 @@ class TestRenderOverlayProviders:
         assert provider["baseUrl"] == f"{WS}/ai-gateway/mlflow/v1"
         # supportsLongCacheRetention: the MLflow gateway 400s on the
         # `prompt_cache_retention`/`prompt_cache_key` Pi sends for long retention.
+        # maxTokensField: Qwen, gpt-oss, Gemma and Llama 400 on
+        # `max_completion_tokens`. supportsDeveloperRole: Qwen 3.5's chat
+        # template rejects the `developer` role.
         assert provider["compat"] == {
             "supportsStore": False,
             "supportsStrictMode": False,
             "supportsLongCacheRetention": False,
+            "maxTokensField": "max_tokens",
+            "supportsDeveloperRole": False,
         }
 
     def test_no_mlflow_provider_when_no_oss_models(self):
@@ -706,6 +744,23 @@ class TestBuildRuntimeEnv:
 
         assert env["PI_CODING_AGENT_DIR"] == str(pi.PI_CONFIG_DIR)
         assert env["HOME"] == "/real-user-home"
+
+    def test_pins_gemini_sdk_off_vertex(self, monkeypatch):
+        # Inherited Vertex settings make Pi's @google/genai SDK build
+        # `publishers/google/models/...` paths the gateway rejects.
+        monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj")
+        monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+        env = pi.build_runtime_env("tok")
+
+        assert env["GOOGLE_GENAI_USE_VERTEXAI"] == "false"
+        assert "GOOGLE_CLOUD_PROJECT" not in env
+        assert "GOOGLE_CLOUD_LOCATION" not in env
+
+    def test_pins_gemini_sdk_off_vertex_when_unset(self, monkeypatch):
+        monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI", raising=False)
+        assert pi.build_runtime_env("tok")["GOOGLE_GENAI_USE_VERTEXAI"] == "false"
 
 
 class TestWriteToolConfig:
@@ -1267,6 +1322,26 @@ class TestMlflowProxyLifecycle:
         assert not restorer.is_alive()
         assert write_order == ["refresh-token", "restore-token"]
         assert state["base_urls"]["pi"]["oss"] == f"{WS}/ai-gateway/mlflow/v1"
+
+    def test_child_env_is_pinned_off_vertex(self, monkeypatch):
+        monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj")
+        monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+        proxy, _, _ = self._proxy_pair()
+        proc = MagicMock()
+        proc.wait.return_value = 0
+        with (
+            patch.object(pi, "_start_oss_proxy", return_value=proxy),
+            patch.object(pi, "_configure_launch", return_value="tok"),
+            patch.object(pi, "_restore_direct_oss_config"),
+            patch.object(pi.subprocess_cross_os, "popen", return_value=proc) as popen,
+            pytest.raises(SystemExit),
+        ):
+            pi.launch({"workspace": WS}, [], options=LaunchOptions())
+        child_env = popen.call_args.kwargs["env"]
+        assert child_env["GOOGLE_GENAI_USE_VERTEXAI"] == "false"
+        assert "GOOGLE_CLOUD_PROJECT" not in child_env
+        assert "GOOGLE_CLOUD_LOCATION" not in child_env
 
     def test_proxy_precedes_first_config_write_and_is_cleaned_on_normal_exit(self):
         proxy, proxy_thread, server = self._proxy_pair()
