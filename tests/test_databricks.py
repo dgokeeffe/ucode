@@ -686,10 +686,9 @@ class TestClaudeModelCapabilities:
         assert capabilities.supports_1m is supports_1m
         assert capabilities.force_adaptive_thinking is adaptive
         expected_xhigh = model_id in {
+            "system.ai.claude-opus-5",
             "claude-sonnet-5",
             "system.ai.claude-fable-5",
-            "system.ai.claude-haiku-5-5",
-            "claude-haiku-5.5",
         }
         assert capabilities.supports_xhigh_thinking is expected_xhigh
         assert db_mod.claude_model_supports_1m(model_id) is supports_1m
@@ -704,14 +703,18 @@ class TestClaudeModelCapabilities:
             ("claude-opus-4-6", False),
             ("claude-opus-4-7", True),
             ("system.ai.claude-opus-4-8", True),
-            ("system.ai.claude-opus-5", False),
+            ("system.ai.claude-opus-5", True),
+            ("system.ai.claude-opus-5-5", True),
+            ("claude-opus-6", False),
             ("claude-sonnet-4-6", False),
             ("claude-sonnet-5", True),
+            ("claude-sonnet-5-5", True),
             ("claude-sonnet-6", False),
             ("claude-fable-5", True),
+            ("claude-fable-5-1", True),
             ("claude-fable-6", False),
             ("claude-haiku-4-5", False),
-            ("claude-haiku-5-5", True),
+            ("claude-haiku-5-5", False),
             ("claude-haiku-6", False),
         ],
     )

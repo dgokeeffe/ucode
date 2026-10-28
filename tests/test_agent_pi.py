@@ -113,16 +113,23 @@ class TestRenderOverlayProviders:
         }
 
     @pytest.mark.parametrize(
-        "model_id",
-        ["system.ai.gpt-6-1-sol", "system.ai.gpt-6.1-sol"],
+        ("model_id", "off"),
+        [
+            ("system.ai.gpt-6-1-sol", "none"),
+            ("system.ai.gpt-6.1-sol", "none"),
+            ("system.ai.gpt-6-1-terra", "none"),
+            ("system.ai.gpt-6.1-terra", "none"),
+            ("databricks-gpt-6-1-terra", "none"),
+        ],
     )
-    def test_gpt61_sol_exposes_full_effort_range(self, model_id):
+    def test_gpt61_sol_and_terra_expose_low_through_max(self, model_id, off):
+        # Databricks accepts `none` for both GPT-6.1 Sol and Terra.
         overlay, _ = _overlay(model_id, codex_models=[model_id])
         entry = overlay["providers"]["databricks-openai"]["models"][0]
 
         assert entry["reasoning"] is True
         assert entry["thinkingLevelMap"] == {
-            "off": "none",
+            "off": off,
             "minimal": None,
             "low": "low",
             "medium": "medium",
@@ -275,7 +282,7 @@ class TestRenderOverlayProviders:
         assert fable["contextWindow"] == 1_000_000
         assert fable["maxTokens"] == 128_000
         assert fable["compat"] == {"forceAdaptiveThinking": True}
-        assert fable["thinkingLevelMap"] == {"max": "max", "xhigh": "xhigh"}
+        assert fable["thinkingLevelMap"] == {"max": "max", "xhigh": "xhigh", "off": None}
 
     def test_claude_extended_levels_follow_model_capabilities(self):
         overlay, _ = _overlay(
@@ -305,7 +312,8 @@ class TestRenderOverlayProviders:
         assert haiku["contextWindow"] == 1_000_000
         assert haiku["maxTokens"] == 128_000
         assert haiku["compat"] == {"forceAdaptiveThinking": True}
-        assert haiku["thinkingLevelMap"] == {"max": "max", "xhigh": "xhigh"}
+        # Databricks rejects `xhigh` and `max` for Haiku 5.5.
+        assert haiku["thinkingLevelMap"] == {"minimal": None}
 
     def test_gemini_provider_uses_google_generative_ai(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
@@ -394,17 +402,19 @@ class TestRenderOverlayOssEnrichment:
     def test_dynamic_reasoning_true_is_applied_with_safe_unknown_limits(self):
         specs = [
             {
-                "id": "system.ai.inkling",
+                "id": "system.ai.qwen35-122b-a10b",
                 "reasoning": True,
                 "context_window": None,
                 "max_tokens": None,
             }
         ]
         overlay, _ = _overlay(
-            "system.ai.inkling", oss_models=["system.ai.inkling"], oss_specs=specs
+            "system.ai.qwen35-122b-a10b",
+            oss_models=["system.ai.qwen35-122b-a10b"],
+            oss_specs=specs,
         )
         assert overlay["providers"]["databricks-mlflow"]["models"][0] == {
-            "id": "system.ai.inkling",
+            "id": "system.ai.qwen35-122b-a10b",
             "reasoning": True,
             "contextWindow": 128_000,
             "maxTokens": 8_192,
@@ -1429,3 +1439,133 @@ class TestBuildPiApiKey:
     def test_forwards_use_pat(self):
         assert "--use-pat" in pi.build_pi_api_key({"workspace": WS, "use_pat": True})
         assert "--use-pat" not in pi.build_pi_api_key({"workspace": WS})
+
+
+# Expected thinking levels per model. Source order: the Databricks
+# reasoning-models doc (https://docs.databricks.com/aws/en/machine-learning/
+# model-serving/query-reason-models), then Pi's own catalog
+# (https://pi.dev/api/models) for models the doc does not list. Gateway ids are
+# custom to Pi, so ug must declare these levels explicitly.
+_DOCUMENTED_THINKING_LEVELS = {
+    "claude-opus-4-6": {"max": "max"},
+    "claude-opus-4-7": {"xhigh": "xhigh", "max": "max"},
+    "claude-opus-4-8": {"xhigh": "xhigh", "max": "max"},
+    "claude-opus-5": {"xhigh": "xhigh", "max": "max"},
+    "claude-opus-5-5": {"off": None, "minimal": None, "xhigh": "xhigh", "max": "max"},
+    "claude-sonnet-4-6": {"max": "max"},
+    "claude-sonnet-5": {"xhigh": "xhigh", "max": "max"},
+    "claude-sonnet-5-5": {"off": None, "minimal": None, "xhigh": "xhigh", "max": "max"},
+    "claude-fable-5": {"off": None, "xhigh": "xhigh", "max": "max"},
+    "claude-fable-5-1": {"off": None, "xhigh": "xhigh", "max": "max"},
+    # Databricks: low/medium/high only; xhigh and max are rejected.
+    "claude-haiku-5-5": {"minimal": None},
+    "gpt-5": {"off": None, "xhigh": None, "max": None},
+    "gpt-5-mini": {"off": None, "xhigh": None, "max": None},
+    "gpt-5-nano": {"off": None, "xhigh": None, "max": None},
+    "gpt-5-pro": {"off": None, "minimal": None, "low": None, "medium": None},
+    "gpt-5.1": {"off": "none", "minimal": None},
+    "gpt-5.2": {"off": "none", "minimal": None, "xhigh": "xhigh"},
+    "gpt-5.2-pro": {"off": None, "minimal": None, "low": None, "xhigh": "xhigh"},
+    "gpt-5.3-codex": {"off": "none", "minimal": None, "xhigh": "xhigh"},
+    "gpt-5.3-codex-spark": {"off": None, "minimal": None, "xhigh": "xhigh"},
+    "gpt-5.4": {"off": "none", "minimal": None, "xhigh": "xhigh"},
+    "gpt-5.4-mini": {"off": "none", "minimal": None, "xhigh": "xhigh"},
+    "gpt-5.4-nano": {"off": "none", "minimal": None, "xhigh": "xhigh"},
+    "gpt-5.4-pro": {"off": None, "minimal": None, "low": None, "xhigh": "xhigh"},
+    "gpt-5.5": {"off": "none", "minimal": None, "xhigh": "xhigh"},
+    "gpt-5.5-pro": {"off": None, "minimal": None, "low": None, "xhigh": "xhigh"},
+    "gpt-5.6-luna": {"off": "none", "minimal": None, "xhigh": "xhigh", "max": "max"},
+    "gpt-5.6-sol": {"off": "none", "minimal": None, "xhigh": "xhigh", "max": "max"},
+    "gpt-5.6-terra": {"off": "none", "minimal": None, "xhigh": "xhigh", "max": "max"},
+    "gpt-6-astra": {"off": None, "minimal": None, "xhigh": "xhigh", "max": "max"},
+    "gpt-6-luna": {"off": "none", "minimal": None, "xhigh": "xhigh", "max": "max"},
+    "gpt-6-sol": {"off": "none", "minimal": None, "xhigh": "xhigh", "max": "max"},
+    # Databricks accepts `none` for GPT-6.1 Sol (Pi's vendor catalog does not).
+    "gpt-6.1-sol": {"off": "none", "minimal": None, "xhigh": "xhigh", "max": "max"},
+    "gpt-6.1-terra": {"off": "none", "minimal": None, "xhigh": "xhigh", "max": "max"},
+    "grok-4.5": {"off": None, "minimal": None, "xhigh": "xhigh", "max": None},
+    "grok-4.6": {"off": None, "minimal": None, "xhigh": "xhigh", "max": None},
+    "grok-4.7": {"off": None, "minimal": None, "xhigh": "xhigh", "max": None},
+}
+_PI_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def _effective_levels(level_map: dict | None) -> dict[str, object]:
+    """Resolve a Pi thinkingLevelMap to {level: provider value} for supported levels.
+
+    Unmapped levels use the provider default through `high`; unmapped `xhigh`
+    and `max` are unsupported.
+    """
+    level_map = level_map or {}
+    resolved: dict[str, object] = {}
+    for level in _PI_LEVELS:
+        if level in level_map:
+            if level_map[level] is not None:
+                resolved[level] = level_map[level]
+        elif level not in {"xhigh", "max"}:
+            # The provider default sends the level's own name.
+            resolved[level] = level
+    return resolved
+
+
+@pytest.mark.parametrize("vendor_id", sorted(_DOCUMENTED_THINKING_LEVELS))
+@pytest.mark.parametrize("prefix", ["system.ai.", "databricks-"])
+def test_thinking_levels_match_documented_levels(vendor_id, prefix):
+    gateway_id = prefix + vendor_id.replace(".", "-")
+    if vendor_id.startswith("claude-"):
+        entry = pi._pi_claude_model_entry(gateway_id)
+    else:
+        entry = pi._pi_gpt_model_entry(gateway_id)
+
+    assert entry["reasoning"] is True
+    expected = _effective_levels(_DOCUMENTED_THINKING_LEVELS[vendor_id])
+    assert _effective_levels(entry.get("thinkingLevelMap")) == expected
+
+
+# Supported Pi levels -> `reasoning_effort` sent, per the Databricks
+# reasoning-models doc. `off` absent means thinking cannot be turned off.
+_DOCUMENTED_OSS_LEVELS = {
+    "glm-5-2": {"off": "none", "high": "high", "max": "max"},
+    "glm-5-3": {"low": "low", "high": "high", "max": "max"},
+    "glm-5-3-flash": {"low": "low", "high": "high", "max": "max"},
+    "kimi-k3": {"off": "none", "low": "low", "high": "high", "max": "max"},
+    "deepseek-v4-1-flash": {
+        "off": "none",
+        "low": "low",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+    },
+    "deepseek-v4-1-flash-1017": {
+        "off": "none",
+        "low": "low",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+    },
+    "deepseek-v4-pro-0813": {"off": "none", "low": "low", "high": "high", "max": "max"},
+    "deepseek-v4-flash-0731": {"off": "none", "low": "low", "high": "high", "max": "max"},
+    "gpt-oss-120b": {"low": "low", "medium": "medium", "high": "high"},
+    "gpt-oss-20b": {"low": "low", "medium": "medium", "high": "high"},
+    "inkling": {"low": "low", "medium": "medium", "high": "high", "max": "max"},
+}
+
+
+@pytest.mark.parametrize("model", sorted(_DOCUMENTED_OSS_LEVELS))
+@pytest.mark.parametrize("prefix", ["system.ai.", "databricks-"])
+def test_oss_thinking_levels_match_databricks_doc(model, prefix):
+    model_id = prefix + model
+    spec = {"id": model_id, "reasoning": True, "context_window": None, "max_tokens": None}
+    entry = pi._pi_oss_model_entry(model_id, spec)
+
+    assert entry["reasoning"] is True
+    assert _effective_levels(entry.get("thinkingLevelMap")) == _DOCUMENTED_OSS_LEVELS[model]
+
+
+def test_undocumented_oss_reasoning_model_keeps_pi_defaults():
+    model_id = "system.ai.qwen35-122b-a10b"
+    spec = {"id": model_id, "reasoning": True, "context_window": None, "max_tokens": None}
+    entry = pi._pi_oss_model_entry(model_id, spec)
+
+    assert entry["reasoning"] is True
+    assert "thinkingLevelMap" not in entry
