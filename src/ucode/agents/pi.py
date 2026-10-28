@@ -151,16 +151,65 @@ def _pi_claude_model_entry(model_id: str) -> dict:
     }
     if capabilities.force_adaptive_thinking:
         entry["compat"] = {"forceAdaptiveThinking": True}
-        # Pi hides its extended levels unless custom models declare them. All
-        # adaptive Claude models support `max`; native `xhigh` is limited to
-        # Opus 4.7/4.8, Sonnet 5, Fable 5, and Haiku 5.5.
-        entry["thinkingLevelMap"] = {"max": "max"}
+        # Pi hides its extended levels unless custom models declare them.
+        # `max`, `xhigh`, disabling thinking, and `minimal` vary by model (see
+        # `ClaudeModelCapabilities` for the sources).
+        level_map: dict[str, str | None] = {}
+        if capabilities.supports_max_thinking:
+            level_map["max"] = "max"
         if capabilities.supports_xhigh_thinking:
-            entry["thinkingLevelMap"]["xhigh"] = "xhigh"
+            level_map["xhigh"] = "xhigh"
+        if not capabilities.supports_disabled_thinking:
+            level_map["off"] = None
+        if not capabilities.supports_minimal_thinking:
+            level_map["minimal"] = None
+        entry["thinkingLevelMap"] = level_map
     return entry
 
 
 _OSS_SAFE_LIMITS = {"context": 128_000, "output": 8_192}
+
+# Pi thinking levels for MLflow chat-completions models, from the Databricks
+# reasoning-models doc. Pi sends `reasoning_effort` with the mapped value, and
+# for `off` only when it maps to a string; with no `off` mapping, hybrid models
+# below would silently reason at their `max` default instead of stopping.
+# Values the doc says "fall back to max" or alias another tier are hidden.
+_HYBRID_LOW_HIGH_MAX: dict[str, str | None] = {
+    "off": "none",
+    "minimal": None,
+    "low": "low",
+    "medium": None,
+    "high": "high",
+    "max": "max",
+}
+_REASONING_ONLY_LOW_HIGH_MAX: dict[str, str | None] = {**_HYBRID_LOW_HIGH_MAX, "off": None}
+_OSS_THINKING_LEVEL_MAPS: dict[str, dict[str, str | None]] = {
+    # Hybrid: `none` disables reasoning; omitted effort defaults to `max`.
+    "glm-5-2": {**_HYBRID_LOW_HIGH_MAX, "low": None},
+    "kimi-k3": _HYBRID_LOW_HIGH_MAX,
+    "deepseek-v4-pro-0813": _HYBRID_LOW_HIGH_MAX,
+    "deepseek-v4-flash-0731": _HYBRID_LOW_HIGH_MAX,
+    "deepseek-v4-1-flash": {**_HYBRID_LOW_HIGH_MAX, "xhigh": "xhigh"},
+    "deepseek-v4-1-flash-1017": {**_HYBRID_LOW_HIGH_MAX, "xhigh": "xhigh"},
+    # Reasoning-only: GLM 5.3 rejects `none` with HTTP 400.
+    "glm-5-3": _REASONING_ONLY_LOW_HIGH_MAX,
+    "glm-5-3-flash": _REASONING_ONLY_LOW_HIGH_MAX,
+    # GPT OSS accepts low/medium/high and ignores `none` (it always reasons).
+    "gpt-oss-120b": {"off": None, "minimal": None},
+    "gpt-oss-20b": {"off": None, "minimal": None},
+    # Inkling: minimal=low and xhigh=max share tiers; `none` does not disable.
+    "inkling": {"off": None, "minimal": None, "xhigh": None, "max": "max"},
+}
+
+
+def _oss_thinking_level_map(model_id: str) -> dict[str, str | None] | None:
+    normalized_id = model_id.rsplit("/", 1)[-1].lower()
+    for prefix in ("system.ai.", "databricks-"):
+        if normalized_id.startswith(prefix):
+            normalized_id = normalized_id[len(prefix) :]
+            break
+    level_map = _OSS_THINKING_LEVEL_MAPS.get(normalized_id.replace(".", "-"))
+    return dict(level_map) if level_map is not None else None
 
 
 def _positive_int(value: object) -> int | None:
@@ -212,6 +261,9 @@ def _pi_oss_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
         reasoning = static_reasoning
     if reasoning:
         entry["reasoning"] = True
+        level_map = _oss_thinking_level_map(model_id)
+        if level_map is not None:
+            entry["thinkingLevelMap"] = level_map
 
     context = _positive_int(spec.get("context_window")) if isinstance(spec, dict) else None
     output = _positive_int(spec.get("max_tokens")) if isinstance(spec, dict) else None
@@ -274,8 +326,12 @@ def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
             normalized_id = normalized_id[len(prefix) :]
             break
     normalized_id = normalized_id.replace(".", "-")
-    if normalized_id == "grok-4-6":
-        # Grok 4.6 is reasoning-only. Databricks supports low/medium/high/xhigh;
+    # Thinking levels follow the Databricks reasoning-models doc, then Pi's
+    # catalog (https://pi.dev/api/models) for models the doc does not list.
+    # Levels left unmapped use the provider default through `high`; `xhigh`
+    # and `max` must be declared.
+    if normalized_id in {"grok-4-5", "grok-4-6", "grok-4-7"}:
+        # Grok 4.5-4.7 are reasoning-only and support low/medium/high/xhigh;
         # hide Pi's unsupported off/minimal/max choices instead of mapping them
         # to values the gateway would reject.
         entry["reasoning"] = True
@@ -297,11 +353,19 @@ def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
             "xhigh": "xhigh",
             "max": "max",
         }
-    elif normalized_id.startswith(("gpt-6-sol", "gpt-6-luna", "gpt-6-1-sol", "gpt-6-1-luna")):
-        # GPT-6 Sol and Luna (including 6.1 IDs, normalised to 6-1) support
-        # the full none/low/medium/high/xhigh/max effort range (unlike Astra,
-        # which has no `none`). Pi's `minimal` is not an API value, so it stays
-        # suppressed.
+    elif normalized_id.startswith(
+        (
+            "gpt-6-sol",
+            "gpt-6-terra",
+            "gpt-6-luna",
+            "gpt-6-1-sol",
+            "gpt-6-1-terra",
+            "gpt-6-1-luna",
+        )
+    ):
+        # GPT-6 and GPT-6.1 Sol/Terra/Luna (6.1 IDs normalise to 6-1) accept
+        # none/low/medium/high/xhigh/max on Databricks; `minimal` is rejected.
+        # GPT-6.1 Luna is undocumented and follows GPT-6.1 Terra.
         entry["reasoning"] = True
         entry["input"] = ["text", "image"]
         entry["thinkingLevelMap"] = {
@@ -327,7 +391,7 @@ def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
         }
         if normalized_id.startswith("gpt-5-6-"):
             entry["thinkingLevelMap"]["max"] = "max"
-    elif normalized_id.startswith(("gpt-5-4-pro", "gpt-5-5-pro")):
+    elif normalized_id.startswith(("gpt-5-2-pro", "gpt-5-4-pro", "gpt-5-5-pro")):
         # Pro variants support medium/high/xhigh only.
         entry["reasoning"] = True
         entry["input"] = ["text", "image"]
@@ -337,8 +401,28 @@ def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
             "low": None,
             "xhigh": "xhigh",
         }
-    elif normalized_id.startswith(("gpt-5-4",)):
-        # GPT-5.4 standard/mini/nano support none/low/medium/high/xhigh.
+    elif normalized_id.startswith("gpt-5-pro"):
+        # GPT-5 Pro supports only `high`.
+        entry["reasoning"] = True
+        entry["input"] = ["text", "image"]
+        entry["thinkingLevelMap"] = {
+            "off": None,
+            "minimal": None,
+            "low": None,
+            "medium": None,
+        }
+    elif normalized_id.startswith("gpt-5-3-codex-spark"):
+        # Codex Spark supports low/medium/high/xhigh, with no `none`.
+        entry["reasoning"] = True
+        entry["input"] = ["text", "image"]
+        entry["thinkingLevelMap"] = {
+            "off": None,
+            "minimal": None,
+            "xhigh": "xhigh",
+        }
+    elif normalized_id.startswith(("gpt-5-2", "gpt-5-3", "gpt-5-4")):
+        # GPT-5.2, GPT-5.3 Codex, and GPT-5.4 standard/mini/nano support
+        # none/low/medium/high/xhigh.
         entry["reasoning"] = True
         entry["input"] = ["text", "image"]
         entry["thinkingLevelMap"] = {
@@ -346,6 +430,11 @@ def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
             "minimal": None,
             "xhigh": "xhigh",
         }
+    elif normalized_id.startswith("gpt-5-1"):
+        # GPT-5.1 introduced `none` but has no `minimal` or `xhigh`.
+        entry["reasoning"] = True
+        entry["input"] = ["text", "image"]
+        entry["thinkingLevelMap"] = {"off": "none", "minimal": None}
     elif "gpt-5" in normalized_id:
         # Older GPT-5 variants reject the Responses API's `none` value. Keep
         # Pi's established minimal/low/medium/high choices for these models.

@@ -2346,6 +2346,15 @@ class ClaudeModelCapabilities:
     supports_1m: bool = False
     force_adaptive_thinking: bool = False
     supports_xhigh_thinking: bool = False
+    # Thinking levels follow the Databricks reasoning-models doc
+    # (https://docs.databricks.com/aws/en/machine-learning/model-serving/query-reason-models),
+    # then Pi's catalog (https://pi.dev/api/models) for undocumented models.
+    # Fable 5.x and the 5.5 Opus/Sonnet models cannot disable thinking; Haiku
+    # 5.5 and the 5.5 Opus/Sonnet models expose no `minimal` level; Databricks
+    # rejects `xhigh` and `max` for Haiku 5.5.
+    supports_max_thinking: bool = True
+    supports_disabled_thinking: bool = True
+    supports_minimal_thinking: bool = True
 
 
 _CLAUDE_FALLBACK_CAPABILITIES = ClaudeModelCapabilities(context=200_000, output=64_000)
@@ -2374,7 +2383,9 @@ def claude_model_capabilities(model_id: str) -> ClaudeModelCapabilities:
             output=128_000,
             supports_1m=True,
             force_adaptive_thinking=True,
-            supports_xhigh_thinking=version in {(4, 7), (4, 8)},
+            supports_xhigh_thinking=version in {(4, 7), (4, 8), (5, 0), (5, 5)},
+            supports_disabled_thinking=version != (5, 5),
+            supports_minimal_thinking=version != (5, 5),
         )
     if family == "sonnet" and version >= (4, 6):
         return ClaudeModelCapabilities(
@@ -2382,7 +2393,9 @@ def claude_model_capabilities(model_id: str) -> ClaudeModelCapabilities:
             output=64_000,
             supports_1m=True,
             force_adaptive_thinking=True,
-            supports_xhigh_thinking=version == (5, 0),
+            supports_xhigh_thinking=version in {(5, 0), (5, 5)},
+            supports_disabled_thinking=version != (5, 5),
+            supports_minimal_thinking=version != (5, 5),
         )
     if family == "sonnet" and version >= (4, 5):
         return ClaudeModelCapabilities(context=1_000_000, output=64_000, supports_1m=True)
@@ -2391,14 +2404,16 @@ def claude_model_capabilities(model_id: str) -> ClaudeModelCapabilities:
             context=1_000_000,
             output=128_000,
             force_adaptive_thinking=True,
-            supports_xhigh_thinking=version == (5, 0),
+            supports_xhigh_thinking=version in {(5, 0), (5, 1)},
+            supports_disabled_thinking=False,
         )
     if family == "haiku" and version >= (5, 5):
         return ClaudeModelCapabilities(
             context=1_000_000,
             output=128_000,
             force_adaptive_thinking=True,
-            supports_xhigh_thinking=version == (5, 5),
+            supports_max_thinking=False,
+            supports_minimal_thinking=False,
         )
     return _CLAUDE_FALLBACK_CAPABILITIES
 

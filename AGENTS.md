@@ -27,6 +27,7 @@ Tests live in `tests/`.
 - Use `acquire_exclusive_file_lock` / `release_file_lock` from `ucode.os_compatibility.file_lock_cross_os` instead of calling `fcntl.flock`, `fcntl.lockf`, or `msvcrt.locking` directly. Ruff enforces this outside the compatibility module and tests.
 - Use `launcher.exec_or_spawn` when handing the terminal to an agent. Shell strings and explicit executable overrides keep their existing subprocess semantics.
 - Add or update focused tests for behavior changes.
+- Model thinking levels: the source of truth is the Databricks reasoning-models doc (https://docs.databricks.com/aws/en/machine-learning/model-serving/query-reason-models), which lists the `reasoning_effort` / `output_config.effort` values the gateway accepts per model. It can differ from the vendor (Haiku 5.5 rejects `xhigh`/`max`; GPT-6.1 Sol accepts `none`). Only for models the doc does not list, fall back to Pi's catalog (`curl -s https://pi.dev/api/models`). Never infer from neighbouring versions; version-pinned allowlists have repeatedly missed new models. The gateway's own validation is a loose shared enum, so a 200 does not prove a level is real. Claude levels: `claude_model_capabilities` in `databricks.py`; GPT/Grok: `_pi_gpt_model_entry`; open-source MLflow models: `_OSS_THINKING_LEVEL_MAPS` in `agents/pi.py`. Update `_DOCUMENTED_THINKING_LEVELS` / `_DOCUMENTED_OSS_LEVELS` in `tests/test_agent_pi.py` in the same change.
 - Do not modify generated or lock files unless the dependency graph intentionally changes.
 
 ## Style
