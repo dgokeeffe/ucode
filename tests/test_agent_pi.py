@@ -1730,8 +1730,30 @@ def test_gemini_argon_entry():
         "maxTokens": 65_536,
         "reasoning": True,
         "input": ["text", "image"],
+        "inputLimits": pi._PI_IMAGE_INPUT_LIMITS,
         "thinkingLevelMap": {"off": None, "minimal": None},
     }
+
+
+def test_image_capable_models_declare_gateway_image_resize_limits():
+    claude = pi._pi_claude_model_entry("system.ai.claude-opus-5-5")
+    gpt = pi._pi_gpt_model_entry("system.ai.gpt-6-1-sol")
+    gemini = pi._pi_gemini_model_entry("system.ai.gemini-4-argon")
+    grok = pi._pi_gpt_model_entry("system.ai.grok-4-6")
+
+    for entry in (claude, gpt, gemini):
+        assert entry["inputLimits"] == {
+            "maxRequestBytes": 33_554_432,
+            "images": {
+                "resize": {
+                    "maxWidth": 2000,
+                    "maxHeight": 2000,
+                    "maxBytes": 786_432,
+                    "jpegQuality": 80,
+                }
+            },
+        }
+    assert "inputLimits" not in grok
 
 
 def test_unknown_gemini_model_gets_safe_limits_without_reasoning():

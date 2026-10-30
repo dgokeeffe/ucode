@@ -146,6 +146,24 @@ def _resolve_model_selector(
 # with those disabled. Pi only; other agents still list them.
 _PI_MIN_CLAUDE_VERSION = (4, 5)
 
+# Databricks AI Gateway enforces a 32 MiB HTTP body limit across model routes.
+# Pi's default per-image resize cap is 4.5 MiB base64, which keeps lossless PNG
+# screenshots at 1.5-4 MB each so ~15-20 screenshots breach 32 MiB well before
+# token-based compaction triggers (Pi estimates every image at 1,200 tokens).
+# Capping encoded images at 750 KiB forces JPEG compression on dense screenshots.
+_PI_GATEWAY_MAX_REQUEST_BYTES = 33_554_432
+_PI_IMAGE_INPUT_LIMITS: dict[str, object] = {
+    "maxRequestBytes": _PI_GATEWAY_MAX_REQUEST_BYTES,
+    "images": {
+        "resize": {
+            "maxWidth": 2000,
+            "maxHeight": 2000,
+            "maxBytes": 786_432,
+            "jpegQuality": 80,
+        }
+    },
+}
+
 
 def _pi_supports_claude_model(model_id: str) -> bool:
     version = claude_model_version(model_id)
@@ -163,6 +181,7 @@ def _pi_claude_model_entry(model_id: str) -> dict:
         "id": model_id,
         "reasoning": True,
         "input": ["text", "image"],
+        "inputLimits": _PI_IMAGE_INPUT_LIMITS,
         "contextWindow": capabilities.context,
         "maxTokens": capabilities.output,
     }
@@ -458,6 +477,8 @@ def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
         entry["reasoning"] = True
         entry["input"] = ["text", "image"]
         entry["thinkingLevelMap"] = {"off": None}
+    if "image" in entry.get("input", ()):
+        entry["inputLimits"] = _PI_IMAGE_INPUT_LIMITS
     return entry
 
 
@@ -556,6 +577,7 @@ def _pi_gemini_model_entry(model_id: str, spec: dict[str, object] | None = None)
     if canonical_id in _GEMINI_THINKING_LEVEL_MAPS:
         entry["reasoning"] = True
         entry["input"] = ["text", "image"]
+        entry["inputLimits"] = _PI_IMAGE_INPUT_LIMITS
         level_map = _GEMINI_THINKING_LEVEL_MAPS[canonical_id]
         if level_map is not None:
             entry["thinkingLevelMap"] = dict(level_map)
