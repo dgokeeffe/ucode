@@ -2109,6 +2109,34 @@ def discover_responses_model_specs(
     return [], "Responses model metadata contained no context windows"
 
 
+def discover_gemini_model_specs(
+    workspace: str, token: str, model_ids: list[str]
+) -> tuple[list[dict], str | None]:
+    """Project live context windows onto native-Gemini model IDs.
+
+    Same shape as ``discover_responses_model_specs`` (``{"id", "context_window"}``)
+    and the same cached foundation-model listing. An empty result is non-fatal:
+    Pi falls back to its static Gemini limits.
+    """
+    payload, reason = _get_foundation_models_payload(workspace, token)
+    if payload is None:
+        return [], reason
+    api_type = "gemini/v1/generateContent"
+    api_types_by_id = _foundation_model_api_types(payload)
+    context_by_id = _foundation_model_context_windows(payload, api_type=api_type)
+    specs: list[dict] = []
+    for model_id in model_ids:
+        canonical_id = _canonical_oss_model_id(model_id)
+        if api_type not in api_types_by_id.get(canonical_id, frozenset()):
+            continue
+        context_window = context_by_id.get(canonical_id)
+        if context_window is not None:
+            specs.append({"id": model_id, "context_window": context_window})
+    if specs or not model_ids:
+        return specs, None
+    return [], "Gemini model metadata contained no context windows"
+
+
 def _static_oss_spec(model_id: str) -> dict | None:
     """Capability fallback for statically validated GLM/Kimi/DeepSeek families."""
     if not _is_oss_chat_model(model_id.lower()):
