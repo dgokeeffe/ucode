@@ -4664,6 +4664,9 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "discover_responses_model_specs", lambda w, t, ids: ([], None))
         monkeypatch.setattr(
+            cli_mod, "discover_gemini_model_specs", lambda w, t, ids: ([], "no metadata")
+        )
+        monkeypatch.setattr(
             cli_mod,
             "discover_oss_model_specs",
             lambda w, t, model_ids=None: (
@@ -4887,6 +4890,31 @@ class TestConfigureSharedStateUsePat:
         assert state["codex_model_specs"] == [{"id": model, "context_window": 750_000}]
         assert state["opencode_models"]["openai"] == [model]
         assert saved[-1]["codex_models"] == [model]
+
+    def test_gemini_specs_persisted_and_discovery_failure_is_non_fatal(self, monkeypatch):
+        cli_mod, _, _, saved = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        model = "system.ai.gemini-4-argon"
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: ({}, [], [model], [], None),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", tools=["pi"])
+
+        assert state["gemini_models"] == [model]
+        assert state["gemini_model_specs"] == []
+
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_gemini_model_specs",
+            lambda w, t, ids: ([{"id": model, "context_window": 1_048_576}], None),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", tools=["pi"])
+
+        assert state["gemini_model_specs"] == [{"id": model, "context_window": 1_048_576}]
+        assert saved[-1]["gemini_model_specs"] == [{"id": model, "context_window": 1_048_576}]
 
     def test_active_listing_replaces_unlisted_gpt_in_state_and_overlays(self, monkeypatch):
         from ucode.agents import opencode as opencode_mod

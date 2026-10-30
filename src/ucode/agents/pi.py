@@ -461,6 +461,107 @@ def _pi_gpt_model_entry(model_id: str, spec: dict[str, object] | None = None) ->
     return entry
 
 
+# Gemini limits from Pi's catalog (https://pi.dev/api/models, `google-vertex`,
+# which is how Databricks hosts Gemini; `gemini-3-pro-image` is only listed
+# under `openrouter`). Keys are canonical ids: prefix-stripped, dots → dashes.
+# A bare entry would otherwise get Pi's 128k context / 4k output defaults.
+_GEMINI_TOKEN_LIMITS: dict[str, dict[str, int]] = {
+    "gemini-4-argon": {"context": 1_048_576, "output": 65_536},
+    "gemini-3-8-flash": {"context": 1_048_576, "output": 65_536},
+    "gemini-3-7-flash": {"context": 1_048_576, "output": 65_536},
+    "gemini-3-6-flash": {"context": 1_048_576, "output": 65_536},
+    "gemini-3-5-flash": {"context": 1_048_576, "output": 65_536},
+    "gemini-3-5-flash-lite": {"context": 1_048_576, "output": 65_536},
+    "gemini-3-1-pro": {"context": 1_048_576, "output": 65_536},
+    "gemini-3-1-flash-lite": {"context": 1_048_576, "output": 65_536},
+    "gemini-3-flash": {"context": 1_048_576, "output": 65_536},
+    "gemini-2-5-pro": {"context": 1_048_576, "output": 65_536},
+    "gemini-2-5-flash": {"context": 1_048_576, "output": 65_536},
+    "gemini-2-5-flash-lite": {"context": 1_048_576, "output": 65_536},
+    "gemini-3-pro-image": {"context": 65_536, "output": 32_768},
+}
+# Uncatalogued Gemini text models get the 1M/64k window every catalogued
+# Gemini 2.5+ text model shares. Uncatalogued image-generation variants
+# (`-image`, no tool calling or long context per the gateway listing) get the
+# smaller window of the one catalogued image model instead.
+_GEMINI_DEFAULT_LIMITS = {"context": 1_048_576, "output": 65_536}
+_GEMINI_IMAGE_DEFAULT_LIMITS = {"context": 65_536, "output": 32_768}
+
+# Pi thinking levels per Gemini model, from the Databricks reasoning-models
+# doc, then Pi's catalog for models the doc does not list. `None` as a value
+# means reasoning with no map (every Pi level through `high`).
+#
+# How Pi's google-generative-ai API sends levels (pi-ai `google-shared.ts`):
+# ids matching `gemini-3(.N)-(pro|flash)` or `gemini-[4-9]` send
+# `thinkingConfig.thinkingLevel` (MINIMAL/LOW/MEDIUM/HIGH); any other id sends
+# `thinkingBudget` (-1 = dynamic for every level, 0 for off). Databricks'
+# dashed ids (`gemini-3-5-flash`) miss the first regex, so only Argon,
+# `gemini-3-flash` and `gemini-3-pro-image` take the level path today.
+# Unmapped `xhigh`/`max` are hidden. With `off: None`, a thinking-disabled
+# request on the level path is clamped to the lowest supported level.
+_GEMINI_THINKING_LEVEL_MAPS: dict[str, dict[str, str | None] | None] = {
+    # Always reasons; accepts low/medium (default)/high only. Both `minimal` and
+    # `thinkingBudget` (Pi's off path) are rejected with HTTP 400, so off is
+    # hidden and a disabled request clamps to `low`.
+    "gemini-4-argon": {"off": None, "minimal": None},
+    # Hybrid: low/medium (default)/high; can be off; `minimal` rejected.
+    "gemini-3-8-flash": {"minimal": None},
+    "gemini-3-7-flash": {"minimal": None},
+    # Gemini 3 family: minimal/low (default)/medium/high; no off.
+    "gemini-3-6-flash": {"off": None},
+    "gemini-3-5-flash": {"off": None},
+    "gemini-3-5-flash-lite": {"off": None},
+    "gemini-3-1-flash-lite": {"off": None},
+    "gemini-3-flash": {"off": None},
+    # The doc lists `minimal` for 3.1 Pro, but the gateway rejects it ("thinking_level
+    # MINIMAL is not supported by this model", HTTP 400) and Pi's catalog hides it.
+    "gemini-3-1-pro": {"off": None, "minimal": None},
+    # Not in the doc; Pi's catalog marks these reasoning with no level map.
+    "gemini-2-5-pro": None,
+    "gemini-2-5-flash": None,
+    "gemini-2-5-flash-lite": None,
+}
+
+
+def _canonical_gemini_id(model_id: str) -> str:
+    normalized_id = model_id.rsplit("/", 1)[-1].lower()
+    for prefix in ("system.ai.", "databricks-"):
+        if normalized_id.startswith(prefix):
+            normalized_id = normalized_id[len(prefix) :]
+            break
+    return normalized_id.replace(".", "-")
+
+
+def _pi_gemini_model_entry(model_id: str, spec: dict[str, object] | None = None) -> dict:
+    """Build a Pi Gemini entry with explicit limits and thinking levels.
+
+    A discovered context window (``spec["context_window"]``) overrides the
+    static one. Models outside the doc and Pi's catalog get limits only, so Pi
+    sends no ``thinkingConfig`` and the gateway applies the model default.
+    """
+    canonical_id = _canonical_gemini_id(model_id)
+    static_limits = _GEMINI_TOKEN_LIMITS.get(canonical_id)
+    if static_limits is None:
+        static_limits = (
+            _GEMINI_IMAGE_DEFAULT_LIMITS if "-image" in canonical_id else _GEMINI_DEFAULT_LIMITS
+        )
+    discovered_context = (
+        _positive_int(spec.get("context_window")) if isinstance(spec, dict) else None
+    )
+    entry: dict = {
+        "id": model_id,
+        "contextWindow": discovered_context or static_limits["context"],
+        "maxTokens": static_limits["output"],
+    }
+    if canonical_id in _GEMINI_THINKING_LEVEL_MAPS:
+        entry["reasoning"] = True
+        entry["input"] = ["text", "image"]
+        level_map = _GEMINI_THINKING_LEVEL_MAPS[canonical_id]
+        if level_map is not None:
+            entry["thinkingLevelMap"] = dict(level_map)
+    return entry
+
+
 def render_overlay(
     model: str,
     api_key: str,
@@ -472,6 +573,7 @@ def render_overlay(
     oss_specs: list[dict] | None = None,
     claude_model_ids: list[str] | None = None,
     codex_specs: list[dict] | None = None,
+    gemini_specs: list[dict] | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Pi's user agent config.
 
@@ -523,13 +625,17 @@ def render_overlay(
         }
         keys.append(["providers", "databricks-openai"])
     if gemini_models:
+        gemini_specs_by_id = _responses_specs_by_id(gemini_specs)
         providers["databricks-gemini"] = {
             "baseUrl": pi_base_urls["gemini"],
             "api": "google-generative-ai",
             "apiKey": api_key,
             "authHeader": True,
             "headers": ua_headers,
-            "models": [{"id": m} for m in gemini_models],
+            "models": [
+                _pi_gemini_model_entry(model_id, gemini_specs_by_id.get(model_id))
+                for model_id in gemini_models
+            ],
         }
         keys.append(["providers", "databricks-gemini"])
     if oss_models:
@@ -642,6 +748,7 @@ def _write_tool_config_unlocked(
         state.get("oss_model_specs") or [],
         claude_model_ids,
         state.get("codex_model_specs") or [],
+        state.get("gemini_model_specs") or [],
     )
     existing = read_json_safe(PI_CONFIG_PATH)
     providers = existing.get("providers")

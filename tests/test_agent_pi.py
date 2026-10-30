@@ -35,6 +35,7 @@ def _empty() -> dict:
         "oss_models": [],
         "oss_specs": [],
         "codex_specs": [],
+        "gemini_specs": [],
     }
 
 
@@ -52,6 +53,7 @@ def _overlay(model: str, token: str = "tok", **kwargs):
         bundle["oss_specs"],
         None,
         bundle["codex_specs"],
+        bundle["gemini_specs"],
     )
 
 
@@ -890,6 +892,24 @@ class TestWriteToolConfig:
         for name in ("databricks-claude", "databricks-openai", "databricks-gemini"):
             assert providers[name]["apiKey"].startswith("!"), name
 
+    def test_persisted_gemini_specs_reach_models_json(self, tmp_path, monkeypatch):
+        pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
+        argon = "system.ai.gemini-4-argon"
+        state = self._state(
+            gemini_models=[argon],
+            gemini_model_specs=[{"id": argon, "context_window": 1_500_000}],
+        )
+
+        with (
+            patch("ucode.agents.pi.get_databricks_token", return_value="tok"),
+            patch("ucode.agents.pi.save_state"),
+        ):
+            pi_mod.write_tool_config(state, "claude-sonnet", token="tok")
+
+        (entry,) = json.loads(config_file.read_text())["providers"]["databricks-gemini"]["models"]
+        assert entry["contextWindow"] == 1_500_000
+        assert entry["thinkingLevelMap"] == {"off": None, "minimal": None}
+
     def test_cached_pi_inventory_always_keeps_shared_default(self):
         state = {
             "workspace": WS,
@@ -1635,6 +1655,140 @@ def test_oss_thinking_levels_match_databricks_doc(model, prefix):
 
     assert entry["reasoning"] is True
     assert _effective_levels(entry.get("thinkingLevelMap")) == _DOCUMENTED_OSS_LEVELS[model]
+
+
+# Supported Pi levels -> Gemini thinking level, per the Databricks
+# reasoning-models doc, then Pi's catalog for models the doc does not list.
+# `off` absent means thinking cannot be turned off.
+_DOCUMENTED_GEMINI_LEVELS = {
+    # Always reasons: low/medium/high only; minimal and none are rejected.
+    "gemini-4-argon": {"low": "low", "medium": "medium", "high": "high"},
+    # Hybrid: off plus low/medium/high; no minimal.
+    "gemini-3-8-flash": {"off": "off", "low": "low", "medium": "medium", "high": "high"},
+    "gemini-3-7-flash": {"off": "off", "low": "low", "medium": "medium", "high": "high"},
+    # Gemini 3 family: minimal/low/medium/high.
+    **{
+        model: {"minimal": "minimal", "low": "low", "medium": "medium", "high": "high"}
+        for model in (
+            "gemini-3-6-flash",
+            "gemini-3-5-flash",
+            "gemini-3-5-flash-lite",
+            "gemini-3-1-flash-lite",
+            "gemini-3-flash",
+        )
+    },
+    # The doc lists minimal for 3.1 Pro, but the gateway rejects MINIMAL (HTTP 400)
+    # and Pi's catalog hides it.
+    "gemini-3-1-pro": {"low": "low", "medium": "medium", "high": "high"},
+    # Not in the doc: Pi's catalog has reasoning with no level map.
+    **{
+        model: {
+            "off": "off",
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+        }
+        for model in ("gemini-2-5-pro", "gemini-2-5-flash", "gemini-2-5-flash-lite")
+    },
+}
+# Values Pi's google-generative-ai resolver accepts (`resolveGoogleThinkingLevel`);
+# any other string throws before the request is sent.
+_PI_GOOGLE_LEVELS = {"minimal", "low", "medium", "high"}
+
+
+@pytest.mark.parametrize("model", sorted(_DOCUMENTED_GEMINI_LEVELS))
+@pytest.mark.parametrize("prefix", ["system.ai.", "databricks-"])
+def test_gemini_thinking_levels_match_databricks_doc(model, prefix):
+    entry = pi._pi_gemini_model_entry(prefix + model)
+
+    assert entry["reasoning"] is True
+    assert entry["input"] == ["text", "image"]
+    assert _effective_levels(entry.get("thinkingLevelMap")) == _DOCUMENTED_GEMINI_LEVELS[model]
+    sent = {value for value in (entry.get("thinkingLevelMap") or {}).values() if value}
+    assert sent <= _PI_GOOGLE_LEVELS
+
+
+def test_gemini_dotted_id_normalises_to_documented_levels():
+    entry = pi._pi_gemini_model_entry("gemini-3.8-flash")
+
+    assert entry["thinkingLevelMap"] == {"minimal": None}
+
+
+@pytest.mark.parametrize("model", sorted(_DOCUMENTED_GEMINI_LEVELS))
+def test_gemini_static_limits_match_pi_catalog(model):
+    entry = pi._pi_gemini_model_entry(f"system.ai.{model}")
+
+    assert entry["contextWindow"] == 1_048_576
+    assert entry["maxTokens"] == 65_536
+
+
+def test_gemini_argon_entry():
+    assert pi._pi_gemini_model_entry("system.ai.gemini-4-argon") == {
+        "id": "system.ai.gemini-4-argon",
+        "contextWindow": 1_048_576,
+        "maxTokens": 65_536,
+        "reasoning": True,
+        "input": ["text", "image"],
+        "thinkingLevelMap": {"off": None, "minimal": None},
+    }
+
+
+def test_unknown_gemini_model_gets_safe_limits_without_reasoning():
+    entry = pi._pi_gemini_model_entry("system.ai.gemini-5-future")
+
+    assert entry == {
+        "id": "system.ai.gemini-5-future",
+        "contextWindow": 1_048_576,
+        "maxTokens": 65_536,
+    }
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "system.ai.gemini-3-pro-image",
+        "system.ai.gemini-3-1-flash-image",
+        "databricks-gemini-3-1-flash-lite-image",
+    ],
+)
+def test_gemini_image_models_get_image_limits_without_reasoning(model_id):
+    entry = pi._pi_gemini_model_entry(model_id)
+
+    assert entry == {"id": model_id, "contextWindow": 65_536, "maxTokens": 32_768}
+
+
+def test_gemini_discovered_context_overrides_static():
+    entry = pi._pi_gemini_model_entry(
+        "system.ai.gemini-4-argon",
+        {"id": "system.ai.gemini-4-argon", "context_window": 2_000_000},
+    )
+
+    assert entry["contextWindow"] == 2_000_000
+    assert entry["maxTokens"] == 65_536
+
+
+def test_gemini_invalid_discovered_context_falls_back_to_static():
+    entry = pi._pi_gemini_model_entry(
+        "system.ai.gemini-4-argon", {"id": "system.ai.gemini-4-argon", "context_window": 0}
+    )
+
+    assert entry["contextWindow"] == 1_048_576
+
+
+def test_render_overlay_threads_gemini_specs():
+    argon = "system.ai.gemini-4-argon"
+    flash = "system.ai.gemini-3-8-flash"
+    overlay, _ = _overlay(
+        argon,
+        gemini_models=[argon, flash],
+        gemini_specs=[{"id": argon, "context_window": 1_500_000}],
+    )
+
+    models = {m["id"]: m for m in overlay["providers"]["databricks-gemini"]["models"]}
+    assert models[argon]["contextWindow"] == 1_500_000
+    assert models[flash]["contextWindow"] == 1_048_576
+    assert models[flash]["thinkingLevelMap"] == {"minimal": None}
 
 
 def test_undocumented_oss_reasoning_model_keeps_pi_defaults():

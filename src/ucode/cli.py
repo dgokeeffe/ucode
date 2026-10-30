@@ -59,6 +59,7 @@ from ucode.databricks import (
     databricks_cli_installed,
     discover_claude_models,
     discover_codex_models,
+    discover_gemini_model_specs,
     discover_gemini_models,
     discover_model_services,
     discover_oss_model_specs,
@@ -658,6 +659,7 @@ def configure_shared_state(
     oss_reason: str | None = None
     claude_models = {}
     gemini_models = []
+    gemini_specs: list[dict] = []
     codex_models = []
     codex_specs: list[dict] = []
     oss_models = []
@@ -692,6 +694,9 @@ def configure_shared_state(
                 gemini_models, gemini_reason = ms_gemini, ms_reason
                 if not gemini_models:
                     gemini_models, gemini_reason = discover_gemini_models(workspace, token)
+                if gemini_models:
+                    # Best-effort: an empty result leaves Pi on static limits.
+                    gemini_specs, _ = discover_gemini_model_specs(workspace, token, gemini_models)
             if want_codex:
                 codex_models, codex_reason = ms_codex, ms_reason
                 if not codex_models:
@@ -757,6 +762,7 @@ def configure_shared_state(
             state["claude_models"] = claude_models
         if want_gemini:
             state["gemini_models"] = gemini_models
+            state["gemini_model_specs"] = gemini_specs
         if want_codex:
             state["codex_models"] = codex_models
             state["codex_model_specs"] = codex_specs

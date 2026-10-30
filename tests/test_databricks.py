@@ -2503,6 +2503,66 @@ class TestDiscoverModelServicesDynamicOss:
         assert spec_reason is None
         assert specs == [{"id": "system.ai.future-coder-1", "context_window": 750_000}]
 
+    def test_gemini_specs_project_native_gemini_context_windows(self, monkeypatch):
+        foundation_models = {
+            "endpoints": [
+                _foundation_endpoint(
+                    "databricks-gemini-4-argon",
+                    ["gemini/v1/generateContent", "mlflow/v1/chat/completions"],
+                    description="supports a context window of 1M tokens",
+                ),
+                # Context advertised only on a non-Gemini API is not projected.
+                _foundation_endpoint(
+                    "databricks-gemini-3-8-flash",
+                    ["mlflow/v1/chat/completions"],
+                    description="supports a context window of 1M tokens",
+                ),
+            ]
+        }
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=10: (foundation_models, None)
+        )
+
+        specs, reason = db_mod.discover_gemini_model_specs(
+            WS, "token", ["system.ai.gemini-4-argon", "system.ai.gemini-3-8-flash"]
+        )
+
+        assert reason is None
+        assert specs == [{"id": "system.ai.gemini-4-argon", "context_window": 1_000_000}]
+
+    def test_gemini_specs_without_context_are_non_fatal(self, monkeypatch):
+        foundation_models = {
+            "endpoints": [
+                _foundation_endpoint(
+                    "databricks-gemini-4-argon",
+                    ["gemini/v1/generateContent"],
+                    description="Gemini 4 Argon is Google's frontier model.",
+                )
+            ]
+        }
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=10: (foundation_models, None)
+        )
+
+        specs, reason = db_mod.discover_gemini_model_specs(
+            WS, "token", ["system.ai.gemini-4-argon"]
+        )
+
+        assert specs == []
+        assert reason == "Gemini model metadata contained no context windows"
+
+    def test_gemini_specs_listing_failure_returns_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=10: (None, "HTTP 503")
+        )
+
+        specs, reason = db_mod.discover_gemini_model_specs(
+            WS, "token", ["system.ai.gemini-4-argon"]
+        )
+
+        assert specs == []
+        assert reason == "HTTP 503"
+
     def test_explicit_capabilities_override_known_name_fallback(self, monkeypatch):
         model_services = {
             "model_services": [
