@@ -7723,6 +7723,26 @@ class TestConfigureSharedStateUsePat:
         assert state["oss_models"] == ["system.ai.glm-5-2", "system.ai.inkling"]
         assert "oss_dead_models" not in state
 
+    def test_launch_path_ignores_dead_list_from_another_workspace_on_the_host(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={
+                "workspace": self.WS,
+                "workspace_id": "111",
+                "oss_dead_models": ["system.ai.inkling"],
+            },
+        )
+        calls = self._stub_oss_probe(monkeypatch, cli_mod, set())
+        # The shared stub predates workspace ids; this login check needs none.
+        monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda *a, **k: None)
+
+        state = cli_mod.configure_shared_state(f"{self.WS}?w=222", profile="DEFAULT", tools=["pi"])
+
+        assert calls == []
+        assert state["oss_models"] == ["system.ai.glm-5-2", "system.ai.inkling"]
+        assert "oss_dead_models" not in state
+
     def test_configure_command_enables_the_oss_probe(self, monkeypatch):
         import ucode.cli as cli_mod
 
@@ -7819,6 +7839,26 @@ class TestConfigureSharedStateUsePat:
         calls = self._stub_tool_probe(monkeypatch, cli_mod, set())
 
         state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", tools=["pi"])
+
+        assert calls == []
+        assert state["oss_models"] == ["system.ai.glm-5-2", "system.ai.tiny"]
+        assert "tool_less_models" not in state
+
+    def test_workspace_change_on_one_host_clears_recorded_tool_less_models(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={
+                "workspace": self.WS,
+                "workspace_id": "111",
+                "tool_less_models": ["system.ai.tiny"],
+            },
+        )
+        calls = self._stub_tool_probe(monkeypatch, cli_mod, set())
+        # The shared stub predates workspace ids; this login check needs none.
+        monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda *a, **k: None)
+
+        state = cli_mod.configure_shared_state(f"{self.WS}?w=222", profile="DEFAULT", tools=["pi"])
 
         assert calls == []
         assert state["oss_models"] == ["system.ai.glm-5-2", "system.ai.tiny"]
@@ -8768,6 +8808,52 @@ class TestConfigureSharedStateSkipPreflight:
         cli_mod.configure_shared_state(f"{shared}?w=222", profile="acme", skip_preflight=True)
 
         assert purges == [{}]
+
+    def test_switching_workspaces_on_one_host_drops_model_state(self, monkeypatch):
+        # Workspaces on one host have their own inventories and probe results.
+        cli_mod, saved = self._stub(monkeypatch)
+        shared = "https://acme.cloud.databricks.com"
+        monkeypatch.setattr(
+            cli_mod,
+            "load_state",
+            lambda: {
+                "workspace": shared,
+                "workspace_id": "111",
+                "pi_claude_models": ["system.ai.claude-opus-5"],
+                "oss_dead_models": ["system.ai.inkling"],
+                "tool_less_models": ["system.ai.tiny"],
+            },
+        )
+        monkeypatch.setattr(cli_mod, "find_profile_name_for_workspace", lambda w, i: "acme")
+        monkeypatch.setattr(cli_mod, "purge_cross_workspace_mcp_residue", lambda *a, **k: None)
+
+        cli_mod.configure_shared_state(f"{shared}?w=222", profile="acme", skip_preflight=True)
+
+        for field in ("pi_claude_models", "oss_dead_models", "tool_less_models"):
+            assert field not in saved[-1]
+
+    def test_same_workspace_keeps_model_state(self, monkeypatch):
+        cli_mod, saved = self._stub(monkeypatch)
+        shared = "https://acme.cloud.databricks.com"
+        monkeypatch.setattr(
+            cli_mod,
+            "load_state",
+            lambda: {
+                "workspace": shared,
+                "workspace_id": "111",
+                "pi_claude_models": ["system.ai.claude-opus-5"],
+                "oss_dead_models": ["system.ai.inkling"],
+                "tool_less_models": ["system.ai.tiny"],
+            },
+        )
+        monkeypatch.setattr(cli_mod, "find_profile_name_for_workspace", lambda w, i: "acme")
+        monkeypatch.setattr(cli_mod, "purge_cross_workspace_mcp_residue", lambda *a, **k: None)
+
+        cli_mod.configure_shared_state(f"{shared}?w=111", profile="acme", skip_preflight=True)
+
+        assert saved[-1]["pi_claude_models"] == ["system.ai.claude-opus-5"]
+        assert saved[-1]["oss_dead_models"] == ["system.ai.inkling"]
+        assert saved[-1]["tool_less_models"] == ["system.ai.tiny"]
 
     def test_explicit_selector_never_falls_back_to_the_saved_workspace(self, monkeypatch):
         import ucode.workspace as workspace_mod

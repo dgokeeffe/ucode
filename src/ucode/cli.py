@@ -705,10 +705,11 @@ def configure_shared_state(
     state["base_urls"] = build_shared_base_urls(workspace)
     # Pi refreshes its supplemental Claude inventory during the next config
     # write. Never carry model ids across a full discovery or workspace change.
-    if not skip_preflight or previous_workspace != workspace:
+    # Compare workspace keys: workspaces sharing a host have different inventories.
+    if not skip_preflight or previous_key != key:
         state.pop("pi_claude_models", None)
     # Probe-derived skip lists belong to the workspace that was probed.
-    if previous_workspace != workspace:
+    if previous_key != key:
         state.pop("oss_dead_models", None)
         state.pop("tool_less_models", None)
 
@@ -897,7 +898,7 @@ def configure_shared_state(
                 oss_models,
                 oss_specs,
                 probe=probe_models,
-                same_workspace=previous_workspace == workspace,
+                same_workspace=previous_key == key,
             )
         if want_gemini or want_oss:
             gemini_models, oss_models, oss_specs = _drop_tool_less_models(
@@ -908,7 +909,7 @@ def configure_shared_state(
                 oss_models,
                 oss_specs,
                 probe=probe_models,
-                same_workspace=previous_workspace == workspace,
+                same_workspace=previous_key == key,
             )
         if claude_models:
             opencode_models["anthropic"] = list(claude_models.values())
