@@ -3900,6 +3900,26 @@ class TestGetDatabricksToken:
             get_databricks_token(WS, profile="p", budget_seconds=0.5, allow_reauth=False)
         assert time.monotonic() - started < 3
 
+    def test_budget_timeout_is_not_memoized(self, tmp_path, monkeypatch):
+        # A deadline miss is transient: the next call must ask the CLI again
+        # instead of replaying the memoized failure.
+        calls = tmp_path / "calls"
+        calls.write_text("0")
+        env = self._fake_databricks(
+            tmp_path,
+            "import time\n"
+            f"calls = Path({str(calls)!r})\n"
+            "count = int(calls.read_text())\n"
+            "calls.write_text(str(count + 1))\n"
+            "if count == 0:\n"
+            "    time.sleep(5)\n"
+            'print(json.dumps({"access_token": "second-try", "token_type": "Bearer"}))',
+        )
+        monkeypatch.setattr("os.environ", env)
+        with pytest.raises(RuntimeError, match="timed out after"):
+            get_databricks_token(WS, profile="p", budget_seconds=0.5, allow_reauth=False)
+        assert get_databricks_token(WS, profile="p", allow_reauth=False) == "second-try"
+
     def test_budget_spans_lock_retries(self, tmp_path, monkeypatch):
         # Each lock-contention retry draws from the same budget, not a fresh 15s.
         env = self._fake_databricks(
@@ -7839,6 +7859,8 @@ class TestProbeToolLessModels:
         finally:
             release.set()
         assert tool_less == []
+
+
 class TestRunStdin:
     def _capture_kwargs(self, monkeypatch) -> dict:
         seen: dict = {}

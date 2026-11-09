@@ -61,7 +61,7 @@ def test_oss_discovery_diagnostic_names_all_consumers(monkeypatch):
 
     cli_mod._print_discovery_diagnostics({"_discovery_reasons": {"oss": "not found"}})
 
-    assert notes[0] == "OSS models (needed for: codex, opencode, pi): not found"
+    assert notes[0] == "OSS models (needed for: codex, opencode, kilo, pi): not found"
 
 
 def _jwt(expires_at: float, sub: str = "user") -> str:
@@ -8151,6 +8151,9 @@ class TestConfigureSharedStateOverlapsProbeAndListing:
             if "parent=" in url:
                 listing_requested.set()
                 return listing_page, None
+            if url.endswith("serving-endpoints:foundation-models"):
+                # Pi/OpenCode capability discovery reads the foundation-model catalog.
+                return {"endpoints": []}, None
             assert listing_requested.wait(self.WAIT_SECONDS), "listing did not overlap the probe"
             return {"model_services": [{"name": "model-services/system.ai.gpt-5"}]}, None
 
@@ -8162,8 +8165,13 @@ class TestConfigureSharedStateOverlapsProbeAndListing:
         for state in (first, second):
             assert state["claude_models"] == {"opus": "system.ai.claude-opus-4-8"}
             assert state["codex_models"] == ["system.ai.gpt-5"]
-        # One probe and one listing page; the second configure answers from both process caches.
-        assert len(requests) == 2
+        # One probe, one listing page and one foundation-model catalog read; the second
+        # configure answers from the process caches.
+        foundation = [
+            url for url in requests if url.endswith("serving-endpoints:foundation-models")
+        ]
+        assert len(foundation) == 1
+        assert len(requests) == 3
 
 
 class TestConfigureNoLongerValidates:

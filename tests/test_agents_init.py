@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import ucode.agents as agents_mod
+import ucode.codex_config as codex_config
 import ucode.databricks as db_mod
 from ucode import managed_files
 from ucode.agents import (
@@ -31,6 +32,9 @@ from ucode.agents import (
 from ucode.agents.args import has_explicit_model_arg
 from ucode.managed_config import ManagedConfigResult
 from ucode.ui import redirect_output_to_stderr
+
+# Captured before the autouse conftest fixture stubs it to None.
+_REAL_CODEX_MANAGED_CONFIG_PATH = codex_config.codex_managed_config_path
 
 
 class TestModelArgumentParsing:
@@ -1445,7 +1449,6 @@ class TestConfigureToolUserScope:
             agents_mod.refuse_user_scope_over_managed_files([tool])
 
     def test_windows_codex_requirements_blocks_user_scope(self, monkeypatch, tmp_path):
-        import ucode.codex_config as codex_config
         from ucode.os_compatibility import system_cross_os
 
         requirements = tmp_path / "OpenAI" / "Codex" / managed_files.CODEX_REQUIREMENTS_FILE
@@ -1454,7 +1457,7 @@ class TestConfigureToolUserScope:
         monkeypatch.setattr(codex_config, "current_os", lambda: managed_files.OS.WINDOWS)
         monkeypatch.setattr(system_cross_os, "windows_program_data_dir", lambda: tmp_path)
         monkeypatch.setattr(
-            agents_mod.codex, "codex_managed_config_path", codex_config.codex_managed_config_path
+            agents_mod.codex, "codex_managed_config_path", _REAL_CODEX_MANAGED_CONFIG_PATH
         )
         managed_files.set_config_scope("user")
         with pytest.raises(RuntimeError, match="requirements.toml"):

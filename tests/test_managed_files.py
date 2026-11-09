@@ -1221,7 +1221,7 @@ class TestWindowsManagedWrites:
         monkeypatch.setattr(codex_config, "current_os", lambda: managed_files.OS.WINDOWS)
 
         assert claude_agent._managed_settings_path() == windows
-        assert codex_config.codex_managed_config_path() == (
+        assert _REAL_CODEX_MANAGED_CONFIG_PATH() == (
             managed_files.windows_codex_managed_settings_path()
         )
 

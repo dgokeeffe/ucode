@@ -402,6 +402,7 @@ class TestAgentConfigs:
             {"opus": "claude-x"},
             [],
             [],
+            [],
         )
         headers = next(iter(overlay["providers"].values()))["headers"]
         assert headers["X-Databricks-Org-Id"] == WSID

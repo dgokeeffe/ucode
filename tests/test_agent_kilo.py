@@ -146,13 +146,15 @@ class TestRenderOverlay:
         models = {"oss": ["system.ai.glm-5-2"]}
         overlay, _ = kilo.render_overlay("system.ai.glm-5-2", "tok", _base_urls(), models)
         glm = overlay["provider"]["databricks-oss"]["models"]["system.ai.glm-5-2"]
-        assert glm["limit"] == {"context": 200000, "output": 25000}
+        # Shares OpenCode's OSS policy: glm-5-2 is 1M context / 65536 output.
+        assert glm["limit"] == {"context": 1_000_000, "output": 65_536}
 
-    def test_non_glm_oss_model_has_no_output_cap(self):
+    def test_kimi_gets_token_limits(self):
+        # kimi is a capped OSS family (128k context / 65536 output).
         models = {"oss": ["system.ai.kimi-k2-7-code"]}
         overlay, _ = kilo.render_overlay("system.ai.kimi-k2-7-code", "tok", _base_urls(), models)
         kimi = overlay["provider"]["databricks-oss"]["models"]["system.ai.kimi-k2-7-code"]
-        assert "limit" not in kimi
+        assert kimi["limit"] == {"context": 128_000, "output": 65_536}
 
     def test_token_in_api_key(self):
         models = {"anthropic": ["claude-sonnet"]}

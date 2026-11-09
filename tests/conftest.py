@@ -43,9 +43,9 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     it can never touch the developer's real ~/.ucode/state.json or invoke the
     privileged writer for an OS-managed agent config.
     """
+    import ucode.agents as agents_mod
     import ucode.auth_token_log as auth_token_log_mod
     import ucode.codex_config as codex_config_mod
-    import ucode.agents as agents_mod
     import ucode.config_io as config_io_mod
     import ucode.databricks as databricks_mod
     import ucode.managed_config as managed_config_mod

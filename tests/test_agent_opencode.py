@@ -473,7 +473,9 @@ class TestOpenAIProvider:
         model = "databricks-gpt-5-6-sol"
         overlay, _ = opencode.render_overlay(model, "tok", _base_urls(), {"openai": [model]})
         entry = overlay["provider"]["databricks-openai"]["models"][model]
-        assert entry["headers"]["User-Agent"] == "ucode/0.1.0 opencode/0.74.0"
+        assert entry["headers"]["User-Agent"] == (
+            f"ucode/0.1.0 opencode/0.74.0 {client_platform()}"
+        )
 
     def test_selector_and_managed_keys_use_openai_provider(self):
         model = "databricks-gpt-5-6-sol"

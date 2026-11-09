@@ -3007,6 +3007,8 @@ def claude_model_token_limits(model_id: str) -> dict[str, int]:
     """Return Pi metadata limits from the shared Claude capability policy."""
     capabilities = claude_model_capabilities(model_id)
     return {"context": capabilities.context, "output": capabilities.output}
+
+
 @dataclass(frozen=True)
 class ModelServiceEntry:
     """One ``system.ai.*`` model service and the API types it advertises.
