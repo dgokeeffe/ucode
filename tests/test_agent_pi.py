@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ucode.agents import pi
+from ucode.agents import _mlflow_proxy, pi
 from ucode.agents.args import LaunchOptions
 from ucode.telemetry import client_platform
 
@@ -1194,7 +1194,7 @@ class TestManagedModels:
 class TestMlflowProxyLifecycle:
     def test_not_started_without_oss_models(self):
         state = {"workspace": WS, "oss_models": [], "base_urls": {"pi": _base_urls()}}
-        with patch.object(pi._mlflow_proxy, "start") as start:
+        with patch.object(_mlflow_proxy, "start") as start:
             assert pi._start_oss_proxy(state) is None
         start.assert_not_called()
 
@@ -1206,7 +1206,7 @@ class TestMlflowProxyLifecycle:
             "base_urls": {"pi": _base_urls()},
         }
         with patch.object(
-            pi._mlflow_proxy,
+            _mlflow_proxy,
             "start",
             return_value=(server, "http://127.0.0.1:60000"),
         ) as start:
@@ -1225,7 +1225,7 @@ class TestMlflowProxyLifecycle:
             },
         }
         with patch.object(
-            pi._mlflow_proxy,
+            _mlflow_proxy,
             "start",
             return_value=(server, "http://127.0.0.1:60000"),
         ) as start:
@@ -1239,7 +1239,7 @@ class TestMlflowProxyLifecycle:
             "workspace": "http://127.0.0.1:9999",
             "oss_models": ["system.ai.inkling"],
         }
-        with patch.object(pi._mlflow_proxy, "start") as start:
+        with patch.object(_mlflow_proxy, "start") as start:
             assert pi._start_oss_proxy(state) is None
         start.assert_not_called()
 

@@ -51,10 +51,9 @@ import shlex
 import signal
 import threading
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from urllib.parse import urlparse
 
-from ucode.agents import _mlflow_proxy
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -86,6 +85,9 @@ from ucode.workspace import workspace_headers
 
 from .args import LaunchOptions
 from .request_tags import request_tags_header_value
+
+if TYPE_CHECKING:
+    from http.server import ThreadingHTTPServer
 
 # Use Pi's standard user configuration directory. Keep ucode's backups and
 # state under APP_DIR, but let Pi share the user's normal ~/.pi/agent config.
@@ -975,7 +977,7 @@ def _is_loopback_origin(origin: str) -> bool:
 
 def _start_oss_proxy(
     state: dict,
-) -> tuple[threading.Thread, _mlflow_proxy.ThreadingHTTPServer] | None:
+) -> tuple[threading.Thread, ThreadingHTTPServer] | None:
     """Start Pi's MLflow repair proxy and rewrite only the in-memory base URL.
 
     The upstream is always derived from ``workspace`` rather than an existing
@@ -991,6 +993,10 @@ def _start_oss_proxy(
     if _is_loopback_origin(origin):
         print_warning("MLflow stream repair proxy skipped for a loopback workspace URL.")
         return None
+    # Imported here: the proxy pulls in httpx through gateway_proxy, which a
+    # plain `ug` start must not pay for.
+    from ucode.agents import _mlflow_proxy
+
     started = _mlflow_proxy.start(origin)
     if started is None:
         return None
@@ -1042,7 +1048,7 @@ def launch(state: dict, tool_args: list[str], *, options: LaunchOptions) -> None
     Pi re-resolves each provider's `!command` apiKey per request, so no token
     refresher thread is needed; only the proxy needs lifecycle management.
     """
-    proxy: tuple[threading.Thread, _mlflow_proxy.ThreadingHTTPServer] | None = None
+    proxy: tuple[threading.Thread, ThreadingHTTPServer] | None = None
     token: str | None = None
     primary_error: BaseException | None = None
     try:
