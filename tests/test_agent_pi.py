@@ -505,6 +505,25 @@ class TestWriteToolConfig:
         assert written["model"] == f"databricks-mlflow/{qwen}"
         assert json.loads(settings_file.read_text())["defaultProvider"] == "databricks-mlflow"
 
+    def test_managed_list_keeps_a_model_the_probes_recorded(self, tmp_path, monkeypatch):
+        # The probes filter discovery only: a model an admin pins stays in Pi's picker, so it fails
+        # with the gateway's error instead of vanishing.
+        pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
+        qwen = "system.ai.qwen35-122b-a10b"
+        state = self._state(
+            pi_models=["system.ai.gpt-5", qwen],
+            pi_default_model=qwen,
+            oss_dead_models=[qwen],
+            tool_less_models=[qwen],
+        )
+
+        with patch("ucode.agents.pi.save_state"):
+            pi_mod.write_tool_config(state, pi.default_model(state), token="tok")
+
+        written = json.loads(config_file.read_text())
+        assert [m["id"] for m in written["providers"]["databricks-mlflow"]["models"]] == [qwen]
+        assert written["model"] == f"databricks-mlflow/{qwen}"
+
     def test_config_written_with_correct_model_and_auth_command(self, tmp_path, monkeypatch):
         pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
 

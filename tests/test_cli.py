@@ -6242,9 +6242,11 @@ class TestConfigureAgentsSelection:
             use_pat=False,
             databricks_ai_tools_enabled=None,
             clear_custom_oauth=False,
+            probe_models=False,
         ):
             captured["workspace"] = workspace
             captured["profile"] = profile
+            captured["probe_models"] = probe_models
             return {**MINIMAL_STATE, "workspace": workspace, "profile": profile}
 
         monkeypatch.setattr(cli_mod, "configure_shared_state", fake_configure_shared_state)
@@ -6261,6 +6263,8 @@ class TestConfigureAgentsSelection:
 
         assert cli_mod.configure_workspace_command() == 0
         assert captured["profile"] == "picked-profile"
+        # An explicit configure is the only caller that probes discovered models.
+        assert captured["probe_models"] is True
 
     def test_multiple_workspaces_rejected(self):
         import ucode.cli as cli_mod
@@ -7532,6 +7536,175 @@ class TestConfigureSharedStateUsePat:
             "opus": "databricks-claude-opus-4-8",
             "sonnet": "databricks-claude-sonnet-4-6",
         }
+
+
+class TestConfigureModelProbes:
+    """Explicit configure probes discovered models; launches and status reuse what it recorded."""
+
+    WS = "https://example.databricks.com"
+    GEMINI = ["system.ai.gemini-3-5-flash", "system.ai.gemini-3-pro-image"]
+    OSS = ["system.ai.glm-5-2", "system.ai.deepseek-v4-flash-0731", "system.ai.qwen35-122b-a10b"]
+
+    def _stub(self, monkeypatch, *, existing_state=None, results=None):
+        cli_mod, _, _, saved = TestConfigureSharedStateUsePat._stub_deps(
+            monkeypatch, pat_token=None, existing_state=existing_state
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: ({}, ["system.ai.gpt-5-5"], list(self.GEMINI), list(self.OSS), None),
+        )
+        probes: list[tuple] = []
+
+        def probe(workspace, token, *, oss_models, gemini_models):
+            probes.append((workspace, token, list(oss_models), list(gemini_models)))
+            return results or db_mod.ModelProbeResults()
+
+        monkeypatch.setattr(cli_mod, "probe_discovered_models", probe)
+        return cli_mod, saved, probes
+
+    def test_explicit_configure_probes_records_and_drops(self, monkeypatch, capsys):
+        results = db_mod.ModelProbeResults(
+            dead=["system.ai.deepseek-v4-flash-0731"], tool_less=["system.ai.gemini-3-pro-image"]
+        )
+        cli_mod, saved, probes = self._stub(monkeypatch, results=results)
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", probe_models=True)
+
+        assert probes == [(self.WS, "token", self.OSS, self.GEMINI)]
+        assert state["gemini_models"] == ["system.ai.gemini-3-5-flash"]
+        assert state["oss_models"] == ["system.ai.glm-5-2", "system.ai.qwen35-122b-a10b"]
+        assert state["opencode_models"]["gemini"] == ["system.ai.gemini-3-5-flash"]
+        assert state["opencode_models"]["oss"] == ["system.ai.glm-5-2"]
+        assert saved[-1]["oss_dead_models"] == ["system.ai.deepseek-v4-flash-0731"]
+        assert saved[-1]["tool_less_models"] == ["system.ai.gemini-3-pro-image"]
+        output = _strip_ansi(capsys.readouterr().out)
+        assert "Skipping retired model endpoints (deprecated or not found)" in output
+        assert "Skipping models that cannot call tools: system.ai.gemini-3-pro-image" in output
+
+    def test_a_clean_probe_clears_earlier_verdicts(self, monkeypatch):
+        cli_mod, saved, _ = self._stub(
+            monkeypatch,
+            existing_state={
+                "workspace": self.WS,
+                "oss_dead_models": ["system.ai.deepseek-v4-flash-0731"],
+                "tool_less_models": ["system.ai.gemini-3-pro-image"],
+            },
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", probe_models=True)
+
+        assert state["gemini_models"] == self.GEMINI
+        assert state["oss_models"] == self.OSS
+        assert "oss_dead_models" not in saved[-1]
+        assert "tool_less_models" not in saved[-1]
+
+    def test_launch_reuses_recorded_verdicts_without_probing(self, monkeypatch):
+        cli_mod, _, probes = self._stub(
+            monkeypatch,
+            existing_state={
+                "workspace": self.WS,
+                "oss_dead_models": ["system.ai.deepseek-v4-flash-0731"],
+                "tool_less_models": ["system.ai.gemini-3-pro-image"],
+            },
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", tools=["pi"])
+
+        assert probes == []
+        assert state["gemini_models"] == ["system.ai.gemini-3-5-flash"]
+        assert state["oss_models"] == ["system.ai.glm-5-2", "system.ai.qwen35-122b-a10b"]
+        assert state["oss_dead_models"] == ["system.ai.deepseek-v4-flash-0731"]
+
+    def test_single_agent_configure_keeps_other_families_verdicts(self, monkeypatch):
+        # A Gemini-only configure probes only Gemini; the OSS verdicts from a full configure stay.
+        cli_mod, saved, probes = self._stub(
+            monkeypatch,
+            existing_state={
+                "workspace": self.WS,
+                "oss_dead_models": ["system.ai.deepseek-v4-flash-0731"],
+                "tool_less_models": ["system.ai.gemini-3-pro-image", "system.ai.qwen35-122b-a10b"],
+            },
+        )
+
+        cli_mod.configure_shared_state(
+            self.WS, profile="DEFAULT", tools=["gemini"], probe_models=True
+        )
+
+        assert probes == [(self.WS, "token", [], self.GEMINI)]
+        assert saved[-1]["oss_dead_models"] == ["system.ai.deepseek-v4-flash-0731"]
+        assert saved[-1]["tool_less_models"] == ["system.ai.qwen35-122b-a10b"]
+
+    def test_workspace_switch_drops_the_previous_workspaces_verdicts(self, monkeypatch):
+        other = "https://other.databricks.com"
+        cli_mod, saved, probes = self._stub(
+            monkeypatch,
+            existing_state={
+                "workspace": other,
+                "oss_dead_models": ["system.ai.glm-5-2"],
+                "tool_less_models": ["system.ai.gemini-3-5-flash"],
+            },
+        )
+        # The destination's own verdicts belong to it and survive the switch.
+        monkeypatch.setattr(
+            cli_mod,
+            "load_full_state",
+            lambda: {
+                "workspaces": {self.WS: {"tool_less_models": ["system.ai.gemini-3-pro-image"]}}
+            },
+        )
+        monkeypatch.setattr(cli_mod, "_purge_after_workspace_switch", lambda *a, **k: None)
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", tools=["pi"])
+
+        assert probes == []
+        assert state["oss_models"] == self.OSS
+        assert state["gemini_models"] == ["system.ai.gemini-3-5-flash"]
+        assert "oss_dead_models" not in saved[-1]
+        assert saved[-1]["tool_less_models"] == ["system.ai.gemini-3-pro-image"]
+
+    def test_provider_mode_neither_probes_nor_touches_the_lists(self, monkeypatch):
+        cli_mod, saved, probes = self._stub(
+            monkeypatch,
+            existing_state={"workspace": self.WS, "oss_dead_models": ["system.ai.glm-5-2"]},
+        )
+
+        cli_mod.configure_shared_state(
+            self.WS,
+            profile="DEFAULT",
+            tools=["codex"],
+            skip_model_discovery=True,
+            probe_models=True,
+        )
+
+        assert probes == []
+        assert saved[-1]["oss_dead_models"] == ["system.ai.glm-5-2"]
+
+    def test_status_live_drops_recorded_models_without_probing(self, monkeypatch):
+        state = {
+            **MINIMAL_STATE,
+            "profile": "explicit-profile",
+            "oss_dead_models": ["system.ai.deepseek-v4-flash-0731"],
+            "tool_less_models": ["system.ai.gemini-3-pro-image"],
+        }
+        monkeypatch.setattr(
+            cli_mod,
+            "probe_discovered_models",
+            lambda *a, **k: pytest.fail("status must not probe"),
+        )
+        with (
+            patch("ucode.cli.get_databricks_token", return_value="token"),
+            patch(
+                "ucode.cli.discover_model_services",
+                return_value=({}, ["system.ai.gpt-5-5"], list(self.GEMINI), list(self.OSS), None),
+            ),
+        ):
+            live, freshness = cli_mod._live_status_model_state(state, {"pi"})
+
+        assert freshness == "live"
+        assert live["gemini_models"] == ["system.ai.gemini-3-5-flash"]
+        assert live["oss_models"] == ["system.ai.glm-5-2", "system.ai.qwen35-122b-a10b"]
+        assert live["opencode_models"]["oss"] == ["system.ai.glm-5-2"]
 
 
 class TestConfigureSharedStateOverlapsProbeAndListing:

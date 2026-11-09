@@ -981,6 +981,19 @@ that name gpt-oss, Qwen, Llama or Gemma (bucketing, default and unservable warni
 `function_calling: false` and embedding names are excluded even by the name fallback. These are
 component checks with stubbed listings, not live discovery.
 
+Discovered-model probes are covered by `TestProbeDiscoveredModels` in `test_databricks.py`: an
+MLflow model is dropped only on a deprecation 400 or a `*NOT_FOUND` 404, never on 403 rate limits,
+429, 5xx, other 400s, an HTML 404 or a timeout; every model answering dead at once drops none; a
+probe still running at the total budget keeps its model; and only models the listing flags with
+`function_calling: false` get the tool probe, dropped only on a 400 saying they don't support
+function calling, even past 200 characters of error body. `TestConfigureModelProbes` in
+`test_cli.py` pins that only explicit configure probes, that `oss_dead_models` and
+`tool_less_models` are recorded, reused by launches and `status --live`, kept for families a
+single-agent configure didn't probe, and replaced by the destination's own lists on a workspace
+switch. `test_workspace_selection.py` checks that probe requests carry the workspace selection,
+and `test_agent_pi.py` that a managed `pi_models` list keeps a recorded model. These stub the
+HTTP boundary; the live drop list and timing were checked by hand.
+
 Shared native transcript parsing is checked by `test_integration_agent_helpers.py` and
 `test_integration_evidence.py`. These component checks protect existing journey evidence;
 they do not establish live agent coverage.

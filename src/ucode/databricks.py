@@ -475,6 +475,7 @@ def _http_send_json(
     timeout: int = 10,
     allow_empty_body: bool = False,
     headers: dict[str, str] | None = None,
+    error_body_chars: int = 200,
 ) -> tuple[dict | list | None, str | None]:
     """Send a request that may carry a JSON body, and decode a JSON response.
 
@@ -484,6 +485,8 @@ def _http_send_json(
 
     ``allow_empty_body`` is for DELETE, whose success response is ``google.protobuf.Empty`` — an
     empty body there is the expected result, not a decode failure.
+
+    ``error_body_chars`` caps how much of an HTTP error body the reason keeps.
     """
     body_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
     request_headers = {
@@ -522,7 +525,7 @@ def _http_send_json(
         if _debug_enabled() and body:
             _debug("body", body[:4000])
         reason = f"HTTP {exc.code} {exc.reason}"
-        body_excerpt = body.strip()[:200]
+        body_excerpt = body.strip()[:error_body_chars]
         if body_excerpt:
             reason = f"{reason}: {body_excerpt}"
         reason = workspace_failure_reason(url, exc.code, body) or reason
@@ -544,10 +547,19 @@ def _http_post_json(
     *,
     timeout: int = 10,
     headers: dict[str, str] | None = None,
+    error_body_chars: int = 200,
 ) -> tuple[dict | list | None, str | None]:
     """POST a JSON body to an endpoint. Returns (payload, None) on success,
     (None, reason) on failure. Mirrors `_http_get_json`."""
-    return _http_send_json("POST", url, token, payload, timeout=timeout, headers=headers)
+    return _http_send_json(
+        "POST",
+        url,
+        token,
+        payload,
+        timeout=timeout,
+        headers=headers,
+        error_body_chars=error_body_chars,
+    )
 
 
 def _http_patch_json(
@@ -2788,6 +2800,165 @@ def discover_model_services(
             ),
         )
     return claude_models, codex_models, gemini_models, oss_models, None
+
+
+# Discovered-model probes (explicit `ug configure` only). Each probe is a 1-token request; they run
+# in parallel under one total budget so a slow gateway can't stall configure.
+_MODEL_PROBE_TIMEOUT_SECONDS = 10
+_MODEL_PROBE_TOTAL_SECONDS = 20.0
+_MODEL_PROBE_MAX_WORKERS = 16
+# Gemini nests its message in a JSON error envelope; keep enough body that the phrase survives.
+_MODEL_PROBE_ERROR_BODY_CHARS = 2000
+_NO_FUNCTION_CALLING_PHRASE = "does not support function calling"
+_DEPRECATED_ENDPOINT_PHRASE = "is deprecated"
+_TOOL_PROBE_FUNCTION = {
+    "name": "noop",
+    "description": "Does nothing.",
+    "parameters": {"type": "object", "properties": {}},
+}
+
+
+@dataclass(frozen=True)
+class ModelProbeResults:
+    """What the discovered-model probes proved, in discovery order.
+
+    ``dead`` holds MLflow chat models whose endpoint answered retired; ``tool_less`` holds models
+    that rejected a request carrying a tool."""
+
+    dead: list[str] = field(default_factory=list)
+    tool_less: list[str] = field(default_factory=list)
+
+
+def _is_dead_endpoint_reason(reason: str | None) -> bool:
+    """True only for a definitive "this endpoint is gone" answer.
+
+    A 404 whose body carries a ``*NOT_FOUND`` error code, or a 400 saying the endpoint is
+    deprecated. Auth, rate limits (403 "rate limit is set to 0"), throttling, 5xx, other 400s, a
+    404 without the error code (an HTML page) and network errors are not evidence."""
+    if not reason:
+        return False
+    if reason.startswith("HTTP 404"):
+        return "NOT_FOUND" in reason
+    if reason.startswith("HTTP 400"):
+        return _DEPRECATED_ENDPOINT_PHRASE in reason.lower()
+    return False
+
+
+def _is_no_function_calling_reason(reason: str | None) -> bool:
+    """True only for a 400 whose body says the model cannot call tools."""
+    if not reason or not reason.startswith("HTTP 400"):
+        return False
+    return _NO_FUNCTION_CALLING_PHRASE in reason.lower()
+
+
+def _tool_less_candidates(workspace: str, model_ids: list[str]) -> set[str]:
+    """The ids whose UC model-service entry lists ``function_calling: false``.
+
+    Reads this process's listing (no request). The flag over-reports (Gemini image models carry it
+    and still call tools), so it only selects which models get the tool probe."""
+    flagged = {
+        entry.id
+        for entry in cached_model_service_entries(workspace) or ()
+        if entry.function_calling is False
+    }
+    return {model_id for model_id in model_ids if model_id in flagged}
+
+
+def probe_discovered_models(
+    workspace: str,
+    token: str,
+    *,
+    oss_models: list[str],
+    gemini_models: list[str],
+    timeout: int = _MODEL_PROBE_TIMEOUT_SECONDS,
+    total_timeout: float = _MODEL_PROBE_TOTAL_SECONDS,
+    max_workers: int = _MODEL_PROBE_MAX_WORKERS,
+) -> ModelProbeResults:
+    """Find discovered models that a live 1-token call proves unusable for a coding agent.
+
+    - Every MLflow chat model (``oss_models``) gets a plain 1-token call. A listing can keep a
+      retired endpoint, and only a call reveals the deprecation 400 or the NOT_FOUND 404 (see
+      ``_is_dead_endpoint_reason``).
+    - Gemini and MLflow models whose listing says ``function_calling: false`` get a 1-token call
+      carrying one trivial tool on their own route, and count as tool-less only on a 400 saying the
+      model "does not support function calling". Every coding agent sends tools.
+
+    Fails open. Any other answer keeps the model, and so does a probe still running when
+    ``total_timeout`` elapses. When at least two models were checked and every one answered dead,
+    the route itself is suspect (a workspace without the MLflow route, say), so none is dropped.
+    Requests carry the workspace selector headers through ``_http_post_json``.
+    """
+    tool_candidates = _tool_less_candidates(workspace, [*gemini_models, *oss_models])
+    jobs: list[tuple[str, str]] = [("alive", model_id) for model_id in oss_models]
+    jobs += [("tools", model_id) for model_id in [*gemini_models, *oss_models]]
+    jobs = [job for job in jobs if job[0] == "alive" or job[1] in tool_candidates]
+    if not jobs:
+        return ModelProbeResults()
+    mlflow_url = f"{workspace}/ai-gateway/mlflow/v1/chat/completions"
+    gemini = set(gemini_models)
+
+    def probe(job: tuple[str, str]) -> bool:
+        kind, model_id = job
+        if kind == "alive":
+            url = mlflow_url
+            body: dict = {
+                "model": model_id,
+                "messages": [{"role": "user", "content": "ok"}],
+                "max_tokens": 1,
+            }
+        elif model_id in gemini:
+            url = f"{workspace}/ai-gateway/gemini/v1beta/models/{model_id}:generateContent"
+            body = {
+                "contents": [{"role": "user", "parts": [{"text": "ok"}]}],
+                "tools": [{"functionDeclarations": [_TOOL_PROBE_FUNCTION]}],
+                "generationConfig": {"maxOutputTokens": 1},
+            }
+        else:
+            url = mlflow_url
+            body = {
+                "model": model_id,
+                "messages": [{"role": "user", "content": "ok"}],
+                "tools": [{"type": "function", "function": _TOOL_PROBE_FUNCTION}],
+                "max_tokens": 1,
+            }
+        _, reason = _http_post_json(
+            url, token, body, timeout=timeout, error_body_chars=_MODEL_PROBE_ERROR_BODY_CHARS
+        )
+        _debug(f"model probe {kind} {model_id}", reason or "ok")
+        if kind == "alive":
+            return _is_dead_endpoint_reason(reason)
+        return _is_no_function_calling_reason(reason)
+
+    alive_answers = 0
+    dead: set[str] = set()
+    tool_less: set[str] = set()
+
+    def collect(failed: bool, job: tuple[str, str]) -> None:
+        nonlocal alive_answers
+        kind, model_id = job
+        if kind == "alive":
+            alive_answers += 1
+            if failed:
+                dead.add(model_id)
+        elif failed:
+            tool_less.add(model_id)
+
+    deadline = time.monotonic() + total_timeout
+    _collect_concurrently(
+        jobs,
+        probe,
+        collect,
+        max_workers=max_workers,
+        should_stop=lambda: time.monotonic() >= deadline,
+    )
+    if alive_answers > 1 and len(dead) == alive_answers:
+        _debug("model probe", "every endpoint answered dead; keeping them all")
+        dead.clear()
+    ordered = [*gemini_models, *oss_models]
+    return ModelProbeResults(
+        dead=[model_id for model_id in oss_models if model_id in dead],
+        tool_less=list(dict.fromkeys(m for m in ordered if m in tool_less)),
+    )
 
 
 # --- Managed coding-agent config (admin-authored, developer-read) -----------

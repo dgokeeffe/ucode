@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import configparser
+import io
 import json
 import os
 import subprocess
@@ -10,6 +11,7 @@ import sys
 import threading
 import time
 from decimal import Decimal
+from email.message import Message
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -5697,6 +5699,224 @@ class TestModelServiceFunctionCalling:
         entries, _ = db_mod.list_model_service_entries(WS, "token")
 
         assert entries[0].function_calling is expected
+
+
+class TestProbeDiscoveredModels:
+    """1-token probes drop a model only on a definitive answer; everything else keeps it."""
+
+    # Error bodies as the gateway returns them.
+    DEPRECATED = (
+        '{"error_code":"BAD_REQUEST","message":"The model endpoint '
+        "databricks-deepseek-v4-flash-0731 is deprecated. For a list of supported models, "
+        'see the documentation."}'
+    )
+    NOT_FOUND = '{"error_code":"NOT_FOUND","message":"\'system.ai.kimi-k2\' does not exist."}'
+    ENDPOINT_NOT_FOUND = (
+        '{"error_code":"ENDPOINT_NOT_FOUND",'
+        '"message":"The requested resource could not be found on the server."}'
+    )
+    # Gemini nests the message in an escaped JSON envelope; padding pushes the phrase past the
+    # 200 characters an ordinary HTTP failure reason keeps.
+    GEMINI_NO_TOOLS = (
+        '{"error_code":"BAD_REQUEST","message":"{\\n  \\"error\\": {\\n    \\"code\\": 400,'
+        + " " * 200
+        + '\\"message\\": \\"Unable to submit request because the model does not support '
+        'function calling.\\"}}"}'
+    )
+
+    @staticmethod
+    def _reason(outcome) -> str | None:
+        if outcome is None:
+            return None
+        status, body = outcome
+        phrase = {400: "Bad Request", 403: "Forbidden", 404: "Not Found", 429: "Too Many"}
+        return f"HTTP {status} {phrase.get(status, 'Error')}: {body}"
+
+    def _probe(self, monkeypatch, outcomes: dict, *, flagged=(), **kwargs):
+        """Run the probes with each model's answer from ``outcomes`` (a (status, body), None for
+        success, or an exception), and ``flagged`` listing ``function_calling: false``."""
+        db_mod.clear_model_services_cache()
+        db_mod._MODEL_SERVICES_CACHE[WS] = [
+            db_mod.ModelServiceEntry(m, function_calling=False) for m in flagged
+        ]
+        sent: list[tuple[str, dict, int]] = []
+        lock = threading.Lock()
+
+        def post(url, token, payload, *, timeout=10, headers=None, error_body_chars=200):
+            model_id = payload.get("model") or url.rsplit("/", 1)[-1].split(":", 1)[0]
+            with lock:
+                sent.append((url, payload, error_body_chars))
+            outcome = outcomes.get(model_id)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            reason = self._reason(outcome)
+            return (None, reason) if reason else ({"choices": []}, None)
+
+        monkeypatch.setattr(db_mod, "_http_post_json", post)
+        kwargs.setdefault("oss_models", [])
+        kwargs.setdefault("gemini_models", [])
+        return db_mod.probe_discovered_models(WS, "tok", **kwargs), sent
+
+    def test_drops_deprecated_and_not_found_keeps_everything_else(self, monkeypatch):
+        oss = [
+            "system.ai.deepseek-v4-flash-0731",
+            "system.ai.kimi-k2",
+            "system.ai.kimi-k3-neo",
+            "system.ai.glm-5-2",
+            "system.ai.deepseek-v4-1-flash",
+            "system.ai.qwen35-122b-a10b",
+            "system.ai.gemma-3-12b",
+            "system.ai.llama-4-maverick",
+            "system.ai.kimi-k3",
+            "system.ai.gpt-oss-120b",
+        ]
+        results, sent = self._probe(
+            monkeypatch,
+            {
+                "system.ai.deepseek-v4-flash-0731": (400, self.DEPRECATED),
+                "system.ai.kimi-k2": (404, self.NOT_FOUND),
+                "system.ai.kimi-k3-neo": (404, self.ENDPOINT_NOT_FOUND),
+                "system.ai.glm-5-2": (400, '{"message":"max_tokens must be at least 16"}'),
+                "system.ai.deepseek-v4-1-flash": (
+                    403,
+                    '{"error_code":"PERMISSION_DENIED","message":"rate limit is set to 0."}',
+                ),
+                "system.ai.qwen35-122b-a10b": (429, '{"error_code":"REQUEST_LIMIT_EXCEEDED"}'),
+                "system.ai.gemma-3-12b": (404, "<html>Not Found</html>"),
+                "system.ai.llama-4-maverick": (503, "upstream unavailable"),
+                "system.ai.kimi-k3": TimeoutError("The read operation timed out"),
+            },
+            oss_models=oss,
+        )
+
+        assert results.dead == [
+            "system.ai.deepseek-v4-flash-0731",
+            "system.ai.kimi-k2",
+            "system.ai.kimi-k3-neo",
+        ]
+        assert results.tool_less == []
+        # One plain 1-token call per MLflow model, on the MLflow chat route, without tools.
+        assert len(sent) == len(oss)
+        for url, payload, _ in sent:
+            assert url == f"{WS}/ai-gateway/mlflow/v1/chat/completions"
+            assert payload["max_tokens"] == 1
+            assert "tools" not in payload
+
+    def test_every_endpoint_dead_means_the_route_is_suspect(self, monkeypatch):
+        oss = ["system.ai.glm-5-2", "system.ai.kimi-k3"]
+        results, _ = self._probe(
+            monkeypatch, dict.fromkeys(oss, (404, self.ENDPOINT_NOT_FOUND)), oss_models=oss
+        )
+        assert results.dead == []
+
+    def test_a_single_dead_endpoint_is_dropped(self, monkeypatch):
+        results, _ = self._probe(
+            monkeypatch,
+            {"system.ai.kimi-k2": (404, self.NOT_FOUND)},
+            oss_models=["system.ai.kimi-k2"],
+        )
+        assert results.dead == ["system.ai.kimi-k2"]
+
+    def test_probes_still_running_at_the_budget_keep_their_model(self, monkeypatch):
+        release = threading.Event()
+
+        def post(url, token, payload, **kwargs):
+            if payload["model"] == "system.ai.slow":
+                release.wait(5)
+            return None, f"HTTP 404 Not Found: {self.NOT_FOUND}"
+
+        monkeypatch.setattr(db_mod, "_http_post_json", post)
+        started = time.monotonic()
+        try:
+            results = db_mod.probe_discovered_models(
+                WS,
+                "tok",
+                oss_models=["system.ai.slow", "system.ai.kimi-k2"],
+                gemini_models=[],
+                total_timeout=0.3,
+            )
+        finally:
+            release.set()
+
+        assert time.monotonic() - started < 3
+        # Only one of the two endpoints answered, so it alone is dropped; the slow one stays.
+        assert results.dead == ["system.ai.kimi-k2"]
+
+    def test_tool_probe_only_for_flagged_models_and_only_on_the_phrase(self, monkeypatch):
+        gemini = [
+            "system.ai.gemini-3-5-flash",
+            "system.ai.gemini-3-1-flash-image",
+            "system.ai.gemini-3-1-flash-lite-image",
+            "system.ai.gemini-3-pro-image",
+        ]
+        oss = ["system.ai.meta-llama-3-1-8b-instruct", "system.ai.glm-5-2"]
+        results, sent = self._probe(
+            monkeypatch,
+            {
+                "system.ai.gemini-3-1-flash-lite-image": (400, self.GEMINI_NO_TOOLS),
+                "system.ai.gemini-3-pro-image": (400, '{"message":"bad tool schema"}'),
+                # The phrase on a non-400 answer is not a verdict.
+                "system.ai.meta-llama-3-1-8b-instruct": (
+                    429,
+                    '{"message":"rate limited; does not support function calling"}',
+                ),
+            },
+            flagged=[
+                "system.ai.gemini-3-1-flash-image",
+                "system.ai.gemini-3-1-flash-lite-image",
+                "system.ai.gemini-3-pro-image",
+                "system.ai.meta-llama-3-1-8b-instruct",
+            ],
+            gemini_models=gemini,
+            oss_models=oss,
+        )
+
+        assert results.tool_less == ["system.ai.gemini-3-1-flash-lite-image"]
+        assert results.dead == []
+        tool_calls = [(url, body, chars) for url, body, chars in sent if "tools" in body]
+        # Unflagged models (Gemini 3.5 Flash, GLM) never get the tool probe.
+        assert {body.get("model") or url for url, body, _ in tool_calls} == {
+            f"{WS}/ai-gateway/gemini/v1beta/models/system.ai.gemini-3-1-flash-image:generateContent",
+            f"{WS}/ai-gateway/gemini/v1beta/models/system.ai.gemini-3-1-flash-lite-image:generateContent",
+            f"{WS}/ai-gateway/gemini/v1beta/models/system.ai.gemini-3-pro-image:generateContent",
+            "system.ai.meta-llama-3-1-8b-instruct",
+        }
+        gemini_call = next(
+            body for url, body, _ in tool_calls if "gemini-3-1-flash-lite-image" in url
+        )
+        assert gemini_call["generationConfig"] == {"maxOutputTokens": 1}
+        assert gemini_call["tools"][0]["functionDeclarations"][0]["name"] == "noop"
+        llama_call = next(
+            body for _, body, _ in tool_calls if body.get("model", "").endswith("8b-instruct")
+        )
+        assert llama_call["max_tokens"] == 1
+        assert llama_call["tools"][0]["type"] == "function"
+        # Every probe keeps enough error body for the nested Gemini message.
+        assert all(chars > len(self.GEMINI_NO_TOOLS) for *_, chars in sent)
+
+    def test_no_listing_means_no_tool_probe(self, monkeypatch):
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod, "_http_post_json", lambda *a, **k: pytest.fail("no request expected")
+        )
+        results = db_mod.probe_discovered_models(
+            WS, "tok", oss_models=[], gemini_models=["system.ai.gemini-3-pro-image"]
+        )
+        assert results == db_mod.ModelProbeResults()
+
+    def test_long_error_bodies_survive_in_the_reason(self, monkeypatch):
+        body = "x" * 300 + " does not support function calling"
+
+        def urlopen(request, timeout):
+            raise db_mod.urllib_error.HTTPError(
+                WS, 400, "Bad Request", Message(), io.BytesIO(body.encode())
+            )
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", urlopen)
+        _, short = db_mod._http_post_json(WS, "tok", {})
+        _, long = db_mod._http_post_json(WS, "tok", {}, error_body_chars=2000)
+        assert "function calling" not in (short or "")
+        assert "does not support function calling" in (long or "")
 
 
 class TestResponsesModelHelpers:

@@ -193,6 +193,24 @@ class TestHttpChokepoints:
         assert request.get_header("X-databricks-org-id") == WSID
         assert request.get_header("X-databricks-workspace-id") == WSID
 
+    def test_model_probes_send_the_selection(self, selected):
+        db_mod.clear_model_services_cache()
+        sent = []
+
+        def urlopen(request, timeout):
+            sent.append(request)
+            return _Response(b"{}", request.full_url, WSID)
+
+        with patch.object(db_mod.urllib_request, "urlopen", side_effect=urlopen):
+            results = db_mod.probe_discovered_models(
+                SHARED, "tok", oss_models=["system.ai.glm-5-2"], gemini_models=[]
+            )
+
+        assert results == db_mod.ModelProbeResults()
+        assert sent[0].full_url == f"{SHARED}/ai-gateway/mlflow/v1/chat/completions"
+        assert sent[0].get_header("X-databricks-org-id") == WSID
+        assert sent[0].get_header("X-databricks-workspace-id") == WSID
+
     def test_classic_requests_are_unchanged(self):
         url = f"{CLASSIC}/api/2.0/x"
         _, request = self._get(url, _Response(b"{}", url))

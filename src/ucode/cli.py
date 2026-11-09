@@ -98,6 +98,7 @@ from ucode.databricks import (
     list_tool_provider_services,
     map_claude_family_models,
     normalize_workspace_url,
+    probe_discovered_models,
     probe_unity_gateway_capabilities,
     profile_choices,
     resolve_pat_token,
@@ -584,6 +585,7 @@ def configure_shared_state(
     custom_oauth: CustomOAuthConfig | None = None,
     clear_custom_oauth: bool = False,
     claude_server_side_web_search: bool | None = None,
+    probe_models: bool = False,
 ) -> dict:
     """Log into Databricks, verify AI Gateway, fetch model lists, persist state.
 
@@ -603,6 +605,10 @@ def configure_shared_state(
     in ``_launch_tool``) and the gateway was verified by that earlier configure.
     Only the local profile resolution and the shared state assembly still run;
     the saved model lists are preserved.
+    If probe_models is True (explicit configure only), the discovered Gemini and MLflow
+    models get the 1-token checks of ``probe_discovered_models``; the models they prove
+    retired or tool-less are recorded in ``oss_dead_models`` / ``tool_less_models``.
+    Every discovery, launches included, drops the recorded models without probing.
     """
     workspace = normalize_workspace_url(workspace)
     if not split_workspace_key(workspace)[1]:
@@ -647,8 +653,14 @@ def configure_shared_state(
         destination = load_full_state().get("workspaces", {}).get(key, {})
         # managed_mcp_servers records what the source workspace delivered to user scope.
         # Keep it until reconciliation removes registrations the destination no longer wants.
-        # The server-side web search choice is likewise per workspace.
-        for field in ("mcp_servers", "mcp_clients", CLAUDE_SERVER_SIDE_WEB_SEARCH_STATE_KEY):
+        # The server-side web search choice is likewise per workspace, and so are the models the
+        # probes recorded (they describe the workspace that was probed).
+        for field in (
+            "mcp_servers",
+            "mcp_clients",
+            CLAUDE_SERVER_SIDE_WEB_SEARCH_STATE_KEY,
+            *_MODEL_PROBE_STATE_KEYS,
+        ):
             if field in destination:
                 state[field] = destination[field]
             else:
@@ -848,6 +860,14 @@ def configure_shared_state(
                     list_anthropic_model_catalog(workspace, token),
                 )
                 copilot_reason = ms_reason or claude_reason or codex_reason
+        gemini_models, oss_models = _apply_model_probes(
+            state,
+            workspace,
+            token,
+            gemini_models=gemini_models,
+            oss_models=oss_models,
+            probe=probe_models,
+        )
         if claude_models:
             opencode_models["anthropic"] = list(claude_models.values())
         if gemini_models:
@@ -902,6 +922,75 @@ def configure_shared_state(
     return state
 
 
+# Models the configure probes proved unusable, per workspace (see `probe_discovered_models`).
+_OSS_DEAD_MODELS_STATE_KEY = "oss_dead_models"
+_TOOL_LESS_MODELS_STATE_KEY = "tool_less_models"
+_MODEL_PROBE_STATE_KEYS = (_OSS_DEAD_MODELS_STATE_KEY, _TOOL_LESS_MODELS_STATE_KEY)
+
+
+def _recorded_model_ids(state: dict, key: str) -> list[str]:
+    recorded = state.get(key)
+    return [m for m in recorded if isinstance(m, str)] if isinstance(recorded, list) else []
+
+
+def _record_probe_result(state: dict, key: str, probed: list[str], found: list[str]) -> None:
+    """Replace the recorded verdicts for ``probed`` with ``found``.
+
+    Models this run didn't probe (another agent's family) keep their recorded verdict, so a
+    configure for one agent doesn't forget what a full configure found."""
+    probed_ids = set(probed)
+    kept = [m for m in _recorded_model_ids(state, key) if m not in probed_ids]
+    merged = list(dict.fromkeys([*kept, *found]))
+    if merged:
+        state[key] = merged
+    else:
+        state.pop(key, None)
+
+
+def _without_probed_out_models(
+    state: dict, gemini_models: list[str], oss_models: list[str]
+) -> tuple[list[str], list[str]]:
+    """``gemini_models`` and ``oss_models`` without the models the last configure's probes dropped.
+
+    A managed config's own model lists (``pi_models`` and the like) are not filtered: the admin
+    chose them, so a model they pin stays visible and fails loudly rather than vanishing."""
+    dead = set(_recorded_model_ids(state, _OSS_DEAD_MODELS_STATE_KEY))
+    tool_less = set(_recorded_model_ids(state, _TOOL_LESS_MODELS_STATE_KEY))
+    return (
+        [m for m in gemini_models if m not in tool_less],
+        [m for m in oss_models if m not in dead and m not in tool_less],
+    )
+
+
+def _apply_model_probes(
+    state: dict,
+    workspace: str,
+    token: str,
+    *,
+    gemini_models: list[str],
+    oss_models: list[str],
+    probe: bool,
+) -> tuple[list[str], list[str]]:
+    """Probe the discovered models when ``probe`` is set, then drop the recorded unusable ones."""
+    if probe and (gemini_models or oss_models):
+        with spinner("Checking discovered models..."):
+            results = probe_discovered_models(
+                workspace, token, oss_models=oss_models, gemini_models=gemini_models
+            )
+        _record_probe_result(state, _OSS_DEAD_MODELS_STATE_KEY, oss_models, results.dead)
+        _record_probe_result(
+            state, _TOOL_LESS_MODELS_STATE_KEY, [*gemini_models, *oss_models], results.tool_less
+        )
+        if results.dead:
+            print_warning(
+                "Skipping retired model endpoints (deprecated or not found): "
+                + ", ".join(results.dead)
+            )
+        if results.tool_less:
+            print_warning("Skipping models that cannot call tools: " + ", ".join(results.tool_less))
+    return _without_probed_out_models(state, gemini_models, oss_models)
+
+
 def _configure_shared_workspace_states(
     workspaces: list[tuple[str, str | None]],
     tools: list[str] | None,
@@ -933,6 +1022,7 @@ def _configure_shared_workspace_states(
                 force_login=force_login,
                 use_pat=use_pat,
                 databricks_ai_tools_enabled=databricks_ai_tools_enabled,
+                probe_models=True,
                 **custom_oauth_kwargs,
                 **optional_kwargs,
             )
@@ -1760,6 +1850,8 @@ def _live_status_model_state(state: dict, tools: set[str]) -> tuple[dict, str]:
         print_warning(f"Live model discovery failed ({exc}); showing cached models.")
         return state, "cached"
 
+    # Status never probes; it drops the models the last configure's probes recorded.
+    gemini_models, oss_models = _without_probed_out_models(state, gemini_models, oss_models)
     live = dict(state)
     live["claude_models"] = claude_models
     live["codex_models"] = codex_models
