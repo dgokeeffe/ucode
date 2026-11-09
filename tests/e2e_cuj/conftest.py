@@ -9,12 +9,12 @@ import pytest
 from databricks.sdk.errors import DatabricksError
 
 from .base import bearer
-from .helpers.constants import CLAUDE, CODEX, MANAGED_PATHS
+from .helpers.constants import CLAUDE, CODEX, MANAGED_PATHS, WORKSPACE_POLICY_PATH
 from .helpers.session import (
     MACHINE_WIDE_LEAK,
-    MachineWideLeak,
     UserSession,
     dirty_runner_message,
+    record_machine_wide_leak,
 )
 from .helpers.tui_request_recorder import TuiRequestRecorder
 from .helpers.workspace import Workspace
@@ -31,16 +31,14 @@ def _scrubbed(error: DatabricksError) -> RuntimeError:
     return RuntimeError(f"Workspace API failed: {type(error).__name__}")
 
 
-def _record_machine_wide_leak(request):
-    """Name the class that leaked machine-wide settings to the later classes it blocks."""
-    leaked = tuple(str(path) for path in MANAGED_PATHS if path.exists())
-    if leaked:
-        request.config.stash[MACHINE_WIDE_LEAK] = MachineWideLeak(request.node.nodeid, leaked)
-
-
 @pytest.fixture(scope="class")
 def cuj(request, setup_workspace, tmp_path_factory):
     assert os.name == "posix", "Full TUI CUJs require a disposable POSIX runner"
+    # Teardown removes the workspace policy, so never start on one this run didn't install.
+    assert not WORKSPACE_POLICY_PATH.exists(), (
+        f"Existing workspace policy {WORKSPACE_POLICY_PATH}; use a clean disposable runner. "
+        "Nothing was changed."
+    )
     assert not any(path.exists() for path in MANAGED_PATHS), dirty_runner_message(
         request.config.stash.get(MACHINE_WIDE_LEAK, None)
     )
@@ -70,7 +68,7 @@ def cuj(request, setup_workspace, tmp_path_factory):
                                 "cleanup-revert", "CUJ teardown left machine-wide agent settings"
                             )
                         finally:
-                            _record_machine_wide_leak(request)
+                            record_machine_wide_leak(request)
             except DatabricksError as error:
                 raise _scrubbed(error) from None
 

@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from ucode import _entry, token_cache
+from ucode import entrypoint, token_cache
 
 # conftest replaces _spawn_detached with a no-op; keep the real one for the tests that need it.
 _REAL_SPAWN_DETACHED = token_cache._spawn_detached
@@ -40,7 +40,7 @@ def _no_bearer_env(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _restore_sigterm():
-    # _entry.main() installs the auth-token kill logger in this process.
+    # entrypoint.main() installs the auth-token kill logger in this process.
     previous = signal.getsignal(signal.SIGTERM)
     yield
     signal.signal(signal.SIGTERM, previous)
@@ -234,7 +234,7 @@ class TestBackgroundRefresh:
 
     def test_python_dash_m_ucode_runs_the_entry_point(self, monkeypatch):
         calls = []
-        monkeypatch.setattr("ucode._entry.main", lambda: calls.append(True))
+        monkeypatch.setattr("ucode.entrypoint.main", lambda: calls.append(True))
         runpy.run_module("ucode", run_name="__main__")
         assert calls == [True]
 
@@ -317,7 +317,7 @@ class TestEntry:
         token_cache.write(WS, None, token)
         monkeypatch.setattr(sys, "argv", ["ug", "auth-token", "--host", WS])
         monkeypatch.setattr("ucode.cli.main", lambda: pytest.fail("full CLI invoked"))
-        _entry.main()
+        entrypoint.main()
         assert capsys.readouterr().out == token + "\n"
 
     def test_old_entry_is_served_without_the_full_cli(self, monkeypatch, capsys, spawned):
@@ -326,7 +326,7 @@ class TestEntry:
         _age(WS, None, token_cache.REFRESH_AFTER_SECONDS + 1)
         monkeypatch.setattr(sys, "argv", ["ug", "auth-token", "--host", WS])
         monkeypatch.setattr("ucode.cli.main", lambda: pytest.fail("full CLI invoked"))
-        _entry.main()
+        entrypoint.main()
         assert capsys.readouterr().out == token + "\n"
         assert spawned == [token_cache.refresh_command(WS, None)]
 
@@ -334,5 +334,5 @@ class TestEntry:
         calls = []
         monkeypatch.setattr(sys, "argv", ["ug", "auth-token", "--host", WS])
         monkeypatch.setattr("ucode.cli.main", lambda: calls.append(True))
-        _entry.main()
+        entrypoint.main()
         assert calls == [True]

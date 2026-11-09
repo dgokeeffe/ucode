@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -11,6 +12,7 @@ from pathlib import Path
 
 from ucode.config_io import atomic_write_json
 from ucode.constants import SMART_ROUTING_ENV_KEYS
+from ucode.smart_routing.config import resolve_environment
 
 SESSION_ENV_VAR = "UCODE_SESSION_ENV_FILE"
 SESSION_PYTHON_ENV_VAR = "UCODE_SMART_ROUTER_PYTHON"
@@ -51,9 +53,9 @@ def _read(path: Path) -> dict[str, str]:
     return _validate(json.loads(path.read_text(encoding="utf-8")))
 
 
-def effective_environment(env: Mapping[str, str] | None = None) -> dict[str, str]:
+def effective_environment(env: Mapping[str, str] | None = None, *, agent: str) -> dict[str, str]:
     """Overlay the latest session controls on the hook process environment."""
-    effective = dict(os.environ if env is None else env)
+    effective = resolve_environment(env, agent=agent)
     try:
         path = session_env_path(effective)
     except RuntimeError:
@@ -74,6 +76,25 @@ def set_session_environment(values: Mapping[str, str]) -> None:
     path = session_env_path()
     try:
         _read(path)
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"Permission denied reading Smart Router session controls at {path}. "
+            "Request native command approval to retry this command."
+        ) from exc
     except (OSError, UnicodeError, ValueError) as exc:
         raise RuntimeError(f"Smart Router session controls at {path} are invalid.") from exc
-    atomic_write_json(path, _validate(dict(values)))
+    try:
+        atomic_write_json(path, _validate(dict(values)))
+    except (OSError, RuntimeError) as exc:
+        # The atomic writer wraps mkdir and replacement failures, but not mkstemp failures.
+        cause = exc.__cause__ if isinstance(exc, RuntimeError) else exc
+        if isinstance(cause, PermissionError) or (
+            isinstance(cause, OSError) and cause.errno in (errno.EACCES, errno.EPERM, errno.EROFS)
+        ):
+            raise RuntimeError(
+                f"Permission denied writing Smart Router session controls at {path}. "
+                "Request native command approval to retry this command."
+            ) from exc
+        raise RuntimeError(
+            f"Error writing Smart Router session controls at {path}: {cause or exc}"
+        ) from exc

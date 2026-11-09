@@ -4,7 +4,7 @@ The background token refresher runs this way, through ``sys.executable``,
 because a console-script path is not reliably re-runnable on every platform.
 """
 
-from ucode._entry import main
+from ucode.entrypoint import main
 
 if __name__ == "__main__":
     main()

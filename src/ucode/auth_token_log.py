@@ -6,7 +6,7 @@ without a token. That includes the caller giving up: pi sends SIGTERM once its
 10s deadline passes, and by default that ends the helper before it can write
 anything, so a timeout used to leave no trace at all.
 
-This module must stay stdlib-only: ``ucode._entry`` installs the SIGTERM
+This module must stay stdlib-only: ``ucode.entrypoint`` installs the SIGTERM
 handler before it imports ``ucode.cli``.
 """
 

@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import re
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 
 from tests.integration.utils.evidence import FileTask, read_jsonl
+from tests.integration.utils.model_discovery import claude_discovery_model_id
+from tests.integration.utils.provider_catalog import MODEL_SERVICE_PARENT_SCHEMA_HEADER
+from tests.integration.utils.request_recorder import (
+    assert_served as assert_served,
+)
+from tests.integration.utils.request_recorder import (
+    served_inference_request as served_inference_request,
+)
 
-from .constants import CLAUDE, CODEX, NATIVE_MODEL_ALIASES
+from .constants import CLAUDE, CODEX, INFERENCE_PATHS, NATIVE_MODEL_ALIASES
 
 
 def canonical_model(value):
@@ -30,16 +39,65 @@ def assert_models(models, expected):
     assert actual == {canonical_model(expected)}, (models, expected)
 
 
-def assert_served(recorder, request, model):
-    """The request asked for `model` and its paired response was a non-empty HTTP 200."""
-    assert request.payload["model"] == model, request.payload
-    response = recorder.response_for(request, timeout=240)
-    assert response.status_code == 200, {
-        "status": response.status_code,
-        "model": request.payload["model"],
-        "output_config": request.payload.get("output_config"),
+def assert_claude_headless_model(result, expected):
+    final = None
+    for line in result.stdout.splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("type") == "result":
+            final = payload
+    assert final is not None and not final.get("is_error"), result.stdout
+    usage = final["modelUsage"]
+    assert set(usage) == {expected}, {"expected": expected, "observed": sorted(usage)}
+    assert usage[expected]["outputTokens"] > 0, usage
+
+
+def _request_contains_task(request, agent, task):
+    field = "messages" if agent == CLAUDE else "input"
+    entries = request.payload.get(field)
+    if not isinstance(entries, (list, str)):
+        return False
+    if isinstance(entries, str):
+        return entries == task.prompt
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("role") != "user":
+            continue
+        content = entry.get("content", "")
+        if isinstance(content, str) and content == task.prompt:
+            return True
+        if isinstance(content, list) and any(
+            message_text([part]) == task.prompt for part in content if isinstance(part, dict)
+        ):
+            return True
+    return False
+
+
+def assert_inference_evidence(recorder, checkpoint, agent, task, expected, *, parent_schema=None):
+    expected_wire_model = claude_discovery_model_id(expected) if agent == CLAUDE else expected
+    requests = recorder.requests_after(checkpoint)
+    inference_requests = [
+        request
+        for request in requests
+        if request.method == "POST" and request.path == INFERENCE_PATHS[agent]
+    ]
+    assert inference_requests, {
+        "agent": agent,
+        "path": INFERENCE_PATHS[agent],
+        "requests": [(request.method, request.path) for request in requests],
     }
-    assert response.body, "Inference response was empty"
+    task_requests = [
+        request for request in inference_requests if _request_contains_task(request, agent, task)
+    ]
+    assert task_requests, "No inference request contained the submitted task prompt"
+    for request in task_requests:
+        if parent_schema is not None:
+            assert (
+                request.headers.get(MODEL_SERVICE_PARENT_SCHEMA_HEADER.lower()) == parent_schema
+            ), request.headers
+        served = served_inference_request(recorder, task_requests, request, agent)
+        assert_served(recorder, served, expected_wire_model)
 
 
 def claude_file_task(session):
@@ -57,6 +115,11 @@ def message_text(content):
     return "\n".join(
         part.get("text", "") for part in content or [] if part.get("type") in {"text", "input_text"}
     )
+
+
+def _answer_matches(task, answer):
+    """task.value=None accepts any nonempty final answer."""
+    return bool(answer.strip()) and (task.value is None or task.value in answer)
 
 
 @dataclass
@@ -132,7 +195,7 @@ class ClaudeCujHelper(BaseCujHelper):
         last = responses[-1]
         answer = message_text(last.get("content"))
         if (
-            task.value not in answer
+            not _answer_matches(task, answer)
             or not last.get("id")
             or any(part.get("type") == "tool_use" for part in last.get("content", []))
             or last.get("stop_reason") not in (None, "end_turn", "stop_sequence")
@@ -150,48 +213,77 @@ class CodexCujHelper(BaseCujHelper):
         meta = [row["payload"] for row in records if row.get("type") == "session_meta"]
         if len(meta) != 1 or isinstance(meta[0].get("source"), dict):
             return None
-        contexts, prompt_count, seen_prompt, active_turn = {}, 0, False, None
+        contexts, active_turn, target_turn = {}, None, None
+        started_turn, aborted_turn, answer, prompt_sources = None, None, None, set()
         for row in records:
             payload = row.get("payload", {})
+            metadata = row.get("internal_chat_message_metadata_passthrough") or {}
+            if "multi_agent.subagent_notification" in metadata.get(
+                "content_item_kinds", ()
+            ) or "<subagent_notification>" in str(
+                payload.get("content") or payload.get("message")
+            ).replace("-", "_"):
+                continue
+            row_turn = payload.get("turn_id")
             if row.get("type") == "turn_context":
-                contexts.setdefault(payload.get("turn_id"), []).append(payload.get("model"))
-            if (
+                contexts.setdefault(row_turn, []).append(payload.get("model"))
+                if target_turn and row_turn != target_turn:
+                    return None
+                active_turn = row_turn
+                continue
+            source = None
+            if row.get("type") == "event_msg" and payload.get("type") == "user_message":
+                source, prompt = "event", payload.get("message")
+            elif (
                 row.get("type") == "response_item"
                 and payload.get("type") == "message"
                 and payload.get("role") == "user"
             ):
-                prompt = message_text(payload.get("content"))
+                source, prompt = "response", message_text(payload.get("content"))
+            if source:
                 if prompt == task.prompt:
-                    prompt_count += 1
-                    assert prompt_count == 1, "Prompt was submitted more than once"
-                    seen_prompt = True
-                elif seen_prompt:
+                    assert source not in prompt_sources, "Prompt was submitted more than once"
+                    prompt_sources.add(source)
+                    if target_turn and row_turn and row_turn != target_turn:
+                        return None
+                    target_turn = target_turn or row_turn or active_turn
+                elif prompt_sources:
                     return None
+                continue
             if row.get("type") != "event_msg":
                 continue
-            if payload.get("type") == "task_started":
-                if seen_prompt:
-                    return None
-                active_turn = payload.get("turn_id")
-            if payload.get("type") == "user_message":
-                if payload.get("message") == task.prompt:
-                    prompt_count += 1
-                    assert prompt_count == 1, "Prompt was submitted more than once"
-                    seen_prompt = True
-                elif seen_prompt:
-                    return None
-            if seen_prompt and payload.get("type") == "task_complete":
+            event_type = payload.get("type")
+            if event_type == "task_started":
                 turn_id = payload.get("turn_id")
-                answer = payload.get("last_agent_message") or ""
-                if (
-                    task.value in answer
-                    and turn_id
-                    and turn_id == active_turn
-                    and contexts.get(turn_id)
-                ):
-                    assert all(contexts[turn_id]), "Missing native turn model metadata"
-                    return CompletedTurn(meta[0]["id"], turn_id, contexts[turn_id], answer)
-        return None
+                if not turn_id or turn_id == aborted_turn:
+                    return None
+                if target_turn and turn_id != target_turn:
+                    return None
+                active_turn = started_turn = turn_id
+                if prompt_sources and target_turn is None:
+                    target_turn = turn_id
+            elif event_type == "task_complete":
+                turn_id = payload.get("turn_id")
+                if target_turn:
+                    if turn_id != target_turn:
+                        return None
+                    answer = payload.get("last_agent_message") or ""
+                    break
+                if turn_id == active_turn:
+                    active_turn = started_turn = None
+            elif event_type == "turn_aborted":
+                aborted_turn = payload.get("turn_id")
+                if aborted_turn == target_turn:
+                    return None
+                if aborted_turn == active_turn:
+                    active_turn = started_turn = None
+        if not prompt_sources or not target_turn or started_turn != target_turn or answer is None:
+            return None
+        models = contexts.get(target_turn)
+        if not _answer_matches(task, answer) or not models:
+            return None
+        assert all(models), "Missing native turn model metadata"
+        return CompletedTurn(meta[0]["id"], target_turn, models, answer)
 
 
 def get_cuj_helper(agent):
@@ -204,6 +296,7 @@ def get_cuj_helper(agent):
 
 
 def completed_turn(agent, records, task):
+    """Match a completed turn; task.value=None accepts any nonempty final answer."""
     return get_cuj_helper(agent)._completed_turn(records, task)
 
 

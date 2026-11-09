@@ -63,6 +63,7 @@ from ucode.config_io import (
     read_json_safe,
     write_json_file,
 )
+from ucode.constants import AI_GATEWAY_REQUEST_TAGS_HEADER
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
     build_auth_token_argv,
@@ -79,10 +80,12 @@ from ucode.databricks import (
 )
 from ucode.os_compatibility import subprocess_cross_os
 from ucode.state import mark_tool_managed, save_state
-from ucode.telemetry import agent_version, ug_version
+from ucode.telemetry import agent_version, ucode_user_agent, ug_version
 from ucode.ui import print_warning
+from ucode.workspace import workspace_headers
 
 from .args import LaunchOptions
+from .request_tags import request_tags_header_value
 
 # Use Pi's standard user configuration directory. Keep ucode's backups and
 # state under APP_DIR, but let Pi share the user's normal ~/.pi/agent config.
@@ -605,7 +608,15 @@ def render_overlay(
     keys: list[list[str]] = [["model"]]
     # Pi expands header values that match an env var name. Our UA contains
     # `/` and a space so it can never collide — safe to pass as a literal.
-    ua_headers = {"User-Agent": f"ucode/{ug_version()} pi/{agent_version('pi')}"}
+    ua_headers = {"User-Agent": ucode_user_agent(ug_version(), f"pi/{agent_version('pi')}")}
+    request_tags = request_tags_header_value()
+    if request_tags:
+        # Similarly to UA, request_tags is a JSON object (validated in `request_tags_header_value()`)
+        # so it can never collide with an env var name
+        ua_headers[AI_GATEWAY_REQUEST_TAGS_HEADER] = request_tags
+    gateway_url = next(iter(pi_base_urls.values()), None)
+    if gateway_url:
+        ua_headers.update(workspace_headers(gateway_url))
 
     claude_ids = sorted(
         m
@@ -711,7 +722,7 @@ def build_pi_api_key(state: dict) -> str:
     No `--force-refresh`: pi has no token cache of its own on this path, so
     forcing a mint would round-trip to the workspace every turn. Pi also kills
     the command after 10s and discards its stderr, so plain `auth-token` serves
-    ucode's own token cache (`ucode.token_cache`, answered by `ucode._entry`
+    ucode's own token cache (`ucode.token_cache`, answered by `ucode.entrypoint`
     before the full CLI imports) and bounds any CLI call it does make — see
     `AUTH_TOKEN_CLI_BUDGET_SECONDS`.
 

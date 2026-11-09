@@ -1,7 +1,5 @@
 """Managed catalog discovery, default launches, and explicit model selection."""
 
-import json
-
 import pytest
 
 from tests.integration.utils.agents import claude, codex
@@ -25,8 +23,14 @@ from .catalog_discovery_expectations import (
     MODEL_SCHEMA,
     OTHER_MODEL_SCHEMA,
 )
-from .helpers.constants import CLAUDE, CODEX, INFERENCE_PATHS
-from .helpers.evidence import SessionEvidence, assert_served, claude_file_task, message_text
+from .helpers.constants import CLAUDE, CODEX
+from .helpers.desktop import assert_claude_desktop_unchanged, enable_claude_desktop
+from .helpers.evidence import (
+    SessionEvidence,
+    assert_claude_headless_model,
+    assert_inference_evidence,
+    claude_file_task,
+)
 from .helpers.terminal import Terminal
 
 CUJ_NAME = "CUJ 3 · UC model discovery"
@@ -69,62 +73,6 @@ def _catalog_display_names(workspace, agent, schema):
     raise AssertionError("Anthropic catalog exceeded 20 pages")
 
 
-def _assert_claude_headless_model(result, expected):
-    final = None
-    for line in result.stdout.splitlines():
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict) and payload.get("type") == "result":
-            final = payload
-    assert final is not None and not final.get("is_error"), result.stdout
-    usage = final["modelUsage"]
-    assert set(usage) == {expected}, {"expected": expected, "observed": sorted(usage)}
-    assert usage[expected]["outputTokens"] > 0, usage
-
-
-def _request_contains_task(request, agent, task):
-    field = "messages" if agent == CLAUDE else "input"
-    entries = request.payload.get(field)
-    if not isinstance(entries, (list, str)):
-        return False
-    if isinstance(entries, str):
-        return entries == task.prompt
-    for entry in entries:
-        if not isinstance(entry, dict) or entry.get("role") != "user":
-            continue
-        content = entry.get("content", "")
-        if isinstance(content, str) and content == task.prompt:
-            return True
-        if isinstance(content, list) and any(
-            message_text([part]) == task.prompt for part in content if isinstance(part, dict)
-        ):
-            return True
-    return False
-
-
-def _assert_inference_evidence(recorder, checkpoint, agent, task, expected):
-    expected_wire_model = claude.discovery_model_id(expected) if agent == CLAUDE else expected
-    requests = recorder.requests_after(checkpoint)
-    inference_requests = [
-        request
-        for request in requests
-        if request.method == "POST" and request.path == INFERENCE_PATHS[agent]
-    ]
-    assert inference_requests, {
-        "agent": agent,
-        "path": INFERENCE_PATHS[agent],
-        "requests": [(request.method, request.path) for request in requests],
-    }
-    task_requests = [
-        request for request in inference_requests if _request_contains_task(request, agent, task)
-    ]
-    assert task_requests, "No inference request contained the submitted task prompt"
-    for request in task_requests:
-        assert_served(recorder, request, expected_wire_model)
-
-
 @pytest.fixture(autouse=True)
 def _revert_catalog_test_state(cuj):
     yield
@@ -142,18 +90,25 @@ class TestCatalogDiscovery(BaseCujTest):
     def test_catalog_discovery_claude_picker_preserves_default(self, cuj):
         """Scenario: configure, launch ug claude, inspect its picker, then submit a task.
 
-        Expected: only Sonnet/Haiku/Kimi appear; Gemini and decoys are absent.
+        Expected: only Sonnet/Haiku/Kimi/GPT Luna appear; Gemini and decoys are absent.
         Dismissing the picker without a selection preserves Sonnet for the completed task.
+        Existing Desktop files remain unchanged: scoped aliases such as claude_haiku do not
+        match Desktop's Claude-family filter. CUJ1/CUJ2 check complete compatible profiles.
         """
         session, workspace, recorder = cuj
+        config_library = enable_claude_desktop(session, workspace.url)
         recorder.configure_session(session, ["configure", "--skip-upgrade"])
+        assert_claude_desktop_unchanged(session, config_library)
 
         parent_catalog = _catalog_display_names(workspace, CLAUDE, MODEL_SCHEMA)
         decoy_catalog = _catalog_display_names(workspace, CLAUDE, OTHER_MODEL_SCHEMA)
         assert set(parent_catalog) == {
             claude.discovery_model_id(model) for model in CLAUDE_MODELS
         }, parent_catalog
-        assert set(decoy_catalog) == {claude.discovery_model_id(CLAUDE_DECOY)}, decoy_catalog
+        assert set(decoy_catalog) == {
+            claude.discovery_model_id(CLAUDE_DECOY),
+            claude.discovery_model_id(CODEX_DECOY),
+        }, decoy_catalog
         default_display_name = parent_catalog[claude.discovery_model_id(CLAUDE_DEFAULT)]
 
         task = claude_file_task(session)
@@ -177,7 +132,7 @@ class TestCatalogDiscovery(BaseCujTest):
             tui.task(evidence, task)
             tui.exit_normally()
         task.assert_completed(session, CLAUDE)
-        _assert_inference_evidence(recorder, checkpoint, CLAUDE, task, CLAUDE_DEFAULT)
+        assert_inference_evidence(recorder, checkpoint, CLAUDE, task, CLAUDE_DEFAULT)
         session.assert_not_routed()
 
     @pytest.mark.codex
@@ -221,7 +176,7 @@ class TestCatalogDiscovery(BaseCujTest):
             tui.task(evidence, task)
             tui.exit_normally()
         assert_completed_task_model(session, CODEX, task.value, CODEX_DEFAULT)
-        _assert_inference_evidence(recorder, checkpoint, CODEX, task, CODEX_DEFAULT)
+        assert_inference_evidence(recorder, checkpoint, CODEX, task, CODEX_DEFAULT)
         session.assert_not_routed()
 
     @pytest.mark.claude
@@ -247,7 +202,7 @@ class TestCatalogDiscovery(BaseCujTest):
             tui.task(evidence, task)
             tui.exit_normally()
         task.assert_completed(session, CLAUDE)
-        _assert_inference_evidence(recorder, checkpoint, CLAUDE, task, CLAUDE_DEFAULT)
+        assert_inference_evidence(recorder, checkpoint, CLAUDE, task, CLAUDE_DEFAULT)
         session.assert_not_routed()
 
     @pytest.mark.claude
@@ -273,7 +228,7 @@ class TestCatalogDiscovery(BaseCujTest):
             tui.task(evidence, task)
             tui.exit_normally()
         task.assert_completed(session, CLAUDE)
-        _assert_inference_evidence(recorder, checkpoint, CLAUDE, task, CLAUDE_DEFAULT)
+        assert_inference_evidence(recorder, checkpoint, CLAUDE, task, CLAUDE_DEFAULT)
         session.assert_not_routed()
 
     @pytest.mark.codex
@@ -295,7 +250,7 @@ class TestCatalogDiscovery(BaseCujTest):
             tui.task(evidence, task)
             tui.exit_normally()
         assert_completed_task_model(session, CODEX, task.value, CODEX_DEFAULT)
-        _assert_inference_evidence(recorder, checkpoint, CODEX, task, CODEX_DEFAULT)
+        assert_inference_evidence(recorder, checkpoint, CODEX, task, CODEX_DEFAULT)
         session.assert_not_routed()
 
     @pytest.mark.claude
@@ -320,8 +275,8 @@ class TestCatalogDiscovery(BaseCujTest):
             timeout=240,
         )
         task.assert_headless_answer(CLAUDE, result)
-        _assert_claude_headless_model(result, CLAUDE_DEFAULT)
-        _assert_inference_evidence(recorder, checkpoint, CLAUDE, task, CLAUDE_DEFAULT)
+        assert_claude_headless_model(result, CLAUDE_DEFAULT)
+        assert_inference_evidence(recorder, checkpoint, CLAUDE, task, CLAUDE_DEFAULT)
         session.assert_not_routed()
 
     @pytest.mark.codex
@@ -340,7 +295,7 @@ class TestCatalogDiscovery(BaseCujTest):
         )
         task.assert_headless_answer(CODEX, result)
         assert_completed_task_model(session, CODEX, task.value, CODEX_DEFAULT)
-        _assert_inference_evidence(recorder, checkpoint, CODEX, task, CODEX_DEFAULT)
+        assert_inference_evidence(recorder, checkpoint, CODEX, task, CODEX_DEFAULT)
         session.assert_not_routed()
 
     @pytest.mark.claude
@@ -348,7 +303,7 @@ class TestCatalogDiscovery(BaseCujTest):
     def test_catalog_discovery_claude_explicit_model_completes_task(self, cuj, model):
         """Scenario: configure, then run a Claude print task with another compatible scoped model.
 
-        Expected: each Haiku/Kimi task completes with the explicitly requested model.
+        Expected: each Haiku/Kimi/GPT Luna task completes with the explicitly requested model.
         """
         session, _, recorder = cuj
         recorder.configure_session(session, ["configure", "--skip-upgrade"])
@@ -369,8 +324,8 @@ class TestCatalogDiscovery(BaseCujTest):
             timeout=240,
         )
         task.assert_headless_answer(CLAUDE, result)
-        _assert_claude_headless_model(result, claude.discovery_model_id(model))
-        _assert_inference_evidence(recorder, checkpoint, CLAUDE, task, model)
+        assert_claude_headless_model(result, claude.discovery_model_id(model))
+        assert_inference_evidence(recorder, checkpoint, CLAUDE, task, model)
         session.assert_not_routed()
 
     @pytest.mark.codex
@@ -398,5 +353,5 @@ class TestCatalogDiscovery(BaseCujTest):
         )
         task.assert_headless_answer(CODEX, result)
         assert_completed_task_model(session, CODEX, task.value, model)
-        _assert_inference_evidence(recorder, checkpoint, CODEX, task, model)
+        assert_inference_evidence(recorder, checkpoint, CODEX, task, model)
         session.assert_not_routed()

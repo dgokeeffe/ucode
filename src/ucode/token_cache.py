@@ -5,7 +5,7 @@ Agents such as pi resolve their API key by running `ug auth-token` before
 discards its stderr). A cache miss costs a full `ucode.cli` import (~0.7s,
 dominated by `databricks.sdk`) plus a `databricks auth token` subprocess that
 can stall on network I/O (host-metadata or OIDC refresh). A hit is served by
-``ucode._entry`` before any of that is imported.
+``ucode.entrypoint`` before any of that is imported.
 
 This module must stay stdlib-only: it runs on the fast path.
 

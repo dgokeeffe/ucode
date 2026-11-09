@@ -117,6 +117,25 @@ class TestHttpHeaders:
         }
 
 
+class TestSettingsPassthrough:
+    def test_state_override_carries_settings_for_claude(self):
+        managed = {"enabled_agents": {"claude": {"agent_native_settings": {"a": {"b": 1}}}}}
+        assert managed_state_overrides(managed, "claude")["claude_settings_passthrough"] == {
+            "a": {"b": 1}
+        }
+
+    @pytest.mark.parametrize("tool", ["codex", "gemini"])
+    def test_other_agents_get_no_override(self, tool):
+        managed = {"enabled_agents": {tool: {"agent_native_settings": {"a": 1}}}}
+        assert f"{tool}_settings_passthrough" not in managed_state_overrides(managed, tool)
+
+    def test_resolve_state_keeps_settings_out_of_persisted_state(self):
+        managed = {"enabled_agents": {"claude": {"agent_native_settings": {"a": 1}}}}
+        resolved = resolve_state(managed, _state(), "claude")
+        assert resolved["claude_settings_passthrough"] == {"a": 1}
+        assert resolved[MANAGED_OVERLAY_KEY]["claude_settings_passthrough"] is None
+
+
 class TestClaudeModels:
     def test_proto_slots_map_to_families(self):
         # The manifest keeps proto spelling (`default_opus_model`); render_overlay reads `opus`.
@@ -667,6 +686,22 @@ class TestManagedUnservableModels:
 
     def test_agents_that_pass_models_through_never_warn(self):
         assert managed_unservable_models(self._managed("codex", ["anything"]), "codex") == []
+
+    @staticmethod
+    def _copilot(models):
+        return {"enabled_agents": {"copilot": {"model_config": {"model_services": models}}}}
+
+    def test_copilot_list_with_only_gemini_and_oss_is_unservable(self):
+        models = ["system.ai.gemini-3-flash", "system.ai.kimi-k2-6"]
+        assert managed_unservable_models(self._copilot(models), "copilot") == models
+
+    def test_copilot_list_with_a_claude_model_is_servable(self):
+        models = ["system.ai.gemini-3-flash", "system.ai.claude-opus-4-8"]
+        assert managed_unservable_models(self._copilot(models), "copilot") == []
+
+    def test_copilot_model_list_reaches_state_as_its_static_models(self):
+        overrides = managed_state_overrides(self._copilot(["system.ai.gpt-5-4"]), "copilot")
+        assert overrides["copilot_static_models"] == ["system.ai.gpt-5-4"]
 
 
 class TestRecommendedAgent:

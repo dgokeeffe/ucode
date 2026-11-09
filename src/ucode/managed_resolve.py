@@ -1,6 +1,6 @@
 """Resolve the effective agent settings from the managed config plus local ucode state.
 
-The managed config (``~/.ucode/managed-state.json``, published by an admin through the AI Gateway
+The managed config (``/etc/unitygateway/managed-settings.json``, published through the AI Gateway
 and refreshed from the workspace at launch through :mod:`ucode.managed_config`) and the developer's own
 ucode state (``~/.ucode/state.json``) stay separate files — they are never merged on disk. Instead
 this module resolves them *per key* at config-write time: whatever the manifest specifies wins, and
@@ -36,6 +36,11 @@ _CLAUDE_FAMILY_SLOTS = {
 
 # Agents whose writers support the per-agent managed OTLP tracing flag.
 OTEL_TRACING_TOOLS = ("claude", "codex")
+
+# Agents that receive the config's harness-native `agent_native_settings`. Claude only, matching the
+# server: Codex's MCP lockdown is the requirements.toml [mcp_servers] allowlist, which ug doesn't
+# write yet.
+SETTINGS_PASSTHROUGH_TOOLS = ("claude",)
 
 
 def _as_dict(value: object) -> dict[str, object]:
@@ -77,7 +82,8 @@ def managed_state_overrides(managed: dict, tool: str) -> dict[str, object]:
     """The state keys to layer over local state so ``tool``'s writer sees managed settings.
 
     Each agent reads models from a different shape, so the manifest's list has to be translated.
-    Supported tracing flags are also mapped to the state key each writer consumes.
+    Supported tracing flags and harness-native settings are also mapped to the state key each
+    writer consumes.
     """
     overrides: dict[str, object] = {}
     models = _manifest_models(managed, tool)
@@ -93,7 +99,7 @@ def managed_state_overrides(managed: dict, tool: str) -> dict[str, object]:
                 overrides["opencode_models"] = buckets
         else:
             overrides[f"{tool}_models"] = models
-    if tool in ("claude", "codex"):
+    if tool in ("claude", "codex", "copilot"):
         static_models = managed_static_models(managed, tool)
         if static_models:
             overrides[f"{tool}_static_models"] = static_models
@@ -105,6 +111,9 @@ def managed_state_overrides(managed: dict, tool: str) -> dict[str, object]:
         overrides[f"{tool}_http_headers"] = http_headers
     if tool in OTEL_TRACING_TOOLS and managed_otel_tracing_enabled(managed, tool):
         overrides[f"{tool}_otel_tracing"] = True
+    settings = _as_dict(_agent_entry(managed, tool).get("agent_native_settings"))
+    if tool in SETTINGS_PASSTHROUGH_TOOLS and settings:
+        overrides[f"{tool}_settings_passthrough"] = settings
     return overrides
 
 
@@ -113,9 +122,15 @@ def managed_unservable_models(managed: dict, tool: str) -> list[str]:
 
     Only non-empty when *every* named model is unservable, which is when the translation yields
     nothing and the developer's own models stand — so the caller can say why the admin's list had no
-    effect. OpenCode has no OpenAI provider; Pi supports Claude, GPT, Gemini, and validated OSS
-    families.
+    effect. OpenCode has no OpenAI provider, so it can be handed a valid model FQN it cannot
+    route; Pi supports Claude, GPT, Gemini, and validated OSS families; and copilot serves only
+    Claude and GPT.
     """
+    if tool == "copilot":
+        from ucode.agents.copilot import classify_copilot_model
+
+        listed = managed_static_models(managed, tool) or []
+        return [] if any(classify_copilot_model(m) for m in listed) else listed
     if tool not in ("opencode", "pi"):
         return []
     models = _manifest_models(managed, tool)
