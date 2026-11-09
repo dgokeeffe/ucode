@@ -7558,14 +7558,16 @@ class TestConfigureModelProbes:
 
         def probe(workspace, token, *, oss_models, gemini_models):
             probes.append((workspace, token, list(oss_models), list(gemini_models)))
-            return results or db_mod.ModelProbeResults()
+            return results or db_mod.ModelProbeResults(tools_checked=True)
 
         monkeypatch.setattr(cli_mod, "probe_discovered_models", probe)
         return cli_mod, saved, probes
 
     def test_explicit_configure_probes_records_and_drops(self, monkeypatch, capsys):
         results = db_mod.ModelProbeResults(
-            dead=["system.ai.deepseek-v4-flash-0731"], tool_less=["system.ai.gemini-3-pro-image"]
+            dead=["system.ai.deepseek-v4-flash-0731"],
+            tool_less=["system.ai.gemini-3-pro-image"],
+            tools_checked=True,
         )
         cli_mod, saved, probes = self._stub(monkeypatch, results=results)
 
@@ -7598,6 +7600,52 @@ class TestConfigureModelProbes:
         assert state["oss_models"] == self.OSS
         assert "oss_dead_models" not in saved[-1]
         assert "tool_less_models" not in saved[-1]
+
+    def test_tool_verdicts_survive_a_configure_without_a_listing(self, monkeypatch):
+        # No UC listing picked the tool-probe models, so the earlier tool verdicts still stand.
+        cli_mod, saved, _ = self._stub(
+            monkeypatch,
+            existing_state={
+                "workspace": self.WS,
+                "oss_dead_models": ["system.ai.deepseek-v4-flash-0731"],
+                "tool_less_models": ["system.ai.gemini-3-pro-image"],
+            },
+            results=db_mod.ModelProbeResults(tools_checked=False),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", probe_models=True)
+
+        assert state["gemini_models"] == ["system.ai.gemini-3-5-flash"]
+        assert saved[-1]["tool_less_models"] == ["system.ai.gemini-3-pro-image"]
+        # The retired-endpoint probe still ran, and found the endpoint alive again.
+        assert "oss_dead_models" not in saved[-1]
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            ({}, True),
+            ({"provider": "main.default.gemini-mps"}, False),
+            ({"model_location": "main.models"}, False),
+        ],
+    )
+    def test_single_agent_configure_probes_only_for_hosted_models(
+        self, monkeypatch, source, expected
+    ):
+        captured: dict = {}
+
+        class Stop(Exception):
+            pass
+
+        def shared_states(workspaces, tools, **kwargs):
+            captured.update(kwargs)
+            raise Stop
+
+        monkeypatch.setattr(cli_mod, "_configure_shared_workspace_states", shared_states)
+        with pytest.raises(Stop):
+            cli_mod._setup_single_agent(
+                [(self.WS, "DEFAULT")], "gemini", apply_managed=True, **source
+            )
+        assert captured["probe_models"] is expected
 
     def test_launch_reuses_recorded_verdicts_without_probing(self, monkeypatch):
         cli_mod, _, probes = self._stub(
@@ -7663,7 +7711,7 @@ class TestConfigureModelProbes:
         assert "oss_dead_models" not in saved[-1]
         assert saved[-1]["tool_less_models"] == ["system.ai.gemini-3-pro-image"]
 
-    def test_provider_mode_neither_probes_nor_touches_the_lists(self, monkeypatch):
+    def test_launch_without_discovery_neither_probes_nor_touches_the_lists(self, monkeypatch):
         cli_mod, saved, probes = self._stub(
             monkeypatch,
             existing_state={"workspace": self.WS, "oss_dead_models": ["system.ai.glm-5-2"]},

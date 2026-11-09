@@ -5734,7 +5734,8 @@ class TestProbeDiscoveredModels:
 
     def _probe(self, monkeypatch, outcomes: dict, *, flagged=(), **kwargs):
         """Run the probes with each model's answer from ``outcomes`` (a (status, body), None for
-        success, or an exception), and ``flagged`` listing ``function_calling: false``."""
+        success, a ``network error: ...`` reason as ``_http_post_json`` returns it, or an
+        exception), and ``flagged`` listing ``function_calling: false``."""
         db_mod.clear_model_services_cache()
         db_mod._MODEL_SERVICES_CACHE[WS] = [
             db_mod.ModelServiceEntry(m, function_calling=False) for m in flagged
@@ -5749,6 +5750,8 @@ class TestProbeDiscoveredModels:
             outcome = outcomes.get(model_id)
             if isinstance(outcome, BaseException):
                 raise outcome
+            if isinstance(outcome, str):
+                return None, outcome
             reason = self._reason(outcome)
             return (None, reason) if reason else ({"choices": []}, None)
 
@@ -5768,6 +5771,12 @@ class TestProbeDiscoveredModels:
             "system.ai.gemma-3-12b",
             "system.ai.llama-4-maverick",
             "system.ai.kimi-k3",
+            "system.ai.kimi-k3-1-pro",
+            "system.ai.glm-5-3",
+            "system.ai.glm-5-3-flash",
+            "system.ai.qwen3-next-80b-a3b-instruct",
+            "system.ai.meta-llama-3-3-70b-instruct",
+            "system.ai.gpt-oss-20b",
             "system.ai.gpt-oss-120b",
         ]
         results, sent = self._probe(
@@ -5785,6 +5794,19 @@ class TestProbeDiscoveredModels:
                 "system.ai.gemma-3-12b": (404, "<html>Not Found</html>"),
                 "system.ai.llama-4-maverick": (503, "upstream unavailable"),
                 "system.ai.kimi-k3": TimeoutError("The read operation timed out"),
+                "system.ai.kimi-k3-1-pro": "network error: The read operation timed out",
+                # NOT_FOUND or "deprecated" outside a JSON error code or message is no verdict.
+                "system.ai.glm-5-3": (404, "<html>NOT_FOUND</html>"),
+                "system.ai.glm-5-3-flash": (
+                    404,
+                    '{"error_code":"INTERNAL_ERROR","message":"upstream NOT_FOUND"}',
+                ),
+                "system.ai.qwen3-next-80b-a3b-instruct": (404, '{"error_code":"NOT_FOUND"'),
+                "system.ai.meta-llama-3-3-70b-instruct": (400, "<p>model is deprecated</p>"),
+                "system.ai.gpt-oss-20b": (
+                    400,
+                    '{"error_code":"BAD_REQUEST","detail":"model is deprecated"}',
+                ),
             },
             oss_models=oss,
         )
@@ -5807,6 +5829,15 @@ class TestProbeDiscoveredModels:
         results, _ = self._probe(
             monkeypatch, dict.fromkeys(oss, (404, self.ENDPOINT_NOT_FOUND)), oss_models=oss
         )
+        assert results.dead == []
+
+    def test_network_failures_do_not_count_against_the_route_check(self, monkeypatch):
+        # Two endpoints answer NOT_FOUND and a third never answers: every HTTP answer was dead,
+        # so the route is still suspect.
+        oss = ["system.ai.glm-5-2", "system.ai.kimi-k3", "system.ai.kimi-k3-1-pro"]
+        outcomes: dict = dict.fromkeys(oss[:2], (404, self.ENDPOINT_NOT_FOUND))
+        outcomes[oss[2]] = "network error: The read operation timed out"
+        results, _ = self._probe(monkeypatch, outcomes, oss_models=oss)
         assert results.dead == []
 
     def test_a_single_dead_endpoint_is_dropped(self, monkeypatch):
@@ -5902,7 +5933,15 @@ class TestProbeDiscoveredModels:
         results = db_mod.probe_discovered_models(
             WS, "tok", oss_models=[], gemini_models=["system.ai.gemini-3-pro-image"]
         )
-        assert results == db_mod.ModelProbeResults()
+        # No listing picked the tool-probe models, so no tool verdict was reached.
+        assert results == db_mod.ModelProbeResults(tools_checked=False)
+
+    def test_a_listing_without_flagged_models_is_a_tool_verdict(self, monkeypatch):
+        results, sent = self._probe(
+            monkeypatch, {}, gemini_models=["system.ai.gemini-3-5-flash"], flagged=()
+        )
+        assert sent == []
+        assert results == db_mod.ModelProbeResults(tools_checked=True)
 
     def test_long_error_bodies_survive_in_the_reason(self, monkeypatch):
         body = "x" * 300 + " does not support function calling"

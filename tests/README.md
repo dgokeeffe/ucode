@@ -982,15 +982,18 @@ that name gpt-oss, Qwen, Llama or Gemma (bucketing, default and unservable warni
 component checks with stubbed listings, not live discovery.
 
 Discovered-model probes are covered by `TestProbeDiscoveredModels` in `test_databricks.py`: an
-MLflow model is dropped only on a deprecation 400 or a `*NOT_FOUND` 404, never on 403 rate limits,
-429, 5xx, other 400s, an HTML 404 or a timeout; every model answering dead at once drops none; a
-probe still running at the total budget keeps its model; and only models the listing flags with
+MLflow model is dropped only on a 400 whose JSON message says it is deprecated or a 404 whose JSON
+`error_code` ends in `NOT_FOUND`, never on 403 rate limits, 429, 5xx, other 400s, HTML or
+truncated bodies, a `NOT_FOUND` outside the error code, a network error or a timeout; when every
+endpoint that answered over HTTP was dead (network failures don't count) none is dropped; a probe
+still running at the total budget keeps its model; and only models the listing flags with
 `function_calling: false` get the tool probe, dropped only on a 400 saying they don't support
-function calling, even past 200 characters of error body. `TestConfigureModelProbes` in
-`test_cli.py` pins that only explicit configure probes, that `oss_dead_models` and
-`tool_less_models` are recorded, reused by launches and `status --live`, kept for families a
-single-agent configure didn't probe, and replaced by the destination's own lists on a workspace
-switch. `test_workspace_selection.py` checks that probe requests carry the workspace selection,
+function calling, even past 200 characters of error body. Without a listing no tool verdict is
+reached. `TestConfigureModelProbes` in `test_cli.py` pins that only explicit configure probes,
+and not with `--provider` or `--model-location`; that `oss_dead_models` and `tool_less_models`
+are recorded, reused by launches and `ug status`, kept for families a single-agent configure
+didn't probe or (tool verdicts) when no listing was available, and replaced by the destination's
+own lists on a workspace switch. `test_workspace_selection.py` checks that probe requests carry the workspace selection,
 and `test_agent_pi.py` that a managed `pi_models` list keeps a recorded model. These stub the
 HTTP boundary; the live drop list and timing were checked by hand.
 

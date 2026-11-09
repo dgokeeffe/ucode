@@ -978,9 +978,14 @@ def _apply_model_probes(
                 workspace, token, oss_models=oss_models, gemini_models=gemini_models
             )
         _record_probe_result(state, _OSS_DEAD_MODELS_STATE_KEY, oss_models, results.dead)
-        _record_probe_result(
-            state, _TOOL_LESS_MODELS_STATE_KEY, [*gemini_models, *oss_models], results.tool_less
-        )
+        if results.tools_checked:
+            # Without a listing no model could be picked for the tool probe; keep the old verdicts.
+            _record_probe_result(
+                state,
+                _TOOL_LESS_MODELS_STATE_KEY,
+                [*gemini_models, *oss_models],
+                results.tool_less,
+            )
         if results.dead:
             print_warning(
                 "Skipping retired model endpoints (deprecated or not found): "
@@ -1001,6 +1006,7 @@ def _configure_shared_workspace_states(
     custom_oauth: CustomOAuthConfig | None = None,
     clear_custom_oauth: bool = False,
     claude_server_side_web_search: bool | None = None,
+    probe_models: bool = True,
 ) -> list[dict]:
     if len(workspaces) != 1:
         raise RuntimeError(f"Expected exactly one workspace, got {len(workspaces)}.")
@@ -1022,7 +1028,7 @@ def _configure_shared_workspace_states(
                 force_login=force_login,
                 use_pat=use_pat,
                 databricks_ai_tools_enabled=databricks_ai_tools_enabled,
-                probe_models=True,
+                probe_models=probe_models,
                 **custom_oauth_kwargs,
                 **optional_kwargs,
             )
@@ -1212,6 +1218,9 @@ def _setup_single_agent(
         custom_oauth=custom_oauth,
         clear_custom_oauth=custom_oauth is None,
         claude_server_side_web_search=claude_server_side_web_search,
+        # A --provider or --model-location source means this agent uses none of the system.ai
+        # models, so it sends no inference probes for them.
+        probe_models=provider is None and model_location is None,
     )
     state = states[0]
     parent_schema = None

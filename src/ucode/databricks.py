@@ -2808,7 +2808,7 @@ _MODEL_PROBE_TIMEOUT_SECONDS = 10
 _MODEL_PROBE_TOTAL_SECONDS = 20.0
 _MODEL_PROBE_MAX_WORKERS = 16
 # Gemini nests its message in a JSON error envelope; keep enough body that the phrase survives.
-_MODEL_PROBE_ERROR_BODY_CHARS = 2000
+_MODEL_PROBE_ERROR_BODY_CHARS = 8000
 _NO_FUNCTION_CALLING_PHRASE = "does not support function calling"
 _DEPRECATED_ENDPOINT_PHRASE = "is deprecated"
 _TOOL_PROBE_FUNCTION = {
@@ -2823,44 +2823,74 @@ class ModelProbeResults:
     """What the discovered-model probes proved, in discovery order.
 
     ``dead`` holds MLflow chat models whose endpoint answered retired; ``tool_less`` holds models
-    that rejected a request carrying a tool."""
+    that rejected a request carrying a tool. ``tools_checked`` is False when no model listing was
+    available to pick the models the tool probe needs, so no tool verdict was reached."""
 
     dead: list[str] = field(default_factory=list)
     tool_less: list[str] = field(default_factory=list)
+    tools_checked: bool = False
+
+
+def _http_error_body(reason: str | None, status: int) -> dict[str, object] | None:
+    """The JSON error object of an ``HTTP <status> ...: <body>`` failure reason, else None.
+
+    None for any other status, a network error, a reason rewritten for the workspace selection,
+    and a body that isn't a JSON object (an HTML page, or one cut short)."""
+    if not reason or not reason.startswith(f"HTTP {status} "):
+        return None
+    _, separator, body = reason.partition(": ")
+    if not separator:
+        return None
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    return cast(dict[str, object], payload) if isinstance(payload, dict) else None
+
+
+def _error_message(error: dict[str, object]) -> str:
+    message = error.get("message")
+    return message.lower() if isinstance(message, str) else ""
 
 
 def _is_dead_endpoint_reason(reason: str | None) -> bool:
     """True only for a definitive "this endpoint is gone" answer.
 
-    A 404 whose body carries a ``*NOT_FOUND`` error code, or a 400 saying the endpoint is
-    deprecated. Auth, rate limits (403 "rate limit is set to 0"), throttling, 5xx, other 400s, a
-    404 without the error code (an HTML page) and network errors are not evidence."""
-    if not reason:
-        return False
-    if reason.startswith("HTTP 404"):
-        return "NOT_FOUND" in reason
-    if reason.startswith("HTTP 400"):
-        return _DEPRECATED_ENDPOINT_PHRASE in reason.lower()
-    return False
+    A 404 whose JSON ``error_code`` ends in ``NOT_FOUND``, or a 400 whose JSON ``message`` says the
+    endpoint is deprecated. Auth, rate limits (403 "rate limit is set to 0"), throttling, 5xx,
+    other 400s, a 404 without that error code (an HTML page, a message that merely mentions
+    NOT_FOUND) and network errors are not evidence."""
+    not_found = _http_error_body(reason, 404)
+    if not_found is not None:
+        code = not_found.get("error_code")
+        return isinstance(code, str) and code.endswith("NOT_FOUND")
+    bad_request = _http_error_body(reason, 400)
+    return bad_request is not None and _DEPRECATED_ENDPOINT_PHRASE in _error_message(bad_request)
 
 
 def _is_no_function_calling_reason(reason: str | None) -> bool:
-    """True only for a 400 whose body says the model cannot call tools."""
-    if not reason or not reason.startswith("HTTP 400"):
-        return False
-    return _NO_FUNCTION_CALLING_PHRASE in reason.lower()
+    """True only for a 400 whose JSON ``message`` says the model cannot call tools.
+
+    Gemini nests its own error envelope inside that message as a string."""
+    bad_request = _http_error_body(reason, 400)
+    return bad_request is not None and _NO_FUNCTION_CALLING_PHRASE in _error_message(bad_request)
 
 
-def _tool_less_candidates(workspace: str, model_ids: list[str]) -> set[str]:
+def _answered_over_http(reason: str | None) -> bool:
+    """Whether a probe got an HTTP answer (success or an HTTP error), not a network failure."""
+    return reason is None or reason.startswith("HTTP ")
+
+
+def _tool_less_candidates(workspace: str, model_ids: list[str]) -> set[str] | None:
     """The ids whose UC model-service entry lists ``function_calling: false``.
 
-    Reads this process's listing (no request). The flag over-reports (Gemini image models carry it
-    and still call tools), so it only selects which models get the tool probe."""
-    flagged = {
-        entry.id
-        for entry in cached_model_service_entries(workspace) or ()
-        if entry.function_calling is False
-    }
+    Reads this process's listing (no request); None when there is none. The flag over-reports
+    (Gemini image models carry it and still call tools), so it only selects which models get the
+    tool probe."""
+    entries = cached_model_service_entries(workspace)
+    if entries is None:
+        return None
+    flagged = {entry.id for entry in entries if entry.function_calling is False}
     return {model_id for model_id in model_ids if model_id in flagged}
 
 
@@ -2884,20 +2914,24 @@ def probe_discovered_models(
       model "does not support function calling". Every coding agent sends tools.
 
     Fails open. Any other answer keeps the model, and so does a probe still running when
-    ``total_timeout`` elapses. When at least two models were checked and every one answered dead,
-    the route itself is suspect (a workspace without the MLflow route, say), so none is dropped.
-    Requests carry the workspace selector headers through ``_http_post_json``.
+    ``total_timeout`` elapses. When at least two endpoints answered over HTTP and every one
+    answered dead, the route itself is suspect (a workspace without the MLflow route, say), so
+    none is dropped; network failures are not answers. Requests carry the workspace selector
+    headers through ``_http_post_json``.
     """
-    tool_candidates = _tool_less_candidates(workspace, [*gemini_models, *oss_models])
+    candidates = _tool_less_candidates(workspace, [*gemini_models, *oss_models])
+    tools_checked = candidates is not None
+    tool_candidates = candidates or set()
     jobs: list[tuple[str, str]] = [("alive", model_id) for model_id in oss_models]
     jobs += [("tools", model_id) for model_id in [*gemini_models, *oss_models]]
     jobs = [job for job in jobs if job[0] == "alive" or job[1] in tool_candidates]
     if not jobs:
-        return ModelProbeResults()
+        return ModelProbeResults(tools_checked=tools_checked)
     mlflow_url = f"{workspace}/ai-gateway/mlflow/v1/chat/completions"
     gemini = set(gemini_models)
 
-    def probe(job: tuple[str, str]) -> bool:
+    def probe(job: tuple[str, str]) -> bool | None:
+        """True when the answer proves the model unusable, None without an HTTP answer."""
         kind, model_id = job
         if kind == "alive":
             url = mlflow_url
@@ -2925,6 +2959,8 @@ def probe_discovered_models(
             url, token, body, timeout=timeout, error_body_chars=_MODEL_PROBE_ERROR_BODY_CHARS
         )
         _debug(f"model probe {kind} {model_id}", reason or "ok")
+        if not _answered_over_http(reason):
+            return None
         if kind == "alive":
             return _is_dead_endpoint_reason(reason)
         return _is_no_function_calling_reason(reason)
@@ -2933,9 +2969,11 @@ def probe_discovered_models(
     dead: set[str] = set()
     tool_less: set[str] = set()
 
-    def collect(failed: bool, job: tuple[str, str]) -> None:
+    def collect(failed: bool | None, job: tuple[str, str]) -> None:
         nonlocal alive_answers
         kind, model_id = job
+        if failed is None:
+            return
         if kind == "alive":
             alive_answers += 1
             if failed:
@@ -2958,6 +2996,7 @@ def probe_discovered_models(
     return ModelProbeResults(
         dead=[model_id for model_id in oss_models if model_id in dead],
         tool_less=list(dict.fromkeys(m for m in ordered if m in tool_less)),
+        tools_checked=tools_checked,
     )
 
 
