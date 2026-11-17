@@ -15,8 +15,16 @@ Per-provider `compat` flags work around fields the gateway translators reject:
   rejects `tools[].eager_input_streaming` on the streaming + tools path that
   pi uses for every request. With this flag pi omits the per-tool field and
   sends the legacy `anthropic-beta: fine-grained-tool-streaming-...` header
-  instead, which the gateway accepts.
+  instead, which the gateway accepts. `sendSessionAffinityHeaders: true` makes
+  pi send `x-session-affinity: <session id>`, a routing hint meant to keep a
+  conversation on one Unity Gateway destination under traffic splitting, since
+  prompt caches are destination-local. Pi's Responses dialect already sends
+  `session_id` without a flag, and its Gemini dialect has no affinity setting.
 - mlflow: see `_MLFLOW_COMPAT` for the OpenAI fields MLflow models reject.
+
+`launch` defaults `PI_CACHE_RETENTION=long` (see `build_runtime_env`). gpt-oss is
+served from `databricks-mlflow`, whose compat sets `supportsLongCacheRetention:
+false`, so the Responses-route `prompt_cache_retention` field is never sent for it.
 
 Gateway model ids are not in Pi's built-in catalog, so a bare `{"id": ...}`
 entry gets Pi's custom-model defaults: no thinking, text-only input, a 128K
@@ -319,6 +327,7 @@ def _gpt_model_entry(model_id: str) -> dict:
 _GEMINI_THINKING_LEVEL_MAPS: dict[str, ThinkingLevelMap | None] = {
     # Always reasons; `minimal` and a thinking budget (Pi's off path) are rejected with HTTP 400.
     "gemini-4-argon": {"off": None, "minimal": None},
+    "gemini-4-carbon": {"off": None, "minimal": None},
     "gemini-3-8-flash": {"minimal": None},
     "gemini-3-7-flash": {"minimal": None},
     "gemini-3-6-flash": {"off": None},
@@ -481,7 +490,11 @@ def render_overlay(
             # Gateway's Anthropic translator rejects per-tool
             # `eager_input_streaming` on the streaming + tools path. Pi sends
             # the legacy beta header instead when this is false.
-            "compat": {"supportsEagerToolInputStreaming": False},
+            # Session affinity hints that requests should share a destination (see module docstring).
+            "compat": {
+                "supportsEagerToolInputStreaming": False,
+                "sendSessionAffinityHeaders": True,
+            },
             "headers": ua_headers,
             "models": [_claude_model_entry(m) for m in claude_ids],
         }
@@ -812,6 +825,10 @@ def _configure_launch(state: dict) -> str:
     return token
 
 
+# Long cache retention for GPT and Claude; rationale in the module docstring.
+PI_CACHE_RETENTION_DEFAULT = "long"
+
+
 # GOOGLE_GENAI_USE_ENTERPRISE outranks GOOGLE_GENAI_USE_VERTEXAI in the SDK; it reads either as on
 # only when the value is `true` in any case.
 _GOOGLE_VERTEX_SWITCHES = ("GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_ENTERPRISE")
@@ -821,6 +838,10 @@ def build_runtime_env(token: str, *, has_gemini: bool = True) -> dict[str, str]:
     env = os.environ.copy()
     env["OAUTH_TOKEN"] = token
     env["PI_CODING_AGENT_DIR"] = str(PI_CONFIG_DIR)
+    # A caller's PI_CACHE_RETENTION wins, e.g. `short` to avoid Anthropic's
+    # higher 1-hour cache-write price.
+    if not env.get("PI_CACHE_RETENTION", "").strip():
+        env["PI_CACHE_RETENTION"] = PI_CACHE_RETENTION_DEFAULT
     if not has_gemini:
         return env
     # The gateway's Gemini route rejects the Vertex paths Pi's Google SDK uses when an inherited

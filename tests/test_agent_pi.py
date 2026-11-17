@@ -171,6 +171,13 @@ class TestRenderOverlayCompatFlags:
         compat = overlay["providers"]["databricks-claude"]["compat"]
         assert compat["supportsEagerToolInputStreaming"] is False
 
+    def test_claude_sends_session_affinity_headers(self):
+        # Keeps a conversation on one gateway destination under traffic
+        # splitting; prompt caches are destination-local.
+        overlay, _ = _overlay("claude-sonnet", claude_models={"sonnet": "claude-sonnet"})
+        compat = overlay["providers"]["databricks-claude"]["compat"]
+        assert compat["sendSessionAffinityHeaders"] is True
+
     def test_openai_and_gemini_have_no_compat_flags(self):
         # Their gateway routes accept pi's request shape as-is.
         overlay, _ = _overlay(
@@ -358,6 +365,18 @@ class TestBuildRuntimeEnv:
     def test_sets_oauth_token(self):
         env = pi.build_runtime_env("tok")
         assert env["OAUTH_TOKEN"] == "tok"
+
+    def test_defaults_to_long_cache_retention(self, monkeypatch):
+        monkeypatch.delenv("PI_CACHE_RETENTION", raising=False)
+        assert pi.build_runtime_env("tok")["PI_CACHE_RETENTION"] == "long"
+
+    def test_blank_cache_retention_gets_the_default(self, monkeypatch):
+        monkeypatch.setenv("PI_CACHE_RETENTION", " ")
+        assert pi.build_runtime_env("tok")["PI_CACHE_RETENTION"] == "long"
+
+    def test_explicit_cache_retention_wins(self, monkeypatch):
+        monkeypatch.setenv("PI_CACHE_RETENTION", "short")
+        assert pi.build_runtime_env("tok")["PI_CACHE_RETENTION"] == "short"
 
     def test_sets_private_agent_dir_without_replacing_home(self, monkeypatch):
         monkeypatch.setenv("HOME", "/real-user-home")
@@ -801,6 +820,7 @@ _DOCUMENTED_LEVELS = {
     "gpt-6.1-sol": {**_NONE_THROUGH_XHIGH, "max": "max"},
     "gpt-6.1-terra": {**_NONE_THROUGH_XHIGH, "max": "max"},
     "gemini-4-argon": _NO_OFF_NO_MINIMAL,
+    "gemini-4-carbon": _NO_OFF_NO_MINIMAL,
     "gemini-3-8-flash": {"off": "off", **_NO_OFF_NO_MINIMAL},
     "gemini-3-7-flash": {"off": "off", **_NO_OFF_NO_MINIMAL},
     "gemini-3-6-flash": {k: v for k, v in _BUDGET.items() if k != "off"},

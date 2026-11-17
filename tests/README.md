@@ -1262,6 +1262,11 @@ managed list and as a managed list's only model. Explicit
 `function_calling: false` and embedding names are excluded even by the name fallback. These are
 component checks with stubbed listings, not live discovery.
 
+`test_agent_pi.py` also checks that the Claude provider sets `sendSessionAffinityHeaders` and
+that Pi's launch environment defaults `PI_CACHE_RETENTION` to `long`, keeping a caller's value
+(gpt-oss's long-retention opt-out is the MLflow provider's compat, pinned above).
+They do not check the headers or cache fields Pi sends, or whether the gateway honors them.
+
 Shared native transcript parsing is checked by `test_integration_agent_helpers.py` and
 `test_integration_evidence.py`. These component checks protect existing journey evidence;
 they do not establish live agent coverage.
