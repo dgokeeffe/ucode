@@ -65,12 +65,12 @@ router or model-quality measurements. Guidance identifies the launched model wit
 unsolicited comparisons with the requested model; comparisons remain available when asked.
 Native registration checks cover model-catalog guidance in routing-only and orchestration
 modes, retained host Usage notes, and unchanged descriptions when routing is off.
-The four logs-pane component tests group rendering/background refresh, reader failures
+The logs-pane component tests group rendering/background refresh, reader failures
 including truncated output, missing configuration, and launch gating. Their controlled reader
 does not establish live pane coverage; exact styling and missing-width fallback are not asserted.
-The pending-reader case checks nonblocking subagent startup, queued refreshes for parallel
-spawns, and no reads on ordinary turns or resumed/denied spawns. Missing/unreadable log behavior
-is covered through the CLI tests; the redundant
+The pending-reader cases check that turn completion/status cleanup and subagent startup are
+nonblocking, parallel spawns queue refreshes, and resumed/denied spawns or closed panes do not
+trigger reads. Missing/unreadable log behavior is covered through the CLI tests; the redundant
 direct-reader case and UUID failure injection were removed.
 
 Windows and macOS Cowork desktop coverage, installation detection, and required
@@ -329,7 +329,9 @@ service needs a user session), the GUI, or inference.
 `test_ug_codex_desktop_macos.py` covers the GUI and inference on macOS only: after the same managed
 configure it opens the pinned ChatGPT desktop app, answers onboarding and sends a prompt through
 Accessibility clicks and real keystrokes, and requires the exact answer on screen and in the
-app's rollout, with `system.ai.gpt-5-6-sol` as the completed turn's model.
+app's rollout, with `system.ai.gpt-5-6-sol` as the completed turn's model. It then clicks an
+absent label in the same app and requires a nonzero helper exit with the native four-column
+accessibility tree captured before the fatal error in command evidence.
 `scripts/run_integration.py` ignores the module unless `--macos-desktop` is passed, which only the
 macOS desktop CI job does, so a local run never drives a developer's installed app.
 
@@ -734,6 +736,12 @@ The credential-free disposable-container harness passes real installed-CLI misma
 as UID 10001; it does not replace the unrun real-workspace configure journey.
 
 ## Shared agent helpers
+
+`utils/mcp.py` refreshes Codex's static `/mcp verbose` inventory while servers
+are starting, within a single 120-second deadline. It still requires both connected
+servers and their exact tools; the CUJ then calls both tools and verifies their receipts.
+Offline checks in `../test_integration_terminal_screen.py` cover stale startup snapshots,
+connection/tool failures, and permanent startup. They do not establish live MCP coverage.
 
 `utils/agents/claude.py` and `utils/agents/codex.py` own the existing native answer
 parsing, session paths, and child-session detection. `utils/evidence.py` dispatches
