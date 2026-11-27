@@ -14,7 +14,7 @@ import threading
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager, redirect_stdout
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from importlib import metadata
 from pathlib import Path
@@ -27,7 +27,7 @@ from rich.text import Text
 from typer import _click
 from typer.core import HAS_RICH, TyperCommand, TyperGroup, TyperOption
 
-from ucode import auth_token_log, custom_oauth, managed_files, metrics, token_cache
+from ucode import auth_token_log, custom_oauth, managed_files, metrics, tls, token_cache
 from ucode.agents import (
     GEMINI_API_TOOLS,
     MODEL_LOCATION_TOOLS,
@@ -40,6 +40,7 @@ from ucode.agents import (
     configure_tool,
     default_model_for_tool,
     ensure_bootstrap_dependencies,
+    ensure_minimum_version,
     ensure_provider_state,
     explicit_model_arg_value,
     install_databricks_ai_tools_for_agents,
@@ -47,6 +48,7 @@ from ucode.agents import (
     normalize_tool,
     refuse_user_scope_over_managed_config,
     refuse_user_scope_over_managed_files,
+    request_vscode_code,
     request_vscode_with_copilot,
     resolve_gemini_provider_model,
     resolve_launch_model,
@@ -68,6 +70,7 @@ from ucode.agents.model_sources import (
     resolve_model_sources,
 )
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
+from ucode.codex_config import is_codex_app_server_launch, is_codex_interactive_launch
 from ucode.config_io import is_dry_run, restore_file, set_dry_run
 from ucode.constants import (
     AGENT_CLAUDE,
@@ -75,7 +78,7 @@ from ucode.constants import (
     AGENT_COPILOT,
     CLAUDE_SERVER_SIDE_WEB_SEARCH_STATE_KEY,
     ISAAC_LAUNCH_MODE_ENV_VAR,
-    ISAAC_SMART_ROUTER_FEEDBACK_ENV_VAR,
+    ISAAC_OMNI_LAUNCH_MODE,
     MANAGED_MODEL_SOURCE_EXPANSIONS_STATE_KEY,
     SMART_ROUTING_ENV_KEYS,
     UG_HEADERS_ENV_VAR,
@@ -87,7 +90,9 @@ from ucode.custom_oauth import (
 )
 from ucode.databricks import (
     SKILLS_MCP_MIN_DATABRICKS_CLI_VERSION,
+    AnthropicModelCatalog,
     BearerCommandError,
+    DatabricksLoginRequiredError,
     apply_pat_environment,
     build_shared_base_urls,
     cached_model_service_entries,
@@ -100,6 +105,7 @@ from ucode.databricks import (
     ensure_databricks_auth,
     ensure_pat_bearer,
     external_bearer_configured,
+    fetch_databricks_token_untimed,
     find_profile_name_for_host,
     find_profile_name_for_workspace,
     get_databricks_token,
@@ -108,7 +114,7 @@ from ucode.databricks import (
     is_oss_family_model,
     list_anthropic_model_catalog,
     list_profile_entries,
-    list_tool_provider_services,
+    looks_like_definitive_auth_failure,
     map_claude_family_models,
     normalize_workspace_url,
     probe_unity_gateway_capabilities,
@@ -117,7 +123,7 @@ from ucode.databricks import (
     resolve_provider_launch_model,
     resolve_provider_service,
     run_databricks_login,
-    runs_web_search_tool,
+    tool_provider_service_choices,
     ug_binary,
 )
 from ucode.env import env_bool
@@ -214,8 +220,9 @@ from ucode.smart_routing import config as smart_routing_config
 from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.claude_hooks import (
     FIRST_PROMPT_SOCKET_ENV,
+    MOD_EVENTS,
     ROUTE_FIRST_PROMPT_EVENT,
-    ROUTE_SUBAGENT_MOD_EVENT,
+    ROUTE_VALIDATION_MOD_EVENT,
 )
 from ucode.smart_routing.session_env import (
     effective_environment,
@@ -229,6 +236,7 @@ from ucode.state import (
     aliased_workspace_key,
     clear_state,
     current_workspace_key,
+    get_claude_auto_revert_targets,
     get_managed_model_source_expansions,
     get_model_location,
     get_provider_service,
@@ -239,6 +247,7 @@ from ucode.state import (
     remove_self_managed_agent,
     save_config_scope,
     save_state,
+    set_claude_auto_revert_targets,
     set_current_workspace,
     set_managed_model_source_expansions,
     set_model_location,
@@ -277,6 +286,7 @@ from ucode.workspace import (
     selector_headers,
     split_workspace_key,
     state_workspace_key,
+    workspace_id_args,
     workspace_key,
 )
 
@@ -358,20 +368,18 @@ def _print_managed_summary(
         return
     lines = [f"[bold]Workspace:[/bold] [cyan]{state.get('workspace', '?')}[/cyan]"]
     if tool is not None:
-        lines.append(f"[bold]Agent:[/bold] [green]{TOOL_SPECS[tool]['display']}[/green]")
+        lines.append(f"[bold]Agent:[/bold] [green]{_agent_label(tool)}[/green]")
     enabled = [t for t in (managed.get("enabled_agents") or {}) if t in TOOL_SPECS]
     failed: list[str] = []
     if configured_tools is not None:
         failed = [t for t in enabled if t not in configured_tools]
         enabled = [t for t in enabled if t in configured_tools]
     if enabled:
-        lines.append(
-            f"[bold]Coding Agents:[/bold] {', '.join(TOOL_SPECS[t]['display'] for t in enabled)}"
-        )
+        lines.append(f"[bold]Coding Agents:[/bold] {', '.join(_agent_label(t) for t in enabled)}")
     if failed:
         lines.append(
             f"[bold]Failed to configure:[/bold] "
-            f"[yellow]{', '.join(TOOL_SPECS[t]['display'] for t in failed)}[/yellow]"
+            f"[yellow]{', '.join(_agent_label(t) for t in failed)}[/yellow]"
         )
     if tool is not None:
         provider = managed_provider_service(managed, tool)
@@ -831,14 +839,14 @@ def configure_shared_state(
     opencode_models: dict[str, list[str]] = {}
     web_search_model: str | None = None
     if skip_model_discovery:
-        # Provider mode: the agent routes through a Model Provider Service and
-        # pins no Databricks model, so the full family discovery is unused. Web
-        # search (claude only) still needs one Responses-capable model, so fetch
-        # just that with a single call.
+        # The agent uses its provider, but web search needs a hosted model. Prefer UC IDs
+        # so gateway-only models do not inherit legacy serving-endpoint names.
         if want_claude:
             with spinner("Fetching available models..."):
-                ws_models, _ = discover_codex_models(workspace, token)
-            web_search_model = next((m for m in ws_models if runs_web_search_tool(m)), None)
+                _, ws_models, _, _, _ = discover_model_services(workspace, token)
+                if not ws_models:
+                    ws_models, _ = discover_codex_models(workspace, token)
+            web_search_model = claude_agent.select_web_search_model(ws_models)
     else:
         # UC-first, best-effort: one UC model-services call yields all families
         # as `system.ai.<model-name>` ids, bucketed by name. If a family comes
@@ -996,10 +1004,12 @@ def _check_copilot_model_source(
 ) -> None:
     """Resolve the Copilot source the way `ug copilot` will, before anything is written or saved.
 
-    A bad source fails here instead of leaving Copilot configured and the source unsaved.
+    A bad source fails here instead of leaving Copilot configured and the source unsaved. A seat
+    relay registers no models, so only its service is checked.
     """
     if provider is not None:
-        copilot_agent.provider_service_catalog(state, provider, None)
+        if not copilot_agent.uses_seat_relay(state, provider):
+            copilot_agent.provider_service_catalog(state, provider, None)
     elif model_location is not None:
         copilot_agent.location_catalog(state, model_location)
 
@@ -1343,7 +1353,7 @@ def _maybe_select_provider_service(tool: str, state: dict) -> dict:
     # silently dropping back to Databricks.
     token = get_databricks_token(state["workspace"], state.get("profile"))
     with spinner("Checking for model provider services..."):
-        names, reason = list_tool_provider_services(tool, state["workspace"], token)
+        choices, reason = tool_provider_service_choices(tool, state["workspace"], token)
     offers_location = tool in MODEL_LOCATION_TOOLS
     if reason is not None:
         # Most workspaces don't have the feature enabled — that's the common case,
@@ -1352,15 +1362,15 @@ def _maybe_select_provider_service(tool: str, state: dict) -> dict:
             print_warning(f"Could not list model provider services: {reason}")
             if not offers_location:
                 print_note("Falling back to Databricks models.")
-        names = []
-    elif not names and not offers_location:
+        choices = []
+    elif not choices and not offers_location:
         # Feature is on but no service matches this tool's provider type.
         print_note(f"Using Databricks models for {display}.")
-    if not names and not offers_location:
+    if not choices and not offers_location:
         return _use_databricks()
 
     options = [("databricks", "Databricks Hosted")]
-    if names:
+    if choices:
         options.append(("mps", "External Models"))
     if offers_location:
         options.append(("location", "Custom Model Location"))
@@ -1378,9 +1388,7 @@ def _maybe_select_provider_service(tool: str, state: dict) -> dict:
         print_success(f"{display} will discover models in {location}")
         return state
 
-    selected = prompt_for_selection(
-        "Select a model provider service:", [(name, name) for name in names]
-    )
+    selected = prompt_for_selection("Select a model provider service:", choices)
     if selected is None:
         raise KeyboardInterrupt
     state = set_model_location(state, tool, None)
@@ -1768,8 +1776,8 @@ def _fail_machine_wide_run(failed_tools: list[str]) -> None:
 def _agent_label(tool: str) -> str:
     """An agent's name where developers choose and review agents: the picker, status, list."""
     if tool == AGENT_COPILOT:
-        # Configuring copilot also sets up Copilot Chat in VS Code.
-        return "GitHub Copilot (CLI and VS Code)"
+        # Configuring copilot also sets up Copilot Chat in VS Code and the desktop app.
+        return "GitHub Copilot (CLI, VS Code and app)"
     return str(TOOL_SPECS[tool]["display"])
 
 
@@ -2031,6 +2039,20 @@ def status() -> int:
             )
         if tool == AGENT_COPILOT and effective_state.get("copilot_vscode_integration") is False:
             rows.append(("VS Code", "off (workspace-managed)"))
+        if tool == AGENT_COPILOT:
+            from ucode.agents.desktop.setup import copilot_app_status
+
+            app_status = copilot_app_status(
+                effective_state,
+                provider=provider_service,
+                location=get_model_location(effective_state, tool),
+            )
+            if app_status:
+                rows.append(("GitHub Copilot app", app_status.row))
+                for warning in app_status.warnings:
+                    print_warning(warning)
+                for note in app_status.notes:
+                    print_note(note)
         if tool in MCP_CLIENTS:
             # High-level overview: just a count per agent. `ug mcp list` (see the note below) shows
             # the per-server detail and live connection status, so status stays scannable. The shared
@@ -2045,6 +2067,11 @@ def status() -> int:
         rows.append(("Endpoint", str(base_url or "not configured")))
         _print_status_panel(_agent_label(tool), rows)
 
+    if AGENT_COPILOT not in configured_tools:
+        from ucode.agents.desktop.setup import copilot_app_unconfigured_status
+
+        if pending := copilot_app_unconfigured_status():
+            _print_status_panel("GitHub Copilot app", [("Status", pending)])
     if not configured_tools:
         print_note("No coding agents are configured.")
     return 0
@@ -2097,6 +2124,12 @@ def revert() -> int:
     from ucode.agents.desktop.setup import revert_desktop
 
     state = load_state()
+    auto_targets = {
+        **get_claude_auto_revert_targets(),
+        **claude_agent.auto_model_targets(),
+    }
+    if auto_targets:
+        set_claude_auto_revert_targets(auto_targets)
     desktop_result = revert_desktop()
     managed_configs = state.get("managed_configs") or {}
     mcp_results = revert_mcp_configs(state)
@@ -2129,11 +2162,18 @@ def revert() -> int:
     from ucode.agents import vscode
 
     try:
-        vscode_result = vscode.revert()
+        vscode_result = vscode.revert(state)
     except Exception as exc:  # noqa: BLE001 -- Preserve other revert operations on failure
         # VS Code's revert looks at the installed extension, not ug state, so a later run still finds it.
         print_warning(f"Could not revert VS Code: {exc}. Fix it, then run ug revert again.")
         vscode_result = "failed"
+    from ucode.agents.desktop.setup import revert_copilot_app
+
+    try:
+        copilot_app_result = revert_copilot_app()
+    except OSError as exc:
+        print_warning(f"Could not revert the GitHub Copilot app: {exc}. Run ug revert again.")
+        copilot_app_result = "failed"
 
     results: dict[str, bool] = {
         # Antigravity's skills.json is shared with its app and IDE extensions, so revert
@@ -2143,6 +2183,7 @@ def revert() -> int:
         else restore_file(spec["config_path"], spec["backup_path"], bool(managed_configs.get(tool)))
         for tool, spec in TOOL_SPECS.items()
     }
+    claude_agent.cleanup_auto_configuration(alias_targets=auto_targets)
     pi_settings_restored = restore_file(
         PI_SETTINGS_PATH, PI_SETTINGS_BACKUP_PATH, bool(managed_configs.get("pi"))
     )
@@ -2167,6 +2208,7 @@ def revert() -> int:
         print_kv("Published agent configuration settings", published_agent_config_result)
     print_kv("Pi settings", "restored" if pi_settings_restored else "unchanged")
     print_kv("VS Code extension", vscode_result)
+    print_kv("GitHub Copilot app", copilot_app_result)
     for client, spec in MCP_CLIENTS.items():
         print_kv(
             f"{spec['display']} MCP config",
@@ -3062,6 +3104,74 @@ def mcp_proxy_cmd(
     run_proxy(url, host, profile, use_pat, workspace_id)
 
 
+@app.command(
+    "copilot-seat-runtime",
+    hidden=True,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def copilot_seat_runtime_cmd(
+    ctx: typer.Context,
+    runtime: Annotated[str, typer.Option("--runtime", help="VS Code's bundled Copilot runtime.")],
+    provider: Annotated[
+        str, typer.Option("--provider", help="The GitHub Copilot seat relay service.")
+    ],
+    host: Annotated[str, typer.Option("--host", help="The workspace configure set up.")],
+    profile: Annotated[
+        str | None, typer.Option("--profile", help="The Databricks CLI profile configure used.")
+    ] = None,
+    workspace_id: Annotated[str | None, typer.Option("--workspace-id", hidden=True)] = None,
+    code: Annotated[
+        str | None,
+        typer.Option("--code", help="VS Code's `code` command, to find its current runtime."),
+    ] = None,
+) -> None:
+    """Run VS Code's Copilot runtime with its Copilot API calls through the seat relay, only while
+    ug is still configured for the workspace and profile VS Code was set up with."""
+    import sys
+    from contextlib import redirect_stdout
+
+    from ucode.agents import vscode as vscode_agent
+
+    # The runtime talks to VS Code over this process's stdio.
+    with redirect_stdout(sys.stderr):
+        state = load_state()
+        workspace = state.get("workspace")
+        if not workspace:
+            print("No workspace configured. Run `ug configure` first.", file=sys.stderr)
+            raise typer.Exit(1)
+        # Another workspace's state would send this one's prompts and GitHub token through it.
+        current_profile = state.get("profile")
+        if workspace.rstrip("/") != host.rstrip("/") or current_profile != profile:
+
+            def label(url: str, name: str | None) -> str:
+                return f"{url} (profile `{name}`)" if name else url
+
+            print(
+                f"VS Code's Copilot was set up for {label(host, profile)}, but ug is now "
+                f"configured for {label(workspace, current_profile)}. Run `ug configure --agents "
+                "copilot`, then restart VS Code.",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+        saved_workspace_id = next(iter(workspace_id_args(workspace)[1:]), None)
+        if workspace_id and saved_workspace_id not in (None, workspace_id):
+            print(
+                f"ug's saved configuration for {workspace} doesn't match the workspace ID VS Code's "
+                "Copilot was set up with. Run `ug configure --agents copilot`, then restart VS Code.",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+        if workspace_id:
+            pin(workspace, workspace_id)
+        if managed := load_managed_state(state_workspace_key(state)):
+            state = resolve_state(managed, state, "copilot")
+        apply_pat_environment(state)
+        returncode = copilot_agent.run_seat_runtime(
+            state, provider, vscode_agent.resolve_runtime(runtime, code), list(ctx.args)
+        )
+    raise typer.Exit(returncode)
+
+
 @app.command("cowork-hook", hidden=True)
 def cowork_hook_cmd(
     host: Annotated[str, typer.Option("--host", help="Configured workspace URL.")],
@@ -3101,6 +3211,9 @@ def claude_desktop_auth_cmd(
     claude_binary: Annotated[
         str | None, typer.Option("--claude-binary", help="Absolute Claude Code executable path.")
     ] = None,
+    use_pat: Annotated[
+        bool, typer.Option("--use-pat", help="Read the profile's static PAT instead of OAuth.")
+    ] = False,
 ) -> None:
     """Print a Desktop credential, allowing browser login only for interactive requests."""
     import sys
@@ -3112,6 +3225,11 @@ def claude_desktop_auth_cmd(
 
     try:
         with redirect_stdout(sys.stderr):
+            if use_pat and not ensure_pat_bearer(profile):
+                raise RuntimeError(
+                    f"Databricks profile `{profile}` has no personal access token. "
+                    "Add one, then start a new Cowork task."
+                )
             if relay:
                 if not claude_binary or not os.path.isabs(claude_binary):
                     raise RuntimeError("An absolute Claude Code executable path is required.")
@@ -3394,6 +3512,17 @@ def otel_proxy_cmd(
         raise typer.Exit(1) from None
 
 
+@app.command("copilot-app-restart", hidden=True)
+def copilot_app_restart_cmd(
+    target: Annotated[str, typer.Argument(help="The app to restart, as JSON from ug's plugin.")],
+) -> None:
+    """Restart the GitHub Copilot app once no chat in it is running a turn. ug's plugin for the
+    app starts this, detached, after it changed the app's Databricks models."""
+    from ucode.agents.desktop import copilot_app_restart
+
+    copilot_app_restart.main(target)
+
+
 @app.command("otel-headers", hidden=True)
 def otel_headers_cmd(
     host: Annotated[
@@ -3474,6 +3603,7 @@ def codex_router_hook_cmd(
     profile: Annotated[str | None, typer.Option("--profile")] = None,
     use_pat: Annotated[bool, typer.Option("--use-pat")] = False,
     model: Annotated[list[str] | None, typer.Option("--model")] = None,
+    provider: Annotated[str | None, typer.Option("--provider", hidden=True)] = None,
     workspace_id: Annotated[str | None, typer.Option("--workspace-id", hidden=True)] = None,
 ) -> None:
     """Run a Codex smart-routing lifecycle hook."""
@@ -3487,6 +3617,7 @@ def codex_router_hook_cmd(
     except (OSError, UnicodeError, ValueError):
         return
     enabled = smart_routing_v2.smart_routing_enabled(environment, default=False, agent=AGENT_CODEX)
+    show_subagent_model = smart_routing_config.subagent_model_visible(environment)
 
     from ucode.smart_routing.codex_routing import (
         is_spawn_agent_tool,
@@ -3509,7 +3640,7 @@ def codex_router_hook_cmd(
     if event == "record-subagent":
         record = record_subagent_start(payload)
         matched = record.get("matches_router_decision")
-        if matched is True:
+        if matched is True and show_subagent_model:
             sys.stdout.write(
                 json.dumps(
                     {
@@ -3545,6 +3676,8 @@ def codex_router_hook_cmd(
                 token=token,
                 available_models=model or [],
                 audit_decision=True,
+                show_notice=show_subagent_model,
+                **({"provider": provider} if provider else {}),
             )
     output = stamp_spawn(payload, enabled=enabled, output=output)
     if output is not None:
@@ -3565,31 +3698,88 @@ def smart_router_describe_cmd() -> None:
 def smart_router_logs_cmd(
     session: Annotated[str, typer.Option("--session")],
     decision: Annotated[str | None, typer.Option("--decision")] = None,
+    harness: Annotated[str, typer.Option("--harness")] = AGENT_CLAUDE,
+    output_format: Annotated[str, typer.Option("--format")] = "json",
+    record_route_validation: Annotated[
+        Path | None, typer.Option("--record-route-validation")
+    ] = None,
 ) -> None:
-    """Print a session's recorded smart-routing decisions as JSON on stdout."""
+    """Print a session's recorded smart-routing decisions as JSON, or a table with --format table."""
     from ucode.smart_routing import session_log
 
-    def emit(payload: dict[str, object]) -> None:
-        sys.stdout.write(json.dumps({"v": 1, **payload}) + "\n")
+    as_table = output_format == "table"
 
+    def fail(message: str) -> typer.Exit:
+        if as_table:
+            sys.stdout.write(f"error: {message}\n")
+        else:
+            sys.stdout.write(json.dumps({"v": 1, "error": message}) + "\n")
+        return typer.Exit(1)
+
+    if harness not in (AGENT_CLAUDE, AGENT_CODEX):
+        raise fail(f"unknown harness {harness!r}; expected {AGENT_CLAUDE} or {AGENT_CODEX}")
+    if output_format not in ("json", "table"):
+        raise fail(f"unknown format {output_format!r}; expected json or table")
+    if record_route_validation is not None:
+        try:
+            text = (
+                sys.stdin.read()
+                if str(record_route_validation) == "-"
+                else record_route_validation.read_text(encoding="utf-8")
+            )
+            result = json.loads(text)
+            if not isinstance(result, dict):
+                raise ValueError("expected a JSON object")
+            session_log.append_route_validation(harness, session, result)
+        except (OSError, ValueError) as exc:
+            raise fail(f"cannot record route validation: {exc}") from exc
+        sys.stdout.write(json.dumps({"v": 1}) + "\n")
+        return
     try:
-        records = session_log.read_decisions("claude", session)
+        records = session_log.read_history(harness, session)
     except OSError as exc:
-        emit(
-            {
-                "error": f"cannot read session log at "
-                f"{session_log.session_log_path('claude', session)}: {exc.strerror or exc}"
-            }
-        )
-        raise typer.Exit(1) from exc
+        raise fail(
+            f"cannot read session log at "
+            f"{session_log.session_log_path(harness, session)}: {exc.strerror or exc}"
+        ) from exc
+    if as_table and decision is not None:
+        try:
+            record = session_log.find_decision(records, decision)
+            render = (
+                session_log.render_validation_detail
+                if record.get("type") == session_log.ROUTE_VALIDATION_TYPE
+                else session_log.render_detail
+            )
+            output = render(record)
+        except (LookupError, ValueError) as exc:
+            raise fail(str(exc)) from exc
+        sys.stdout.write(output + "\n")
+        return
+    if as_table:
+        sys.stdout.write(session_log.render_table(records) + "\n")
+        return
     if decision is None:
-        emit({"decisions": [session_log.overview(record) for record in records]})
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "v": 1,
+                    "decisions": [
+                        session_log.overview(r)
+                        for r in records
+                        if r.get("type") == session_log.DECISION_TYPE
+                    ],
+                    "route_validations": [
+                        r for r in records if r.get("type") == session_log.ROUTE_VALIDATION_TYPE
+                    ],
+                }
+            )
+            + "\n"
+        )
         return
     record = next((r for r in records if r.get("decision_id") == decision), None)
     if record is None:
-        emit({"error": "decision not found"})
-        raise typer.Exit(1)
-    emit({"decision": record})
+        raise fail("decision not found")
+    sys.stdout.write(json.dumps({"v": 1, "decision": record}) + "\n")
 
 
 @app.command("claude-router-hook", hidden=True)
@@ -3609,8 +3799,10 @@ def claude_router_hook_cmd(
     import json
     import sys
 
-    if not smart_routing_v2.smart_routing_enabled(
-        effective_environment(agent=AGENT_CLAUDE), default=False, agent=AGENT_CLAUDE
+    environment = effective_environment(agent=AGENT_CLAUDE)
+    # The toggle validates while the session controls still keep routing off.
+    if event != ROUTE_VALIDATION_MOD_EVENT and not smart_routing_v2.smart_routing_enabled(
+        environment, default=False, agent=AGENT_CLAUDE
     ):
         return
 
@@ -3652,7 +3844,7 @@ def claude_router_hook_cmd(
     if event == "record-subagent":
         record = record_subagent_start(payload)
         matched = record.get("matches_router_decision")
-        if matched is True:
+        if matched is True and smart_routing_config.subagent_model_visible(environment):
             sys.stdout.write(
                 json.dumps(
                     {
@@ -3670,10 +3862,19 @@ def claude_router_hook_cmd(
         # When matched is None the harness didn't report the subagent model —
         # routing already injected the selected model, so emit nothing.
         return
-    if event not in {"route-subagent", ROUTE_SUBAGENT_MOD_EVENT} or not host:
+    if (event != "route-subagent" and event not in MOD_EVENTS) or not host:
         return
     token = _router_hook_token(host, profile, use_pat)
     if not token:
+        return
+    if event == ROUTE_VALIDATION_MOD_EVENT:
+        result = smart_routing_v2.validate_claude_model_list(
+            workspace=host,
+            token=token,
+            available_models=model or [],
+            provider=provider,
+        )
+        sys.stdout.write(json.dumps(result))
         return
     output = smart_routing_v2.route_claude_subagent(
         payload,
@@ -3740,44 +3941,67 @@ def _smart_routing_v2_flag(enabled: bool | None, *, agent: str) -> Iterator[bool
 
     Yields whether the flag or a known version already chose this launch's routing.
     """
-    routing_chosen = enabled is not None or smart_routing_config.known_version()
-    previous = (
-        smart_routing_v2.apply_config(agent=agent)
-        if enabled is None
-        else smart_routing_v2.override_smart_routing(enabled, agent=agent)
-    )
-    try:
-        yield routing_chosen
-    finally:
-        smart_routing_v2.restore_smart_routing_env(previous)
+    with smart_routing_config.version_scope():
+        routing_chosen = enabled is not None or smart_routing_config.known_version()
+        previous = (
+            smart_routing_v2.apply_config(agent=agent)
+            if enabled is None
+            else smart_routing_v2.override_smart_routing(enabled, agent=agent)
+        )
+        try:
+            yield routing_chosen
+        finally:
+            smart_routing_v2.restore_smart_routing_env(previous)
 
 
-def _toggle_current_smart_routing_session(enabled: bool | None, reason: str | None = None) -> bool:
+# Omnigent matches these replies exactly; update Omnigent if either changes.
+_SMART_ROUTER_STATE_REPLY = "Smart Router is {state} for this session"
+_SMART_ROUTER_UNCHANGED_REPLY = "Smart Router is already {state} for this session"
+
+
+def _toggle_current_smart_routing_session(
+    enabled: bool | None,
+    reason: str | None = None,
+    *,
+    agent: str,
+    feedback_collected: bool = False,
+) -> bool:
     if enabled is None:
         return False
     try:
         controls = session_env_path()
     except RuntimeError:
         return False
+    from ucode.smart_routing.feedback import smart_router_feedback_required
     from ucode.smart_routing.session_env import session_routing_enabled
 
+    state = "on" if enabled else "off"
     try:
         unchanged = session_routing_enabled(controls) == enabled
     except (OSError, UnicodeError, ValueError):
         unchanged = False
     if unchanged:
-        print_success(f"Smart Router is already {'on' if enabled else 'off'} for this session")
+        print_success(_SMART_ROUTER_UNCHANGED_REPLY.format(state=state))
         return True
+    # Claude's mod checks this marker itself before it runs a plain off.
     if (
-        not enabled
-        and env_bool(ISAAC_SMART_ROUTER_FEEDBACK_ENV_VAR)
-        and os.environ.get(ISAAC_LAUNCH_MODE_ENV_VAR) != "omni"
-        and len((reason or "").strip()) < 16
+        agent == AGENT_CODEX
+        and not enabled
+        and not feedback_collected
+        and os.environ.get(ISAAC_LAUNCH_MODE_ENV_VAR) == ISAAC_OMNI_LAUNCH_MODE
     ):
         print_err(
+            "Smart Router is still on. To turn it off, open Omnigent's model menu in this "
+            "session's message composer and switch off Smart Routing."
+        )
+        raise typer.Exit(2)
+    feedback_required = not enabled and smart_router_feedback_required()
+    if feedback_required and len((reason or "").strip()) < 16:
+        print_err(
             "Turning Smart Router off requires a reason of at least 16 characters, excluding "
-            "surrounding whitespace. Ask the user why, then pass their reason with "
-            "--smart-router-feedback and submit it through /isaac-feedback --category smart-routing."
+            "surrounding whitespace. Use the Smart Router skill to collect and submit feedback, "
+            "or pass a reason with --smart-router-feedback to toggle routing directly. "
+            "The direct CLI command does not submit feedback."
         )
         raise typer.Exit(2)
     try:
@@ -3786,7 +4010,7 @@ def _toggle_current_smart_routing_session(enabled: bool | None, reason: str | No
         metrics.failure(metrics.COMMAND_OPERATION, exc)
         print_err(str(exc))
         raise typer.Exit(1) from None
-    print_success(f"Smart Router is {'on' if enabled else 'off'} for this session")
+    print_success(_SMART_ROUTER_STATE_REPLY.format(state=state))
     return True
 
 
@@ -4051,15 +4275,17 @@ def _should_launch_smart_routing(
 
 
 def _smart_routing_launch_shape(tool: str, tool_args: list[str], explicit_prompt: bool) -> bool:
-    """Whether the forwarded arguments represent an interactive launch."""
+    """Whether the forwarded arguments represent an interactive launch or Codex's app-server."""
     if not tool_args or explicit_prompt:
         return True
+    if tool == AGENT_CODEX:
+        return is_codex_interactive_launch(tool_args) or is_codex_app_server_launch(tool_args)
     return tool == "claude" and tool_args[0].startswith("-")
 
 
 def _smart_routing_supported(tool: str, provider: str | None) -> bool:
     """Whether smart routing supports this agent and provider combination."""
-    return not provider or tool == "claude"
+    return not provider or tool in {AGENT_CLAUDE, AGENT_CODEX}
 
 
 def _routes_launch(
@@ -4077,7 +4303,6 @@ def _routes_launch(
         smart_routing_enabled
         # Only Claude Code and Codex currently support smart routing.
         and tool in CAN_USE_CACHED_CONFIG_AGENTS
-        # Model Provider Services are supported for Claude only.
         and _smart_routing_supported(tool, provider)
         # Route a supported interactive launch shape.
         and _should_launch_smart_routing(
@@ -4161,6 +4386,103 @@ def _get_catalog_profile(state: dict) -> str | None:
     return state.get("profile")
 
 
+@dataclass
+class _SpeculativePickerCatalog:
+    """The picker catalog fetch started before `configure_shared_state`, with the launch
+    identity it was fetched for: `result` drops it when configure resolved a different
+    workspace, workspace id, or catalog profile."""
+
+    future: Future[AnthropicModelCatalog]
+    workspace: str
+    workspace_id: str | None
+    profile: str | None
+    catalog_kwargs: dict[str, str | None]
+
+    @classmethod
+    def start(
+        cls, state: dict, profile: str | None, **catalog_kwargs: str | None
+    ) -> _SpeculativePickerCatalog:
+        workspace = state["workspace"]
+
+        def fetch() -> AnthropicModelCatalog:
+            # The undecorated fetch: a failure here is reported by the join's fallback
+            # handler, not double-counted as a hard token-fetch failure, and a success adds
+            # no second databricks_token_fetch duration observation. Only the plain
+            # ``databricks auth token`` call runs — no ``auth login``, no browser, nothing
+            # that can prompt — so the main thread never waits on it and a failure never
+            # doubles configure's own fetch. Its exception rides the future; the join site
+            # falls back to the serial fetch on the live token.
+            token = fetch_databricks_token_untimed(workspace, profile)
+            return list_anthropic_model_catalog(workspace, token, **catalog_kwargs)
+
+        return cls(
+            _start_in_background(fetch),
+            workspace,
+            state.get("workspace_id"),
+            profile,
+            catalog_kwargs,
+        )
+
+    def result(
+        self, state: dict, catalog_profile: str | None, **catalog_kwargs: str | None
+    ) -> AnthropicModelCatalog | None:
+        """The speculative catalog result when its identity and catalog scope still match
+        and it succeeded; None sends the caller to the serial fetch with the live token."""
+        if (self.workspace, self.workspace_id, self.profile, self.catalog_kwargs) != (
+            state["workspace"],
+            state.get("workspace_id"),
+            catalog_profile,
+            catalog_kwargs,
+        ):
+            return None
+        try:
+            speculative = self.future.result()
+        except DatabricksLoginRequiredError:
+            # An expected no-reauth miss: the CLI has no usable cached credentials, and
+            # configure's auth step performs the login, so the serial fetch rides the
+            # repaired token without reporting this as a launch failure.
+            return None
+        except Exception as exc:
+            # The speculation is best effort: a failed background token or catalog fetch
+            # falls back to the serial fetch on the live token, never fails the launch.
+            # The raised exception can only come from the non-interactive token fetch (the
+            # catalog call reports failures via error_msg instead).
+            metrics.failure(
+                metrics.DATABRICKS_TOKEN_FETCH_OPERATION, exc, continued_with_fallback=True
+            )
+            return None
+        error = speculative.error_msg
+        if error and looks_like_definitive_auth_failure(error):
+            # The token the speculation rode is definitively rejected (a 401, an
+            # invalid-token 400, an invalid-access-token 403) and configure's auth step may
+            # have repaired it; refetch with the live token.
+            metrics.failure(metrics.MODELS_LIST_OPERATION, error, continued_with_fallback=True)
+            return None
+        # Any other error (a plain 403, a transient error) would fail a live-token fetch the
+        # same way, so use the speculative result instead of doubling the request.
+        return speculative
+
+
+def _picker_catalog(
+    speculation: _SpeculativePickerCatalog | None,
+    state: dict,
+    profile: str | None,
+    scope: dict[str, str | None],
+) -> AnthropicModelCatalog:
+    """The speculative picker catalog when its identity and scope still match, else the
+    serial fetch on the live token — one join-then-fallback for every reader."""
+    picker_catalog = speculation.result(state, profile, **scope) if speculation else None
+    if picker_catalog is None:
+        token = get_databricks_token(state["workspace"], profile)
+        picker_catalog = list_anthropic_model_catalog(
+            state["workspace"],
+            token,
+            **scope,
+        )
+    return picker_catalog
+
+
+@smart_routing_config.version_scope()
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
@@ -4362,6 +4684,57 @@ def _launch_tool(
             and (managed is None or managed_provider or managed_parent_schema)
         ):
             os.environ[claude_agent.GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
+        # The Anthropic picker catalog depends only on inputs settled above, so start it
+        # speculatively here and overlap it with the probe and discovery that
+        # `configure_shared_state` runs. A launch shape whose routing wouldn't read the catalog
+        # abandons the request on its daemon thread.
+        picker_catalog_speculation: _SpeculativePickerCatalog | None = None
+        launch_only_auto_picker = (
+            tool == AGENT_CLAUDE
+            and smart_routing_config.auto_mode_enabled()
+            and not smart_routing_v2.claude_print_mode(ctx.args)
+            and _routes_launch(
+                tool,
+                ctx.args,
+                smart_routing_enabled=smart_routing_enabled,
+                explicit_prompt=explicit_prompt,
+                model=model or forwarded_model,
+                provider=provider,
+            )
+        )
+        unmanaged_picker_catalog = (
+            tool == "claude"
+            and managed is None
+            and not provider
+            and not parent_schema
+            and family_defaults is None
+            and not launch_only_auto_picker
+        )
+        # A claude launch whose source is a Unity Catalog location — managed or
+        # developer-selected — always reads the picker catalog: this gate speculates it and
+        # `should_fetch_claude_picker_catalog` below joins it, so derive both from this one
+        # rule. Provider launches resolve their service first: a relayed one skips this
+        # catalog (`relayed` below), and that's only known after a lookup, so only a source
+        # that never relays — a Unity Catalog location — starts the catalog here.
+        claude_uc_picker_catalog = tool == "claude" and bool(
+            managed_parent_schema or (managed is None and bool(parent_schema))
+        )
+        scoped_picker_catalog = claude_uc_picker_catalog and not provider
+        # The catalog scope of the launch's source — empty for an unmanaged launch — is one
+        # dict for the speculation's start and join checks and the serial fallbacks, so the
+        # check is meaningful and the fetches cannot drift.
+        picker_catalog_scope: dict[str, str | None]
+        if provider:
+            picker_catalog_scope = {"provider": provider}
+        elif parent_schema:
+            picker_catalog_scope = {"parent_schema": parent_schema}
+        else:
+            picker_catalog_scope = {}
+        if unmanaged_picker_catalog or scoped_picker_catalog:
+            picker_catalog_speculation = _SpeculativePickerCatalog.start(
+                state, _get_catalog_profile(state), **picker_catalog_scope
+            )
+
         state = configure_shared_state(
             state["workspace"],
             profile=state.get("profile"),
@@ -4458,6 +4831,29 @@ def _launch_tool(
                 if authored:
                     provider_models = authored
                     coding_agent_config_defaults = authored
+        if tool == AGENT_CODEX and managed_smart_routing_applies:
+            if relayed:
+                routing_unavailable = (
+                    "Smart routing is unavailable with a ChatGPT subscription relay."
+                )
+            else:
+                try:
+                    routing_unavailable = codex_agent.minimum_version_error(
+                        smart_routing_enabled=True
+                    )
+                    if routing_unavailable:
+                        ensure_minimum_version(
+                            "codex",
+                            lambda: codex_agent.minimum_version_error(smart_routing_enabled=True),
+                        )
+                        routing_unavailable = None
+                except RuntimeError as exc:
+                    routing_unavailable = str(exc)
+            if routing_unavailable:
+                print_warning(f"{routing_unavailable} Running without smart routing.")
+                smart_routing_enabled = False
+                managed_smart_routing_applies = False
+                previous = {**smart_routing_v2.disable_smart_routing(), **previous}
         if tool == AGENT_CLAUDE and not provider and not parent_schema:
             # A static model list (no provider) can still name a model service that routes to a
             # subscription relay; that launch must swap credentials like a relayed provider.
@@ -4467,8 +4863,9 @@ def _launch_tool(
             tool == "claude"
             and not relayed
             and (
-                bool(managed_parent_schema or managed_provider)
-                or (managed is None and bool(explicit_provider or parent_schema))
+                claude_uc_picker_catalog
+                or bool(managed_provider)
+                or (managed is None and bool(explicit_provider))
                 or (
                     bool(provider)
                     and _routes_launch(
@@ -4483,11 +4880,8 @@ def _launch_tool(
             )
         )
         if should_fetch_claude_picker_catalog:
-            token = get_databricks_token(state["workspace"], catalog_profile)
-            picker_catalog = list_anthropic_model_catalog(
-                state["workspace"],
-                token,
-                **({"provider": provider} if provider else {"parent_schema": parent_schema}),
+            picker_catalog = _picker_catalog(
+                picker_catalog_speculation, state, catalog_profile, picker_catalog_scope
             )
             error = picker_catalog.error_msg
             if error:
@@ -4593,16 +4987,10 @@ def _launch_tool(
             route_root_model = None
         # List the gateway's models in ug's own /model picker so GPT rows get the `[1m]` hint.
         # Claude Code's own discovery lists them without it, so they would run at 200K.
-        if (
-            tool == "claude"
-            and managed is None
-            and not provider
-            and not parent_schema
-            and family_defaults is None
-        ):
-            discovered = list_anthropic_model_catalog(
-                state["workspace"],
-                get_databricks_token(state["workspace"], catalog_profile),
+        # launch_only_auto_picker was settled above, where the speculative catalog started.
+        if unmanaged_picker_catalog:
+            discovered = _picker_catalog(
+                picker_catalog_speculation, state, catalog_profile, picker_catalog_scope
             )
             if discovered.model_ids:
                 picker_catalog = claude_agent.default_model_picker_catalog(
@@ -4644,7 +5032,7 @@ def _launch_tool(
             # Claude re-adds an out-of-catalog saved model to /model even when built-ins are
             # replaced. Keep the catalog launch-scoped and leave the user's settings alone.
             state["_claude_launch_picker_models"] = picker_catalog.model_ids
-            if managed is None and (explicit_provider or parent_schema) and not model:
+            if managed is None and (provider or parent_schema) and not model:
                 # The permanent Default row should also resolve within the selected catalog.
                 state["_claude_launch_default_model"] = (
                     claude_agent.default_model(
@@ -4782,7 +5170,11 @@ def _has_explicit_prompt(ctx: typer.Context) -> bool:
     if not isinstance(suffix, tuple):
         return False
     suffix_args = list(suffix)
-    return ctx.args == suffix_args and len(suffix_args) <= 1
+    return (
+        ctx.args == suffix_args
+        and len(suffix_args) <= 1
+        and (not suffix_args or not suffix_args[0].startswith("-"))
+    )
 
 
 @app.callback(invoke_without_command=True)
@@ -4974,29 +5366,34 @@ def codex_cmd(
         str | None,
         typer.Option("--scopes", hidden=True, help="Comma-separated custom OAuth scopes."),
     ] = None,
-    # Hidden while Codex is unrouted by default; the Smart Router skill still toggles with them.
     enable_smart_routing: Annotated[
         bool,
-        typer.Option("--enable-smart-routing", hidden=True),
+        typer.Option("--enable-smart-routing", help="Enable smart routing for this session."),
     ] = False,
     disable_smart_routing: Annotated[
         bool,
-        typer.Option("--disable-smart-routing", hidden=True),
+        typer.Option("--disable-smart-routing", help="Disable smart routing for this session."),
     ] = False,
     smart_router_feedback: Annotated[
         str | None,
         typer.Option("--smart-router-feedback", hidden=True),
     ] = None,
+    feedback_collected: Annotated[
+        bool,
+        typer.Option("--feedback-collected", hidden=True),
+    ] = False,
 ) -> None:
-    """Launch Codex via Databricks.
-
-    Smart Routing is currently only supported for the Claude Code harness.
-    """
+    """Launch Codex via Databricks."""
     # Both flags cancel out: the launch behaves as if neither was passed.
     enable_smart_routing_flag = (
         None if enable_smart_routing == disable_smart_routing else enable_smart_routing
     )
-    if _toggle_current_smart_routing_session(enable_smart_routing_flag, smart_router_feedback):
+    if _toggle_current_smart_routing_session(
+        enable_smart_routing_flag,
+        smart_router_feedback,
+        agent=AGENT_CODEX,
+        feedback_collected=feedback_collected,
+    ):
         return
     try:
         custom_oauth = _custom_oauth_config(client_id, redirect_url, scopes)
@@ -5099,7 +5496,9 @@ def claude_cmd(
     ] = None,
 ) -> None:
     """Launch Claude Code via Databricks."""
-    if _toggle_current_smart_routing_session(enable_smart_routing_flag, smart_router_feedback):
+    if _toggle_current_smart_routing_session(
+        enable_smart_routing_flag, smart_router_feedback, agent=AGENT_CLAUDE
+    ):
         return
     try:
         custom_oauth = _custom_oauth_config(client_id, redirect_url, scopes)
@@ -5449,6 +5848,16 @@ def configure(
             "choice (off by default).",
         ),
     ] = None,
+    tls_trust_store: Annotated[
+        str | None,
+        typer.Option(
+            "--tls-trust-store",
+            help="Certificates ug's own HTTPS requests trust: 'os' (the operating system's "
+            "trust store, the default, which includes a TLS-inspection proxy's root) or "
+            "'python' (Python's certificate chain). Saved for later `ug` commands; "
+            "UG_TLS_TRUST_STORE overrides it. Omit to keep the saved choice.",
+        ),
+    ] = None,
     provider: Annotated[
         str | None,
         typer.Option(
@@ -5465,7 +5874,7 @@ def configure(
             "--model-location",
             help="Discover models from a Unity Catalog schema (`<catalog>.<schema>`, e.g. "
             "main.default) instead of system.ai. Applies with --agent or --agents for claude, "
-            "codex, or copilot (Copilot CLI and VS Code). Cannot be combined with --provider.",
+            "codex, or copilot (Copilot CLI, VS Code and app). Cannot be combined with --provider.",
         ),
     ] = None,
     no_vscode: Annotated[
@@ -5476,6 +5885,15 @@ def configure(
             "Copilot Chat in VS Code.",
         ),
     ] = False,
+    vscode_code: Annotated[
+        str | None,
+        typer.Option(
+            "--vscode-code",
+            hidden=True,
+            help="The desktop VS Code's `code` command to set up, when the one ug finds is "
+            "another product's. `UG_VSCODE_CODE` does the same for every run.",
+        ),
+    ] = None,
     mcp: Annotated[
         str | None,
         typer.Option(
@@ -5549,6 +5967,8 @@ def configure(
         raise typer.Exit(2)
     set_dry_run(dry_run)
     set_verbosity(verbose)
+    if tls_trust_store is not None:
+        _configure_tls_trust_store(tls_trust_store)
     if from_file is not None and not (global_scope and dry_run):
         print_err("--from-file previews a draft, so it requires --global --dry-run.")
         raise typer.Exit(2)
@@ -5591,8 +6011,11 @@ def configure(
                     return
         claude_agent.request_explicit_configure()
         request_explicit_managed_writes()
+        if not claude_agent.auto_configuration_enabled():
+            claude_agent.cleanup_auto_configuration()
         codex_agent.request_explicit_configure()
         request_vscode_with_copilot(not no_vscode)
+        request_vscode_code(vscode_code)
         custom_oauth = _custom_oauth_config(client_id, redirect_url, scopes)
         if custom_oauth is not None and use_pat:
             raise RuntimeError("--client-id cannot be combined with --use-pat.")
@@ -5938,6 +6361,22 @@ def _configure_global_from_agent_config(
                 ) from exc
             # The preview still shows the files, with this installation's paths in them.
             print_warning(f"A real run would stop here: {exc}")
+        if not claude_agent.auto_configuration_enabled():
+            try:
+                claude_agent.cleanup_auto_configuration()
+            except RuntimeError as exc:
+                raise published_agent_config.ManagedRunError(
+                    published_agent_config.EXIT_WRITE, str(exc)
+                ) from exc
+        enabled = normalize_managed_config(raw).get("enabled_agents") or {}
+        if not dry_run and from_file is None:
+            # Install missing enabled agents as the merge does, before the build checks versions.
+            for tool_name in selected:
+                if tool_name in enabled:
+                    try:
+                        install_tool_binary(tool_name, strict=False)
+                    except RuntimeError as exc:
+                        print_warning(str(exc))
         published_agent_config.run(
             key=key,
             raw=raw,
@@ -5947,7 +6386,6 @@ def _configure_global_from_agent_config(
             profile=profile,
             token=token,
         )
-        enabled = normalize_managed_config(raw).get("enabled_agents") or {}
         if from_file is None and "claude" in selected:
             if "claude" in enabled:
                 # Best effort, as before: a Desktop failure warns without failing the run. A dry
@@ -6191,6 +6629,7 @@ def upgrade_cmd() -> None:
     try:
         result = subprocess_cross_os.run(
             ["uv", "tool", "install", "--reinstall", upgrade_requirement],
+            env=tls.uv_environment(),
             check=False,
             capture_output=True,
             text=True,
@@ -6207,6 +6646,7 @@ def upgrade_cmd() -> None:
                 legacy_removed = True
                 subprocess_cross_os.run(
                     ["uv", "tool", "install", "--force", git_url],
+                    env=tls.uv_environment(),
                     check=True,
                 )
                 migrated = True
@@ -6305,7 +6745,26 @@ def _verify_upgraded_commands() -> None:
             )
 
 
+def _configure_tls_trust_store(requested: str) -> None:
+    """Save ``--tls-trust-store`` and switch this run to it before its first request."""
+    trust_store = requested.strip().lower()
+    if trust_store not in tls.TRUST_STORES:
+        print_err(f"--tls-trust-store must be one of: {', '.join(tls.TRUST_STORES)}.")
+        raise typer.Exit(2)
+    tls.save_trust_store(trust_store)
+    override = os.environ.get(tls.TRUST_STORE_ENV_VAR, "").strip().lower()
+    if override in tls.TRUST_STORES and override != trust_store:
+        print_warning(
+            f"{tls.TRUST_STORE_ENV_VAR}={override} overrides the saved TLS trust store "
+            f"'{trust_store}' while it is set."
+        )
+        return
+    tls.apply(trust_store)
+
+
 def main() -> None:
+    # `python -m ucode.cli` wrappers (Desktop MDM, the smart-router skill) skip the entry point.
+    tls.apply()
     app()
 
 

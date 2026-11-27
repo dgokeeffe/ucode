@@ -20,6 +20,7 @@ import copy
 import json
 import subprocess
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -197,11 +198,14 @@ def claude_ug_values(
             env.pop(entry.path[1], None)
     # Set per launch (smart routing), never in the managed file.
     env.pop("ANTHROPIC_MODEL", None)
-    # Blank provider switches keep developers from routing around the gateway.
-    env["CLAUDE_CODE_USE_BEDROCK"] = ""
-    env["CLAUDE_CODE_USE_VERTEX"] = ""
     if mcp_entries:
         overlay[claude_agent.MANAGED_MCP_SETTINGS_KEY] = dict(mcp_entries)
+    # The recipe mod carries the smart-router recipe from the policy tier, which Claude's guard
+    # reserves the extra body to on releases that seat it; per-launch headers stay out. Compose
+    # merges the admin's own `prependPlugins` entries in ahead of these without duplicating either.
+    root = claude_agent.claude_header_mod_root()
+    if root is not None:
+        claude_agent.enable_managed_mods(overlay, root, (claude_agent.CLAUDE_ROUTER_MOD_ID,))
     return overlay
 
 
@@ -236,12 +240,20 @@ def build_claude(
         ug_values[claude_agent.CLAUDE_ALLOWED_MCP_SERVERS_KEY] = [
             {"serverName": name} for name in sorted(names)
         ]
-    return ownership.compose(
+    composed = ownership.compose(
         ownership.load_table("claude").section("managed_settings"),
         native=native,
         ug_values=ug_values,
         features=agent_features(manifest, "claude"),
     )
+    if not claude_agent.auto_configuration_enabled():
+        from ucode.agents.claude_auto import remove_auto_configuration
+
+        try:
+            composed.doc = remove_auto_configuration(composed.doc)
+        except ValueError as exc:
+            raise ManagedRunError(EXIT_USAGE, f"Cannot remove Claude Auto settings: {exc}") from exc
+    return composed
 
 
 def _codex_identity(entry: dict) -> dict:
@@ -337,7 +349,11 @@ def _codex_static_models(manifest: dict) -> list[str] | None:
 
 
 def _codex_catalog_files(
-    manifest: dict, previous_paths: set[str], warnings: list[str]
+    manifest: dict,
+    previous_paths: set[str],
+    warnings: list[str],
+    workspace: str,
+    get_token: Callable[[], str] | None,
 ) -> dict[Path, str | None]:
     """The model catalog and the ``managed_config.toml`` that names it, or their removal.
 
@@ -356,7 +372,9 @@ def _codex_catalog_files(
             )
             return {}
         try:
-            catalog = prepare_codex_catalog(codex_agent.SPEC["binary"], static)
+            catalog = prepare_codex_catalog(
+                codex_agent.SPEC["binary"], static, workspace=workspace, get_token=get_token
+            )
         except RuntimeError as exc:
             raise ManagedRunError(EXIT_USAGE, f"Codex: {exc}") from exc
         if legacy is not None:
@@ -419,6 +437,13 @@ def _written_paths(plan: AgentPlan) -> list[Path]:
     """The files ``plan`` writes, references before the files they name, so removing them in this
     order never leaves a dangling reference."""
     paths = [path for path, text in plan.files.items() if text is not None]
+    if plan.agent == "claude":
+        # The settings name the mods' plugins, so they leave first: a removal that fails partway
+        # leaves settings referencing files still on disk, never settings without their plugins.
+        settings = next((path for path in agent_paths("claude") if path in paths), None)
+        if settings is not None:
+            paths.remove(settings)
+            paths.insert(0, settings)
     if CODEX_MANAGED_CATALOG_PATH in paths:
         paths.remove(CODEX_MANAGED_CATALOG_PATH)
         paths.append(CODEX_MANAGED_CATALOG_PATH)
@@ -433,6 +458,7 @@ def plan_agents(
     previous_state: dict | None,
     *,
     claude_mcp_names: set[str] | None = None,
+    get_token: Callable[[], str] | None = None,
 ) -> list[AgentPlan]:
     previously_written = set(((previous_state or {}).get("agents") or {}).keys())
     enabled = manifest.get("enabled_agents") or {}
@@ -457,6 +483,12 @@ def plan_agents(
                 manifest, workspace, mcp_entries.get("claude"), claude_mcp_names
             )
             path = agent_paths("claude")[0]
+            # The recipe mod's files, installed before the settings that name them: the managed
+            # run is the only writer this machine has, and the guard denies the session mod's own
+            # recipe write on Claude releases that seat it.
+            mod_root = claude_agent.claude_header_mod_root()
+            if mod_root is not None:
+                plan.files.update(claude_agent.managed_mod_files(mod_root))
             plan.files[path] = claude_agent._dump_managed_settings(composed.doc)
             plan.reports.append((path, composed))
             tracing_paths = {
@@ -487,7 +519,9 @@ def plan_agents(
             previous_paths = set(
                 (((previous_state or {}).get("agents") or {}).get("codex") or {}).get("paths") or []
             )
-            plan.files.update(_codex_catalog_files(manifest, previous_paths, plan.warnings))
+            plan.files.update(
+                _codex_catalog_files(manifest, previous_paths, plan.warnings, workspace, get_token)
+            )
             version_warning = _codex_version_warning()
             if version_warning:
                 plan.warnings.append(version_warning)
@@ -788,7 +822,13 @@ def run(
 
     try:
         plans = plan_agents(
-            manifest, host, agents, mcp_entries, previous, claude_mcp_names=claude_mcp_names
+            manifest,
+            host,
+            agents,
+            mcp_entries,
+            previous,
+            claude_mcp_names=claude_mcp_names,
+            get_token=(lambda: token) if token is not None else None,
         )
     except ValueError as exc:
         raise ManagedRunError(EXIT_USAGE, str(exc)) from exc

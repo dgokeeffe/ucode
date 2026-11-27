@@ -15,8 +15,12 @@ from uuid import uuid4
 
 import pytest
 from session import Session, install_header_mod
+from test_credentials import _STREAM
 
 from ucode.agents.claude import _enable_header_mod
+from ucode.agents.claude_auto import apply_auto_context_windows, auto_variant
+from ucode.constants import SMART_ROUTING_ENV_KEYS
+from ucode.databricks import AnthropicModelCatalog
 from ucode.smart_routing import config, orchestrator, session_env
 from ucode.smart_routing.v2 import (
     _claude_mod_launch_options,
@@ -67,6 +71,25 @@ def test_header_mod_validation_and_merge(native_binary, tmp_path):
             assert "CLAUDE_CODE_GATEWAY_HINT_HEADERS" not in writes
 
 
+def test_recipe_mod_validation_and_merge(native_binary, tmp_path):
+    from ucode.agents.claude import CLAUDE_ROUTER_MOD_NAME
+
+    plugin = install_header_mod(tmp_path) / CLAUDE_ROUTER_MOD_NAME
+    shutil.copytree(Path(__file__).with_name("recipe_mod_tests"), plugin / "tests")
+    for command in ("validate", "test"):
+        result = subprocess.run(
+            [native_binary, "plugin", command, str(plugin)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        if command == "validate":
+            writes = next(line for line in result.stdout.splitlines() if "env writes:" in line)
+            assert "CLAUDE_CODE_EXTRA_BODY" in writes
+            assert "ANTHROPIC_BASE_URL" not in writes
+
+
 def test_native_options_are_launch_local(native_binary, tmp_path):
     env = {
         "SMART_ROUTER_CONFIG_VERSION": config.SUBAGENT_ORCH_V0_CLAUDE_ONLY,
@@ -76,9 +99,51 @@ def test_native_options_are_launch_local(native_binary, tmp_path):
         Session(native_binary, tmp_path / "a", env) as a,
         Session(native_binary, tmp_path / "b", {}) as b,
     ):
-        assert a.observe()["options"] == _claude_mod_launch_options(env)
-        assert b.observe()["options"] == _claude_mod_launch_options({})
+        assert a.observe()["options"] == {
+            **_claude_mod_launch_options(env),
+            "autoPicker": "",
+            "validateCommand": [],
+        }
+        assert b.observe()["options"] == {
+            **_claude_mod_launch_options({}),
+            "autoPicker": "",
+            "validateCommand": [],
+        }
         assert not (a.plugin / "hooks/launch.json").exists()
+
+
+def test_managed_recipe_mod_owns_the_extra_body_write(native_binary, tmp_path):
+    """The managed policy-tier mod carries the recipe; the session mod never touches the body.
+
+    Inference deliberately fails without credentials; this checks the serialized environment
+    the gateway would read, not a model response.
+    """
+    env = {
+        "ENABLE_SMART_ROUTING_V2": "0",
+        "ENABLE_SMART_ROUTING_SUBAGENT_ONLY": "1",
+        "SMART_ROUTER_NAME": "task_v3",
+        "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
+    }
+    controls = session_env.start_session(env)
+    try:
+        with Session(native_binary, tmp_path / "routed", env) as session:
+            assert session.observe()["body"] == {
+                "caller_field": "keep",
+                "smart_router_recipe_name": "task_v3",
+            }
+            for action, recipe in (("off", "DISABLED"), ("on", "task_v3")):
+                assert (
+                    f"Smart Router is {action}" in session.send(f"/smart-router {action}")["result"]
+                )
+                # A turn applies the managed mod's write before the next request, as it does
+                # for the header mod's variables.
+                session.send("Reply OK.", expect_error=True)
+                assert session.observe()["body"] == {
+                    "caller_field": "keep",
+                    "smart_router_recipe_name": recipe,
+                }
+    finally:
+        shutil.rmtree(controls.parent)
 
 
 def test_orchestrator_instructions_follow_native_toggles(native_binary, tmp_path):
@@ -214,6 +279,83 @@ def test_marked_omni_off_turns_routing_off_without_the_feedback_form(native_bina
         shutil.rmtree(controls.parent)
 
 
+def test_auto_manual_startup_with_feedback_stays_off_on_next_turn(native_binary, tmp_path):
+    """Initialize a regular model with feedback required, then submit a main turn.
+
+    Routing stays off without a feedback-gated disable. Inference deliberately fails
+    without credentials; this checks native startup/next-turn state, not a live answer.
+    """
+
+    env = {
+        "ENABLE_SMART_ROUTING_V2": "0",
+        "ENABLE_SMART_ROUTING_SUBAGENT_ONLY": "1",
+        "SMART_ROUTER_CONFIG_VERSION": config.SUBAGENT_AUTO_V0_CLAUDE_ONLY,
+        "ISAAC_SMART_ROUTER_FEEDBACK": "1",
+        "ISAAC_LAUNCH_MODE": "cli",
+        "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
+    }
+    controls = session_env.start_session(env)
+    # Fresh Auto launches initialize OFF until the native selected model is known.
+    controls.write_text(json.dumps(dict.fromkeys(SMART_ROUTING_ENV_KEYS, "0")))
+    auto = {
+        "model": "ug-auto-sonnet",
+        "mainModel": "claude-sonnet-4-6",
+        "description": "Auto",
+        "storeKey": "test-main",
+        "models": [
+            {"model": "claude-sonnet-4-6", "label": "Sonnet", "autoModel": "ug-auto-sonnet"}
+        ],
+    }
+    try:
+        with Session(native_binary, tmp_path / "manual-auto", env, auto_picker=auto) as session:
+            for after_turn in (False, True):
+                if after_turn:
+                    session.send("Reply OK without tools.", expect_error=True)
+                observed = session.observe()
+                assert observed["environment"]["ENABLE_SMART_ROUTING_SUBAGENT_ONLY"] == "0"
+                # The managed mod only replaces a recipe that is already there; a caller body
+                # without one (the fixture's) is left alone, so nothing names a recipe.
+                assert "smart_router_recipe_name" not in observed["body"]
+                assert not session_env.session_routing_enabled(controls)
+    finally:
+        shutil.rmtree(controls.parent)
+
+
+@pytest.mark.parametrize(
+    ("limits", "preferences", "window"),
+    [
+        ({"team.alias-claude-preview": (125_000, 8192)}, {}, "125k"),
+        ({}, {"autoCompactWindow": 180_000}, "180k"),
+    ],
+)
+def test_saved_custom_auto_alias_window_on_startup(
+    native_binary, tmp_path, monkeypatch, limits, preferences, window
+):
+    """Read the effective compaction window from a new Claude process."""
+
+    monkeypatch.setattr(
+        "ucode.agents.claude.native_settings_paths", lambda: (tmp_path / "settings.json",)
+    )
+    model = "team.alias-claude-preview"
+    alias = auto_variant({"model": model})
+    settings = {"modelOverrides": {alias: model}, **preferences}
+    catalog = AnthropicModelCatalog([model], {}, model_id_to_limits=limits)
+    apply_auto_context_windows(settings, {}, [{"model": model, "autoModel": alias}], catalog)
+
+    with Session(
+        native_binary,
+        tmp_path / "restarted",
+        {},
+        user_settings={"model": alias},
+        launch_settings=settings,
+        model=None,
+    ) as session:
+        report = session.send("/context")["result"]
+    assert f"**Model:** {alias}" in report
+    tokens = next(line for line in report.splitlines() if line.startswith("**Tokens:**"))
+    assert f" / {window} " in tokens, tokens
+
+
 def test_native_process_inherits_settings_and_runs_python_cli(native_binary, tmp_path):
     # The child checks launch settings before replacing itself with the real disabled router.
     script = (
@@ -238,13 +380,14 @@ def test_native_process_inherits_settings_and_runs_python_cli(native_binary, tmp
         assert result["stdout"] == result["stderr"] == "", result
 
 
+@pytest.mark.parametrize("server_mode", [None, "1"], ids=["server-default", "server-explicit"])
 @pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize(
     ("language", "setting_sources"),
     [("Chinese", "user"), (None, "user"), ("Chinese", "project,local")],
 )
 def test_auto_mode_preserves_reviewed_agent_and_routes_only_child_model(
-    native_binary, tmp_path, background, language, setting_sources
+    native_binary, tmp_path, background, language, setting_sources, server_mode
 ):
     """Scenario: Auto Mode approves or flags a native Agent call.
 
@@ -508,7 +651,7 @@ print(json.dumps({"model": sys.argv[1], "rationale": "Synthetic route",
                     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
                     "DISABLE_AUTOUPDATER": "1",
                     "CLAUDE_CODE_MAX_RETRIES": "0",
-                    "CLAUDE_CODE_AUTO_MODE_SERVER": "1",
+                    **({"CLAUDE_CODE_AUTO_MODE_SERVER": server_mode} if server_mode else {}),
                     "ENABLE_SMART_ROUTING_SUBAGENT_ONLY": "1",
                     "CLAUDE_CODE_ELEGANT_MEADOW": "1",
                     "AUTOMODE_DECISION_LOG": "1",
@@ -618,6 +761,9 @@ print(json.dumps({"model": sys.argv[1], "rationale": "Synthetic route",
                     path.read_text() for path in (root / "config/projects").glob("*/*.jsonl")
                 )
                 assert false_claim in saved
+                # The reviewed call keeps the description the model wrote, whatever
+                # CLAUDE_CODE_AUTO_MODE_SERVER or nonessential traffic say.
+                assert original["description"] in saved
                 for state in ("Running", "Finished"):
                     status = f" · {selected_model} · {state}"
                     assert not any(status in answer for answer in parent_answers), parent_answers
@@ -652,8 +798,6 @@ print(json.dumps({"model": sys.argv[1], "rationale": "Synthetic route",
 
 
 def test_native_language_reload_updates_parent_context_once(native_binary, tmp_path):
-    from test_credentials import _STREAM
-
     requests = []
 
     class Handler(BaseHTTPRequestHandler):

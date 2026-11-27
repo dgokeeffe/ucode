@@ -88,8 +88,10 @@ def main() -> None:
             return
         auth_token_log.set_stage("loading the ug CLI")
 
-    from ucode import metrics
+    from ucode import metrics, tls
 
+    # Before any import that could open a connection, so every client sees the same trust store.
+    tls.apply()
     is_mcp_proxy = sys.argv[1:2] == ["mcp-proxy"]
     enabled = not any(arg in {"--help", "-h"} for arg in sys.argv[1:])
     if enabled:
